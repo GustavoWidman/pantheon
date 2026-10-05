@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::{Client, Method};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -304,20 +304,33 @@ impl Discord {
         mention: Option<u64>,
         nonce: &str,
     ) -> Result<String> {
+        self.send_reply(channel, content, mention, nonce, None)
+            .await
+    }
+
+    pub async fn send_reply(
+        &self,
+        channel: u64,
+        content: &str,
+        mention: Option<u64>,
+        nonce: &str,
+        reply_to: Option<u64>,
+    ) -> Result<String> {
         if content.is_empty() || utf16_len(content) > MESSAGE_LIMIT {
             bail!("Discord message must contain 1–2000 UTF-16 units");
         }
         // Discord nonces have a 25-character limit; keep durable UUID/sequence keys deterministic.
         let nonce = hex::encode(Sha256::digest(nonce.as_bytes()))[..25].to_owned();
         let users: Vec<String> = mention.into_iter().map(|id| id.to_string()).collect();
+        let mut payload = json!({"content":content,"nonce":nonce,"enforce_nonce":true,"allowed_mentions":{"parse":[],"users":users,"replied_user":reply_to.is_some() && mention.is_some()}});
+        if let Some(message) = reply_to {
+            payload["message_reference"] = json!({"message_id":message.to_string(),"channel_id":channel.to_string(),"fail_if_not_exists":false});
+        }
         let body = self
             .request(
                 Method::POST,
                 &format!("/channels/{channel}/messages"),
-                Some(json!({
-                    "content": content, "nonce": nonce, "enforce_nonce": true,
-                    "allowed_mentions": { "parse": [], "users": users, "replied_user": false }
-                })),
+                Some(payload),
             )
             .await?;
         body["id"]
@@ -327,6 +340,59 @@ impl Discord {
     }
 
     /// Update an existing tool row. Edits cannot ping users, roles, or everyone.
+    pub async fn activity(
+        &self,
+        channel: u64,
+        content: &str,
+        nonce: &str,
+        reply_to: Option<u64>,
+        receipt: Option<&str>,
+    ) -> Result<String> {
+        if content.is_empty() || utf16_len(content) > MESSAGE_LIMIT {
+            bail!("activity message exceeds Discord's limit");
+        }
+        let mut body = json!({"content":content,"allowed_mentions":{"parse":[],"users":[],"roles":[],"replied_user":false}});
+        let (method, path) = if let Some(receipt) = receipt {
+            let message = receipt.parse::<u64>().context("invalid activity receipt")?;
+            (
+                Method::PATCH,
+                format!("/channels/{channel}/messages/{message}"),
+            )
+        } else {
+            body["nonce"] = json!(hex::encode(Sha256::digest(nonce.as_bytes()))[..25].to_owned());
+            body["enforce_nonce"] = json!(true);
+            if let Some(message) = reply_to {
+                body["message_reference"] = json!({"message_id":message.to_string(),"channel_id":channel.to_string(),"fail_if_not_exists":false});
+            }
+            (Method::POST, format!("/channels/{channel}/messages"))
+        };
+        // Progress is low priority. Durable outbox retries own failures rather
+        // than holding the channel's completion reply behind a long HTTP retry.
+        let response = self
+            .client
+            .request(method, format!("{}{path}", self.api))
+            .header("Authorization", format!("Bot {}", self.token))
+            .json(&body)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .map_err(|_| anyhow!("activity delivery deferred"))?;
+        if !response.status().is_success() {
+            bail!(
+                "activity delivery deferred (HTTP {})",
+                response.status().as_u16()
+            );
+        }
+        let value: Value = response
+            .json()
+            .await
+            .map_err(|_| anyhow!("invalid activity delivery receipt"))?;
+        value["id"]
+            .as_str()
+            .map(str::to_owned)
+            .context("missing activity delivery receipt")
+    }
+
     pub async fn edit(&self, channel: u64, message_id: &str, content: &str) -> Result<String> {
         if content.is_empty() || utf16_len(content) > MESSAGE_LIMIT {
             bail!("Discord message must contain 1–2000 UTF-16 units");
@@ -355,6 +421,35 @@ impl Discord {
             Some(json!({"content": content, "allowed_mentions": {"parse": []}})),
         )
         .await?;
+        Ok(())
+    }
+
+    pub async fn reply_card(&self, token: &str, payload: Value) -> Result<()> {
+        self.request(
+            Method::PATCH,
+            &format!(
+                "/webhooks/{}/{token}/messages/@original",
+                self.application_id
+            ),
+            Some(payload),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn typing(&self, channel: u64) -> Result<()> {
+        let response = self
+            .client
+            .post(format!("{}/channels/{channel}/typing", self.api))
+            .header("Authorization", format!("Bot {}", self.token))
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .map_err(|_| anyhow!("typing indicator unavailable"))?;
+        if !response.status().is_success() {
+            bail!("typing indicator unavailable");
+        }
+        tracing::debug!(channel, "typing indicator renewed");
         Ok(())
     }
 
@@ -1324,6 +1419,84 @@ mod tests {
                 .to_string()
                 .contains("Invalid Discord message ID")
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn native_replies_and_cards_preserve_references_and_control_notifications() {
+        use axum::{
+            Json, Router,
+            routing::{patch, post},
+        };
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let a = captured.clone();
+        let b = captured.clone();
+        let app = Router::new()
+            .route(
+                "/channels/1/messages",
+                post(move |Json(body): Json<Value>| {
+                    let captured = a.clone();
+                    async move {
+                        captured.lock().await.push(body);
+                        Json(json!({"id":"123"}))
+                    }
+                }),
+            )
+            .route(
+                "/webhooks/1/interaction/messages/@original",
+                patch(move |Json(body): Json<Value>| {
+                    let captured = b.clone();
+                    async move {
+                        captured.lock().await.push(body);
+                        Json(json!({"id":"124"}))
+                    }
+                }),
+            )
+            .route(
+                "/channels/1/typing",
+                post(|| async { axum::http::StatusCode::NO_CONTENT }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut discord = Discord::new("private-token".into(), 1, vec![42]).unwrap();
+        discord.api = format!("http://{address}");
+        discord
+            .send_reply(1, "Finished", Some(42), "final", Some(99))
+            .await
+            .unwrap();
+        discord
+            .activity(
+                1,
+                "```text\n✓ shell · 7.0s\n```",
+                "activity",
+                Some(99),
+                None,
+            )
+            .await
+            .unwrap();
+        discord
+            .reply_card(
+                "interaction",
+                crate::ui::card(
+                    "Context",
+                    "Ready",
+                    vec![("Model", "codex/test".into(), false)],
+                    false,
+                ),
+            )
+            .await
+            .unwrap();
+        discord.typing(1).await.unwrap();
+        let bodies = captured.lock().await;
+        assert_eq!(bodies[0]["message_reference"]["message_id"], "99");
+        assert_eq!(bodies[0]["message_reference"]["fail_if_not_exists"], false);
+        assert_eq!(bodies[0]["allowed_mentions"]["replied_user"], true);
+        assert_eq!(bodies[0]["content"], "Finished");
+        assert_eq!(bodies[1]["allowed_mentions"]["replied_user"], false);
+        assert_eq!(bodies[2]["content"], "");
+        assert_eq!(bodies[2]["embeds"][0]["title"], "Context");
+        assert_eq!(bodies[2]["allowed_mentions"]["parse"], json!([]));
         server.abort();
     }
     #[tokio::test]

@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{path::Path, sync::Mutex};
 
 pub struct Store {
-    db: Mutex<Connection>,
+    pub(crate) db: Mutex<Connection>,
 }
 #[derive(Clone, Debug)]
 pub struct Input {
@@ -23,6 +23,7 @@ pub struct Outbound {
     pub text: String,
     pub nonce: String,
     pub receipt: Option<String>,
+    pub reply_to: Option<u64>,
 }
 #[derive(Clone, Debug)]
 pub struct Job {
@@ -65,10 +66,13 @@ impl Store {
         CREATE INDEX IF NOT EXISTS agent_inbox_pending ON agent_inbox(owner,created) WHERE state='queued';
         CREATE TABLE IF NOT EXISTS shell_runs(id TEXT PRIMARY KEY,owner TEXT NOT NULL,channel TEXT NOT NULL,user TEXT NOT NULL,command TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'running',background INTEGER NOT NULL DEFAULT 0,output TEXT);
         PRAGMA user_version=2;")?;
+        crate::ui::initialize(&db)?;
         Ok(Self { db: Mutex::new(db) })
     }
     pub fn admit(&self, input: &Input) -> Result<bool> {
-        Ok(self.db.lock().unwrap().execute(
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let admitted = tx.execute(
             "INSERT OR IGNORE INTO inbox(id,channel,user,text,created) VALUES(?1,?2,?3,?4,?5)",
             params![
                 input.id,
@@ -77,7 +81,17 @@ impl Store {
                 input.text,
                 now()
             ],
-        )? == 1)
+        )? == 1;
+        if admitted {
+            let context = crate::ui::ReplyContext::request(&input.id);
+            tx.execute("INSERT OR IGNORE INTO ui_contexts(source,reply_to,activity,is_prompt) VALUES(?1,?2,?3,1)", params![input.id,context.reply_to.map(|id|id.to_string()),context.activity])?;
+            tx.execute(
+                "UPDATE ui_contexts SET is_prompt=1 WHERE source=?1",
+                [&input.id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(admitted)
     }
     pub fn queued(&self, channel: u64) -> Result<Vec<Input>> {
         let db = self.db.lock().unwrap();
@@ -130,26 +144,38 @@ impl Store {
     ) -> Result<bool> {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
+        let context = match inputs.first() {
+            Some(id) => tx
+                .query_row(
+                    "SELECT reply_to,activity FROM ui_contexts WHERE source=?1",
+                    [id],
+                    |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?)),
+                )
+                .optional()?,
+            None => None,
+        };
         let queued: i64 = tx.query_row(
-            "SELECT count(*) FROM inbox WHERE channel=?1 AND state='queued'",
-            [channel.to_string()],
+            "SELECT count(*) FROM inbox i LEFT JOIN ui_contexts c ON c.source=i.id WHERE i.channel=?1 AND i.state='queued' AND (c.activity=?2 OR c.is_prompt=1 OR c.source IS NULL)",
+            params![channel.to_string(),context.as_ref().map(|(_,activity)|activity)],
             |r| r.get(0),
         )?;
         if queued != 0 {
             return Ok(false);
         }
+        let background:i64=tx.query_row("SELECT (SELECT count(*) FROM tasks t JOIN ui_contexts c ON c.source=t.id WHERE c.activity=?1 AND t.state='running')+(SELECT count(*) FROM ui_agents a WHERE a.activity=?1 AND active=1 AND owner NOT LIKE 'channel:%')+(SELECT count(*) FROM shell_runs r JOIN ui_contexts c ON c.source=r.id WHERE c.activity=?1 AND r.state='running')",[context.as_ref().map(|(_,activity)|activity)],|row|row.get(0))?;
         for (i, text) in chunks.iter().enumerate() {
             let id = format!("{id}:{i}");
             let hash = Sha256::digest(id.as_bytes());
             let nonce = u64::from_le_bytes(hash[..8].try_into().unwrap()).to_string();
             tx.execute(
-                "INSERT OR IGNORE INTO outbox(id,channel,user,text,nonce) VALUES(?1,?2,?3,?4,?5)",
+                "INSERT OR IGNORE INTO outbox(id,channel,user,text,nonce,reply_to) VALUES(?1,?2,?3,?4,?5,?6)",
                 params![
                     id,
                     channel.to_string(),
-                    if i == 0 { Some(user.to_string()) } else { None },
+                    if i == 0 && background==0 { Some(user.to_string()) } else { None },
                     text,
-                    nonce
+                    nonce,
+                    context.as_ref().and_then(|(reply,_)|reply.as_deref())
                 ],
             )?;
         }
@@ -185,8 +211,15 @@ impl Store {
         self.next_outbound_excluding(&[])
     }
     pub fn next_outbound_excluding(&self, channels: &[u64]) -> Result<Option<Outbound>> {
-        // Per-channel order: an earlier failed item blocks later items for that channel only.
-        Ok(self.db.lock().unwrap().query_row("SELECT id,channel,user,text,nonce,receipt FROM outbox o WHERE state='queued' AND next_try<=?1 AND channel NOT IN (SELECT value FROM json_each(?2)) AND NOT EXISTS(SELECT 1 FROM outbox p WHERE p.channel=o.channel AND p.state='queued' AND p.seq<o.seq) ORDER BY seq LIMIT 1",params![now(),serde_json::to_string(&channels.iter().map(|c|c.to_string()).collect::<Vec<_>>())?],|r|Ok(Outbound{id:r.get(0)?,channel:r.get::<_,String>(1)?.parse().unwrap_or(0),user:r.get::<_,Option<String>>(2)?.and_then(|s|s.parse().ok()),text:r.get(3)?,nonce:r.get(4)?,receipt:r.get(5)?})).optional()?)
+        self.next_outbound_with_ui_budget(channels, &[])
+    }
+    pub fn next_outbound_with_ui_budget(
+        &self,
+        channels: &[u64],
+        ui_throttled: &[u64],
+    ) -> Result<Option<Outbound>> {
+        // Text replies preserve order and can pass pending activity edits.
+        Ok(self.db.lock().unwrap().query_row("SELECT id,channel,user,text,nonce,receipt,reply_to FROM outbox o WHERE state='queued' AND next_try<=?1 AND channel NOT IN (SELECT value FROM json_each(?2)) AND (o.id NOT LIKE '%:activity:%' OR channel NOT IN (SELECT value FROM json_each(?3))) AND NOT EXISTS(SELECT 1 FROM outbox p WHERE p.channel=o.channel AND p.state='queued' AND p.seq<o.seq AND (o.id LIKE '%:activity:%' OR p.id NOT LIKE '%:activity:%')) ORDER BY seq LIMIT 1",params![now(),serde_json::to_string(&channels.iter().map(|c|c.to_string()).collect::<Vec<_>>())?,serde_json::to_string(&ui_throttled.iter().map(|c|c.to_string()).collect::<Vec<_>>())?],|r|Ok(Outbound{id:r.get(0)?,channel:r.get::<_,String>(1)?.parse().unwrap_or(0),user:r.get::<_,Option<String>>(2)?.and_then(|s|s.parse().ok()),text:r.get(3)?,nonce:r.get(4)?,receipt:r.get(5)?,reply_to:r.get::<_,Option<String>>(6)?.and_then(|s|s.parse().ok())})).optional()?)
     }
     pub fn delivered(&self, item: &Outbound, receipt: &str) -> Result<()> {
         self.db.lock().unwrap().execute("UPDATE outbox SET receipt=?2,state=CASE WHEN text=?3 THEN 'sent' ELSE 'queued' END,next_try=0 WHERE id=?1",params![item.id,receipt,item.text])?;
@@ -305,6 +338,7 @@ impl Store {
         if !job_active(&tx, job)? {
             return Ok(false);
         }
+        crate::ui::copy_context(&tx, &job.id, &id)?;
         deliver_event(
             &tx,
             &id,
@@ -332,6 +366,7 @@ impl Store {
             if !job_active(&tx, job)? {
                 return Ok(false);
             }
+            crate::ui::copy_context(&tx, &job.id, &format!("monitor:{}:{}", job.id, job.due))?;
             deliver_event(
                 &tx,
                 &format!("monitor:{}:{}", job.id, job.due),
@@ -382,9 +417,9 @@ impl Store {
     pub fn tasks(&self, channel: u64) -> Result<Value> {
         let db = self.db.lock().unwrap();
         let mut s = db.prepare(
-            "SELECT id,state,task FROM tasks WHERE channel=?1 ORDER BY rowid DESC LIMIT 100",
+            "SELECT t.id,CASE WHEN u.active=1 THEN 'working' WHEN EXISTS(SELECT 1 FROM shell_runs r WHERE r.owner=t.id AND r.state='running') THEN 'background shell' ELSE t.state END,t.task,COALESCE(u.name,'Worker'),COALESCE(a.model,'Unknown'),COALESCE(a.reasoning,'Unknown') FROM tasks t LEFT JOIN ui_agents u ON u.owner=t.id LEFT JOIN agent_settings a ON a.id=t.id WHERE t.channel=?1 ORDER BY t.rowid DESC LIMIT 100",
         )?;
-        Ok(Value::Array(s.query_map([channel.to_string()],|r|Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"state":r.get::<_,String>(1)?,"task":r.get::<_,String>(2)?})))?.collect::<std::result::Result<_,_>>()?))
+        Ok(Value::Array(s.query_map([channel.to_string()],|r|Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"state":r.get::<_,String>(1)?,"task":r.get::<_,String>(2)?,"name":r.get::<_,String>(3)?,"model":r.get::<_,String>(4)?,"reasoning":r.get::<_,String>(5)?})))?.collect::<std::result::Result<_,_>>()?))
     }
     pub fn tool_start(&self, id: &str, channel: u64, name: &str) -> Result<()> {
         self.db.lock().unwrap().execute(
@@ -475,6 +510,7 @@ impl Store {
                 "UPDATE tasks SET report=?2 WHERE id=?1",
                 params![id, report],
             )?;
+            crate::ui::copy_context(&tx, id, delivery_id)?;
             deliver_event(
                 &tx,
                 delivery_id,
@@ -527,6 +563,14 @@ impl Store {
     pub fn recover(&self) -> Result<()> {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
+        tx.execute(
+            "UPDATE ui_agents SET active=0,phase='Interrupted' WHERE active=1",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE ui_events SET status='error' WHERE status='running'",
+            [],
+        )?;
         let affected = {
             let mut s =
                 tx.prepare("SELECT DISTINCT channel,user FROM inbox WHERE state='running'")?;
@@ -536,7 +580,15 @@ impl Store {
         for (c, u) in affected {
             let id = format!("recovery:{}:{c}", uuid::Uuid::new_v4());
             let hash = Sha256::digest(id.as_bytes());
-            tx.execute("INSERT INTO outbox(id,channel,user,text,nonce) VALUES(?1,?2,?3,?4,?5)",params![id,c,u,"Pantheon restarted during a turn. That turn was interrupted; completed tool effects may remain. Send a message to continue after inspecting the saved history.",u64::from_le_bytes(hash[..8].try_into().unwrap()).to_string()])?;
+            let reply_to: Option<String> = tx
+                .query_row(
+                    "SELECT reply_to FROM ui_contexts WHERE source=?1",
+                    [format!("channel:{c}")],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            tx.execute("INSERT INTO outbox(id,channel,user,text,nonce,reply_to) VALUES(?1,?2,?3,?4,?5,?6)",params![id,c,u,"Pantheon restarted during a turn. That turn was interrupted; completed tool effects may remain. Send a message to continue after inspecting the saved history.",u64::from_le_bytes(hash[..8].try_into().unwrap()).to_string(),reply_to])?;
         }
         tx.execute(
             "UPDATE inbox SET state='interrupted' WHERE state='running'",
@@ -575,6 +627,7 @@ impl Store {
                     "UPDATE tasks SET report=?2 WHERE id=?1",
                     params![owner, report],
                 )?;
+                crate::ui::copy_context(&tx, &owner, &format!("recovery:{run}"))?;
                 deliver_event(
                     &tx,
                     &format!("recovery:{run}"),
@@ -621,6 +674,7 @@ fn finish_task_transaction(tx: &rusqlite::Transaction<'_>, id: &str, report: &st
         |r| r.get(0),
     )?;
     if active == 0 {
+        crate::ui::copy_context(tx, id, &format!("batch:{batch}"))?;
         let reports = {
             let mut s = tx.prepare("SELECT id,report FROM tasks WHERE batch=?1 ORDER BY rowid")?;
             s.query_map([&batch], |r| {
@@ -662,6 +716,7 @@ fn deliver_event(
     user: u64,
     text: &str,
 ) -> Result<()> {
+    crate::ui::copy_context(tx, owner, id)?;
     if owner == format!("channel:{channel}") {
         tx.execute(
             "INSERT OR IGNORE INTO inbox(id,channel,user,text,created) VALUES(?1,?2,?3,?4,?5)",
@@ -675,6 +730,7 @@ fn deliver_event(
 fn shell_delivery(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<()> {
     let result:Option<(String,String,String,String)>=tx.query_row("SELECT owner,channel,user,output FROM shell_runs WHERE id=?1 AND state='done' AND background=1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
     if let Some((owner, channel, user, output)) = result {
+        crate::ui::copy_context(tx, id, &format!("shell:{id}"))?;
         deliver_event(
             tx,
             &format!("shell:{id}"),

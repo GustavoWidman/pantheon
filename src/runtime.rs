@@ -1,7 +1,7 @@
 use crate::{
     browser::BrowserManager,
     config::Config,
-    discord::{Discord, Inbound, ToolStatus, render_tool, split_message},
+    discord::{Discord, Inbound, split_message},
     memory::{COMPACT, Kind, Memory, NodeKey},
     provider::{Provider, ToolCall, model_parts},
     store::{Input, Job, Store},
@@ -69,6 +69,7 @@ struct Run {
     inputs: Vec<String>,
     trace: Option<Memory>,
     steering: Vec<String>,
+    context: crate::ui::ReplyContext,
 }
 impl Harness {
     pub fn new(
@@ -157,6 +158,8 @@ impl Harness {
             }
             result
         });
+        let h = self.clone();
+        let progress = tokio::spawn(async move { h.progress_worker().await });
         let mut commands = tokio::task::JoinSet::new();
         let command_capacity = Arc::new(Semaphore::new(16));
         for id in self.store.queued_channels()? {
@@ -175,11 +178,11 @@ impl Harness {
                         Inbound::Command{id:_,token,channel,user,name,options}=>{
                             let h=self.clone();let permit=command_capacity.clone().try_acquire_owned();
                             commands.spawn(async move {
-                                let text=match permit {
-                                    Ok(_permit)=>match h.command(channel,user,&name,&options).await {Ok(text)=>text,Err(e)=>format!("Command failed: {e}")},
-                                    Err(_)=>"Too many active commands; try again shortly.".into(),
+                                let card=match permit {
+                                    Ok(_permit)=>match h.command(channel,user,&name,&options).await {Ok(card)=>card,Err(e)=>crate::ui::card("Command couldn't complete",&e.to_string(),vec![],true)},
+                                    Err(_)=>crate::ui::card("Please try again shortly","This channel has too many active commands.",vec![],true),
                                 };
-                                if h.discord.reply_interaction(&token,&text).await.is_err(){tracing::warn!(channel,"interaction reply failed");}
+                                if h.discord.reply_card(&token,card).await.is_err(){tracing::warn!(channel,"interaction reply failed");}
                             });
                         }
                     }
@@ -201,6 +204,7 @@ impl Harness {
         let _ = tokio::time::timeout(Duration::from_secs(5), async {
             let _ = out.await;
             let _ = jobs.await;
+            let _ = progress.await;
         })
         .await;
         Ok(())
@@ -244,6 +248,32 @@ impl Harness {
             if queued.is_empty() {
                 tokio::select! {_=notified=>continue,_=self.shutdown.cancelled()=>break};
             }
+            let context = self.store.reply_context(&queued[0].id)?;
+            let queued = queued
+                .into_iter()
+                .filter(|input| {
+                    self.store
+                        .reply_context(&input.id)
+                        .is_ok_and(|ctx| ctx.activity == context.activity)
+                })
+                .collect::<Vec<_>>();
+            let owner = format!("channel:{channel}");
+            let settings = self.store.settings(
+                channel,
+                &self.config.agent.model,
+                &self.config.agent.reasoning,
+            )?;
+            self.store
+                .present_agent(&owner, channel, &context, "Coordinator", &settings.0)?;
+            self.store.activity_event(
+                &context,
+                channel,
+                &format!("received:{}", queued[0].id),
+                "-> request received",
+                "event",
+                Duration::ZERO,
+            )?;
+            self.store.agent_phase(&owner, true, "Preparing context")?;
             let cancel = self.shutdown.child_token();
             *c.cancel.lock().await = Some(cancel.clone());
             let view = self.settle(&c, &cancel).await;
@@ -260,6 +290,7 @@ impl Harness {
                     Some(queued[0].user),
                     &e.to_string(),
                 )?;
+                self.store.agent_phase(&owner, false, "Stopped")?;
                 *c.cancel.lock().await = None;
                 continue;
             }
@@ -290,6 +321,7 @@ impl Harness {
                 inputs: ids,
                 trace: None,
                 steering: vec![],
+                context,
             };
             let run_id = queued[0].id.clone();
             let result = self.clone().run_agent(run).await;
@@ -304,6 +336,7 @@ impl Harness {
                 )?;
                 // Steering still queued is left for the next fresh turn.
             }
+            self.store.agent_phase(&owner, false, "Idle")?;
             *c.cancel.lock().await = None;
         }
         Ok(())
@@ -321,10 +354,26 @@ impl Harness {
             } else {
                 &self.master_system
             };
+            let name = self.store.agent_label(&run.owner)?;
+            self.store.present_agent(
+                &run.owner,
+                run.channel,
+                &run.context,
+                &name,
+                &run.settings.0,
+            )?;
+            self.store.agent_phase(&run.owner, true, "Thinking")?;
             let run_id = uuid::Uuid::new_v4().to_string();
             let outcome = self
                 .run_steps(&mut run, &vendor, &defs, system, &run_id)
                 .await;
+            self.store
+                .refresh_activities(run.channel, run.memory.memory.lock().await.is_settled())?;
+            self.store.agent_phase(
+                &run.owner,
+                false,
+                if outcome.is_ok() { "Idle" } else { "Stopped" },
+            )?;
             if !run.child {
                 for id in &run.inputs {
                     self.store
@@ -351,6 +400,7 @@ impl Harness {
             for text in std::mem::take(&mut run.steering) {
                 run.history.push(Provider::user(vendor, &text));
             }
+            self.store.agent_phase(&run.owner, true, "Thinking")?;
             let response = tokio::select! {
                 r=self.provider.step(&run.settings.0,&run.settings.1,system,&run.history,defs)=>r?,
                 _=run.cancel.cancelled()=>bail!("cancelled"),
@@ -402,7 +452,14 @@ impl Harness {
                             &format!("{run_id}:{step}:final"),
                             run.channel,
                             run.user,
-                            &split_message(&text, Some(run.user)),
+                            &split_message(
+                                &text,
+                                if run.context.reply_to.is_some() {
+                                    None
+                                } else {
+                                    Some(run.user)
+                                },
+                            ),
                         )?;
                         if !completed {
                             self.notice(
@@ -456,14 +513,17 @@ impl Harness {
                 let tool_id = format!("{run_id}:{step}:tool:{index}");
                 self.store.tool_start(&tool_id, run.channel, &call.name)?;
                 let start = Instant::now();
-                if !run.child {
-                    self.notice(
-                        &tool_id,
-                        run.channel,
-                        None,
-                        &render_tool(&call.name, ToolStatus::Running, Duration::ZERO),
-                    )?;
-                }
+                let label = format!("{} / {}", self.store.agent_label(&run.owner)?, call.name);
+                self.store
+                    .agent_phase(&run.owner, true, &format!("Running {}", call.name))?;
+                self.store.activity_event(
+                    &run.context,
+                    run.channel,
+                    &tool_id,
+                    &label,
+                    "running",
+                    Duration::ZERO,
+                )?;
                 let result = if steered {
                     Ok("Skipped because new steering arrived; reconsider this call before executing.".to_string())
                 } else {
@@ -502,22 +562,25 @@ impl Harness {
                     image.as_deref(),
                 );
                 self.store.tool_done(&tool_id)?;
-                if !run.child {
-                    self.notice(
-                        &tool_id,
-                        run.channel,
-                        None,
-                        &render_tool(
-                            &call.name,
-                            if error {
-                                ToolStatus::Error
-                            } else {
-                                ToolStatus::Done
-                            },
-                            start.elapsed(),
-                        ),
-                    )?;
-                }
+                let background = !error
+                    && serde_json::from_str::<Value>(&output)
+                        .is_ok_and(|v| v["state"] == "background");
+                self.store.activity_event(
+                    &run.context,
+                    run.channel,
+                    &tool_id,
+                    &label,
+                    if steered {
+                        "skipped"
+                    } else if error {
+                        "error"
+                    } else if background {
+                        "background"
+                    } else {
+                        "done"
+                    },
+                    start.elapsed(),
+                )?;
             }
         }
         bail!("maximum tool steps reached")
@@ -539,10 +602,56 @@ impl Harness {
                 }
                 self.store.agent_event_done(&input.id)?;
                 run.steering.push(input.text);
+                self.store.activity_event(
+                    &run.context,
+                    run.channel,
+                    &format!("incoming:{}", input.id),
+                    &format!(
+                        "-> {} for {}",
+                        if input.id.starts_with("shell:") {
+                            "shell completion"
+                        } else if input.id.starts_with("wake:") {
+                            "wakeup"
+                        } else if input.id.starts_with("monitor:") {
+                            "monitor change"
+                        } else {
+                            "incoming message"
+                        },
+                        self.store.agent_label(&run.owner)?
+                    ),
+                    "event",
+                    Duration::ZERO,
+                )?;
                 received = true;
             }
         } else {
             for input in self.store.queued(run.channel)? {
+                let context = self.store.reply_context(&input.id)?;
+                let prompt = self.store.is_prompt(&input.id)?;
+                if context.activity != run.context.activity && !prompt {
+                    continue;
+                }
+                self.store.bind_context(&input.id, &run.context)?;
+                if !prompt && input.id.starts_with("shell:") {
+                    self.store.activity_event(
+                        &run.context,
+                        run.channel,
+                        &format!("incoming:{}", input.id),
+                        "-> shell completion for Coordinator",
+                        "event",
+                        Duration::ZERO,
+                    )?;
+                }
+                if prompt {
+                    self.store.activity_event(
+                        &run.context,
+                        run.channel,
+                        &format!("steering:{}", input.id),
+                        "-> steering message received",
+                        "event",
+                        Duration::ZERO,
+                    )?;
+                }
                 self.store.input_state(&input.id, "running")?;
                 Self::append_input(&run.memory, &input).await?;
                 self.store.mark_logged(&input.id)?;
@@ -678,10 +787,18 @@ impl Harness {
                     !tasks.is_empty() && tasks.len() <= self.config.agent.max_subagents,
                     "invalid task count"
                 );
-                let tasks: Vec<String> = tasks
-                    .iter()
-                    .map(|t| t.as_str().map(String::from).context("task must be text"))
-                    .collect::<Result<_>>()?;
+                let mut names = HashSet::new();
+                let tasks=tasks.iter().enumerate().map(|(index,value)| {
+                    let task=value.as_str().or_else(||value["task"].as_str()).context("task must contain text")?.to_owned();
+                    ensure!(!task.trim().is_empty() && task.len()<=64_000,"task must contain 1–64000 bytes");
+                    let name=value["name"].as_str().map(str::to_owned).unwrap_or_else(||format!("Worker {}",index+1));
+                    ensure!(!name.trim().is_empty() && name.encode_utf16().count()<=48 && name.chars().all(|c|c.is_alphanumeric() || matches!(c,' '|'-'|'_')),"agent names must be short words without formatting or control characters");
+                    ensure!(names.insert(name.to_lowercase()),"agent names must be unique within a spawn batch");
+                    let model=value["model"].as_str().unwrap_or(&run.settings.0).to_owned();
+                    let reasoning=value["reasoning"].as_str().unwrap_or(&run.settings.1).to_owned();
+                    model_parts(&model)?; crate::config::validate_reasoning(&reasoning)?;
+                    Ok((task,name,(model,reasoning)))
+                }).collect::<Result<Vec<_>>>()?;
                 let mut permits = vec![];
                 for _ in &tasks {
                     permits.push(
@@ -697,20 +814,38 @@ impl Harness {
                     .iter()
                     .map(|_| uuid::Uuid::new_v4().to_string())
                     .collect();
-                for (id, task) in ids.iter().zip(&tasks) {
+                let mut agents = vec![];
+                for (id, (task, name, settings)) in ids.iter().zip(&tasks) {
                     self.store
                         .add_task(id, &batch, run.channel, run.user, task)?;
-                }
-                for ((id, task), permit) in ids.iter().zip(tasks).zip(permits) {
+                    self.store.register_agent(id, &settings.0, &settings.1)?;
                     self.store
-                        .register_agent(id, &run.settings.0, &run.settings.1)?;
+                        .present_agent(id, run.channel, &run.context, name, &settings.0)?;
+                    self.store.activity_event(
+                        &run.context,
+                        run.channel,
+                        &format!("spawn:{id}"),
+                        &format!(
+                            "↗ spawned {name} [{}] · {} · {}",
+                            crate::ui::short_id(id),
+                            settings.0,
+                            settings.1
+                        ),
+                        "event",
+                        Duration::ZERO,
+                    )?;
+                    agents.push(
+                        json!({"id":id,"name":name,"model":settings.0,"reasoning":settings.1}),
+                    );
+                }
+                for ((id, (task, _name, settings)), permit) in ids.iter().zip(tasks).zip(permits) {
                     self.start_child(ChildStart {
                         id: id.clone(),
                         channel: run.channel,
                         user: run.user,
                         task,
                         previous: String::new(),
-                        settings: run.settings.clone(),
+                        settings,
                         memory: run.memory.clone(),
                         view: Some(view.clone()),
                         cancel: run.cancel.child_token(),
@@ -719,7 +854,7 @@ impl Harness {
                     .await?;
                 }
 
-                json!({"batch":batch,"ids":ids,"mode":"background"})
+                json!({"batch":batch,"ids":ids,"agents":agents,"mode":"background"})
             }
             "tell" => {
                 ensure!(!run.child, "child cannot tell other agents");
@@ -736,8 +871,20 @@ impl Harness {
                     },
                     id,
                 )?;
+                self.store.activity_event(
+                    &run.context,
+                    run.channel,
+                    &format!("tell:{}", uuid::Uuid::new_v4()),
+                    &format!(
+                        "-> message sent to {} [{}]",
+                        self.store.agent_label(id)?,
+                        crate::ui::short_id(id)
+                    ),
+                    "event",
+                    Duration::ZERO,
+                )?;
                 self.ensure_agent(id).await?;
-                json!({"delivered":id})
+                json!({"delivered":id,"name":self.store.agent_label(id)?})
             }
             "wakeup" | "monitor" => {
                 self.manage_jobs(run.channel, run.user, &run.owner, &call.name, a)?
@@ -777,13 +924,22 @@ impl Harness {
                 permit,
             } = start;
             let _permit = permit;
+            let context = match h.store.reply_context(&id) {
+                Ok(context) => context,
+                Err(error) => {
+                    tracing::error!(%error,"restore worker presentation failed");
+                    h.shutdown.cancel();
+                    return;
+                }
+            };
+            let _ = h.store.agent_phase(&id, true, "Preparing context");
             let outcome=async {
                 let view=match view {Some(view)=>view,None=>h.settle(&memory,&cancel).await?};
                 let mut trace=Memory::open(h.config.state_dir.join("subagents").join(&id),h.config.agent.view_bytes)?;
                 let prompt=if previous.is_empty() {task.clone()} else {format!("Original task: {task}\nYour previous report: {previous}\nContinue on the new inbox notifications. Inspect saved tool effects before repeating work.")};
                 trace.append(Kind::User,&prompt)?;
                 let (vendor,_)=model_parts(&settings.0)?;
-                let run=Run {channel,user,owner:id.clone(),child:true,memory:memory.clone(),cancel,settings:settings.clone(),history:Provider::start(vendor,&view,&prompt),inputs:vec![],trace:Some(trace),steering:vec![]};
+                let run=Run {channel,user,owner:id.clone(),child:true,memory:memory.clone(),cancel,settings:settings.clone(),history:Provider::start(vendor,&view,&prompt),inputs:vec![],trace:Some(trace),steering:vec![],context:context.clone()};
                 h.clone().run_agent(run).await
             }.await;
             let mut report = match outcome {
@@ -800,6 +956,22 @@ impl Harness {
             }
             if let Err(error) = h.store.finish_agent(&id, &report, &delivery_id) {
                 tracing::error!(error=%error,"persist agent report failed");
+                h.shutdown.cancel();
+            }
+            let _ = h.store.agent_phase(&id, false, "Idle");
+            if let Err(error) = h.store.activity_event(
+                &context,
+                channel,
+                &format!("report:{delivery_id}"),
+                &format!(
+                    "-> incoming agent message from {} [{}]",
+                    h.store.agent_label(&id).unwrap_or_else(|_| id.clone()),
+                    crate::ui::short_id(&id)
+                ),
+                "event",
+                Duration::ZERO,
+            ) {
+                tracing::error!(%error,"persist report presentation failed");
                 h.shutdown.cancel();
             }
             h.children.lock().await.remove(&id);
@@ -854,6 +1026,7 @@ impl Harness {
             .try_acquire_owned()
             .context("background shell capacity full")?;
         let id = uuid::Uuid::new_v4().to_string();
+        self.store.bind_context(&id, &run.context)?;
         self.store
             .shell_start(&id, &run.owner, run.channel, run.user, command)?;
         let cancel = run.cancel.child_token();
@@ -950,8 +1123,10 @@ impl Harness {
                 };
                 payload["_owner"]=json!(owner);
                 let id=uuid::Uuid::new_v4().to_string();
+                let context=if administrative {crate::ui::ReplyContext{reply_to:None,activity:format!("schedule:{id}")}}else{self.store.reply_context(&owner)?};
+                self.store.bind_context(&id,&context)?;
                 self.store.add_job(&Job{id:id.clone(),channel,user,kind:kind.into(),payload,due,interval})?;
-                self.notice(&format!("job:{id}:queued"),channel,None,&format!("◷ {kind} `{id}` saved; due <t:{due}:R>"))?;
+                self.store.activity_event(&context,channel,&format!("job:{id}:queued"),&format!("◷ {} / {kind} saved [{}]",self.store.agent_label(&owner)?,crate::ui::short_id(&id)),"event",Duration::ZERO)?;
                 Ok(json!({"id":id,"due":due,"interval_seconds":interval}))
             }
             _=>bail!("unknown job action"),
@@ -963,7 +1138,7 @@ impl Harness {
         user: u64,
         name: &str,
         options: &Value,
-    ) -> Result<String> {
+    ) -> Result<Value> {
         let mut args = serde_json::Map::new();
         for option in options.as_array().into_iter().flatten() {
             if let Some(n) = option["name"].as_str() {
@@ -987,7 +1162,20 @@ impl Harness {
                     model = id.into();
                     self.store.set_settings(channel, &model, &reasoning)?;
                 }
-                format!("Model: `{model}`. Changes apply to the next fresh turn.")
+                return Ok(crate::ui::card(
+                    "Model",
+                    "Changes apply to the next fresh turn.",
+                    vec![
+                        ("Active model", format!("`{model}`"), false),
+                        ("Reasoning", format!("`{reasoning}`"), true),
+                        (
+                            "Compaction model",
+                            format!("`{}`", self.config.agent.compactor_model),
+                            false,
+                        ),
+                    ],
+                    false,
+                ));
             }
             "reasoning" => {
                 if let Some(level) = args["level"].as_str() {
@@ -995,7 +1183,15 @@ impl Harness {
                     reasoning = level.into();
                     self.store.set_settings(channel, &model, &reasoning)?;
                 }
-                format!("Reasoning: `{reasoning}`. Changes apply to the next fresh turn.")
+                return Ok(crate::ui::card(
+                    "Reasoning effort",
+                    "Changes apply to the next fresh turn.",
+                    vec![
+                        ("Current effort", format!("`{reasoning}`"), true),
+                        ("Active model", format!("`{model}`"), false),
+                    ],
+                    false,
+                ));
             }
             "context" | "status" => {
                 let stats = c.memory.lock().await.stats();
@@ -1018,31 +1214,82 @@ impl Harness {
                     .as_u64()
                     .or_else(|| usage["cache_read_input_tokens"].as_u64())
                     .unwrap_or(0);
-                let usage_text = if usage.as_object().is_some_and(|o| !o.is_empty()) {
+                let input = usage["input_tokens"].as_u64().unwrap_or(0)
+                    + if usage.get("cache_read_input_tokens").is_some() {
+                        cached + usage["cache_creation_input_tokens"].as_u64().unwrap_or(0)
+                    } else {
+                        0
+                    };
+                let output = usage["output_tokens"].as_u64().unwrap_or(0);
+                let cache = if input > 0 {
                     format!(
-                        "Last request: {} input · {} output · {cached} cached tokens",
-                        usage["input_tokens"], usage["output_tokens"]
+                        "{cached} tokens · {:.0}% of input",
+                        cached as f64 / input as f64 * 100.0
                     )
                 } else {
-                    "No provider usage recorded yet.".into()
+                    "No usage recorded yet".into()
                 };
-                format!(
-                    "Model: `{model}` · reasoning: `{reasoning}\nMaster: {} · {children} background agents\nMemory: {} messages · {} summaries\nView: {} / {} bytes · {} lines · {}\nQueue: {} prompts · {} pending Discord deliveries\n{usage_text}",
-                    if active { "working" } else { "idle" },
-                    stats["messages"],
-                    stats["summaries"],
-                    stats["view_bytes"],
-                    stats["view_budget_bytes"],
-                    stats["view_lines"],
-                    if stats["settled"] == true {
-                        "settled"
+                let view = stats["view_bytes"].as_u64().unwrap_or(0);
+                let budget = stats["view_budget_bytes"].as_u64().unwrap_or(1).max(1);
+                let filled = ((view.saturating_mul(10) / budget).min(10)) as usize;
+                let bar = format!("{}{}", "▰".repeat(filled), "▱".repeat(10 - filled));
+                let state = if active {
+                    "Coordinator is working"
+                } else if children > 0 {
+                    "Background agents are working"
+                } else if stats["settled"] != true {
+                    "Updating context"
+                } else {
+                    "Ready"
+                };
+                return Ok(crate::ui::card(
+                    if name == "context" {
+                        "Context"
                     } else {
-                        "summarizing"
+                        "Work status"
                     },
-                    operational["queued_prompts"],
-                    operational["pending_delivery"]
-                )
+                    state,
+                    vec![
+                        ("Model", format!("`{model}`"), false),
+                        ("Reasoning", reasoning.clone(), true),
+                        ("Background agents", children.to_string(), true),
+                        (
+                            "Context budget",
+                            format!(
+                                "{bar}\n{:.1} / {:.1} KiB · {:.0}%",
+                                view as f64 / 1024.0,
+                                budget as f64 / 1024.0,
+                                view as f64 / budget as f64 * 100.0
+                            ),
+                            false,
+                        ),
+                        (
+                            "Durable memory",
+                            format!(
+                                "{} messages · {} summaries\n{} view lines",
+                                stats["messages"], stats["summaries"], stats["view_lines"]
+                            ),
+                            true,
+                        ),
+                        (
+                            "Delivery queue",
+                            format!(
+                                "{} prompts · {} messages",
+                                operational["queued_prompts"], operational["pending_delivery"]
+                            ),
+                            true,
+                        ),
+                        (
+                            "Last request",
+                            format!("{input} input · {output} output tokens"),
+                            true,
+                        ),
+                        ("Prompt cache", cache, true),
+                    ],
+                    false,
+                ));
             }
+
             "stop" => {
                 for (job_channel, cancel) in self.shell_jobs.lock().await.values() {
                     if *job_channel == channel {
@@ -1061,59 +1308,87 @@ impl Harness {
             }
             "subagents" => {
                 let tasks = self.store.tasks(channel)?;
-                let rows: Vec<String> = tasks
+                let entries = tasks
                     .as_array()
                     .into_iter()
                     .flatten()
                     .take(12)
-                    .map(|t| {
-                        format!(
-                            "`{}` · {} · {}",
-                            t["id"].as_str().unwrap_or(""),
-                            t["state"].as_str().unwrap_or(""),
-                            t["task"]
-                                .as_str()
-                                .unwrap_or("")
-                                .replace(['\n', '\r', '`'], " ")
-                                .chars()
-                                .take(70)
-                                .collect::<String>()
-                        )
+                    .map(|task| {
+                        let name = task["name"].as_str().unwrap_or("Worker");
+                        let value = format!(
+                            "**{}** · `{}` · {}\n{}\nID: `{}`",
+                            task["state"].as_str().unwrap_or(""),
+                            task["model"].as_str().unwrap_or(""),
+                            task["reasoning"].as_str().unwrap_or(""),
+                            crate::ui::clean(task["task"].as_str().unwrap_or(""), 180),
+                            task["id"].as_str().unwrap_or("")
+                        );
+                        (name, value, false)
                     })
                     .collect();
-                if rows.is_empty() {
-                    "No background agents registered in this channel.".into()
-                } else {
-                    rows.join("\n")
-                }
+                return Ok(crate::ui::card(
+                    "Background agents",
+                    if tasks.as_array().is_none_or(Vec::is_empty) {
+                        "No workers yet. Ask Pantheon to delegate a task."
+                    } else {
+                        "Workers keep their identity when resumed by a message, wakeup or monitor."
+                    },
+                    entries,
+                    false,
+                ));
             }
+
             "wakeup" | "monitor" => {
                 let result = self.manage_jobs(channel, user, "*", name, &args)?;
+                let mut records = vec![];
                 if let Some(rows) = result.as_array() {
-                    if rows.is_empty() {
-                        format!("No active {name} jobs.")
-                    } else {
-                        rows.iter()
-                            .take(12)
-                            .map(|j| {
-                                format!(
-                                    "`{}` · due <t:{}:R>{}",
-                                    j["id"].as_str().unwrap_or(""),
-                                    j["due"],
-                                    j["interval_seconds"]
-                                        .as_i64()
-                                        .map(|s| format!(" · repeats every {s}s"))
-                                        .unwrap_or_default()
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n")
+                    for job in rows.iter().take(12) {
+                        let owner = self
+                            .store
+                            .agent_label(job["owner"].as_str().unwrap_or("Coordinator"))?;
+                        let id = job["id"].as_str().unwrap_or("");
+                        let repeat = job["interval_seconds"]
+                            .as_i64()
+                            .map(|seconds| format!("\nRepeats every **{seconds}s**"))
+                            .unwrap_or_default();
+                        records.push((
+                            format!("{owner} · {}", crate::ui::short_id(id)),
+                            format!("Next: <t:{}:R>{repeat}\nID: `{id}`", job["due"]),
+                        ));
                     }
                 } else if let Some(id) = result["id"].as_str() {
-                    format!("Saved {name} `{id}` · due <t:{}:R>", result["due"])
+                    records.push((
+                        "Schedule saved".into(),
+                        format!("Next: <t:{}:R>\nID: `{id}`", result["due"]),
+                    ));
                 } else {
-                    format!("Cancelled: {}", result["cancelled"])
+                    records.push((
+                        "Cancellation".into(),
+                        if result["cancelled"] == true {
+                            "Schedule cancelled".into()
+                        } else {
+                            "No matching active schedule".into()
+                        },
+                    ));
                 }
+                let fields = records
+                    .iter()
+                    .map(|(label, value)| (label.as_str(), value.clone(), false))
+                    .collect();
+                return Ok(crate::ui::card(
+                    if name == "wakeup" {
+                        "Wakeups"
+                    } else {
+                        "Monitors"
+                    },
+                    if records.is_empty() {
+                        "No active schedules in this channel."
+                    } else {
+                        "Notifications return to the agent that created each schedule."
+                    },
+                    fields,
+                    false,
+                ));
             }
             "browser" => {
                 let mut args = args;
@@ -1164,41 +1439,106 @@ impl Harness {
             }
             _ => bail!("unknown command"),
         };
-        Ok(text)
+        Ok(crate::ui::card(
+            match name {
+                "stop" => "Work stopped",
+                "browser" => "Browser windows",
+                "wakeup" => "Wakeups",
+                "monitor" => "Monitors",
+                _ => "Pantheon",
+            },
+            &text,
+            vec![],
+            false,
+        ))
     }
     fn notice(&self, id: &str, channel: u64, mention: Option<u64>, text: &str) -> Result<()> {
-        for (i, chunk) in split_message(text, mention).iter().enumerate() {
-            self.store.enqueue(
+        let context = self.store.reply_context(&format!("channel:{channel}"))?;
+        for (i, chunk) in split_message(
+            text,
+            if context.reply_to.is_some() {
+                None
+            } else {
+                mention
+            },
+        )
+        .iter()
+        .enumerate()
+        {
+            self.store.enqueue_reply(
                 &format!("{id}:{i}"),
                 channel,
                 if i == 0 { mention } else { None },
                 chunk,
+                context.reply_to,
             )?;
         }
+        Ok(())
+    }
+    async fn progress_worker(self: Arc<Self>) -> Result<()> {
+        let mut typing = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {_=self.shutdown.cancelled()=>break,_=tokio::time::sleep(Duration::from_secs(4))=>{}};
+            while typing.try_join_next().is_some() {}
+            let channels = self
+                .channels
+                .lock()
+                .await
+                .iter()
+                .map(|(id, c)| (*id, c.clone()))
+                .collect::<Vec<_>>();
+            for (id, c) in channels {
+                let settled = c.memory.lock().await.is_settled();
+                if self.store.refresh_activities(id, settled)? && typing.len() < 16 {
+                    let discord = self.discord.clone();
+                    let stop = self.shutdown.clone();
+                    typing.spawn(async move {
+                        tokio::select! {_=stop.cancelled()=>{},_=discord.typing(id)=>{}};
+                    });
+                }
+            }
+        }
+        typing.abort_all();
         Ok(())
     }
     async fn outbox_worker(&self) -> Result<()> {
         let mut workers = tokio::task::JoinSet::new();
         let mut active = HashSet::new();
+        let mut ui_sent = HashMap::<u64, Instant>::new();
         loop {
             if self.shutdown.is_cancelled() {
                 break;
             }
             while workers.len() < 8 {
-                let Some(out) = self
-                    .store
-                    .next_outbound_excluding(&active.iter().copied().collect::<Vec<_>>())?
+                let Some(out) = self.store.next_outbound_with_ui_budget(
+                    &active.iter().copied().collect::<Vec<_>>(),
+                    &ui_sent
+                        .iter()
+                        .filter(|(_, at)| at.elapsed() < Duration::from_secs(2))
+                        .map(|(id, _)| *id)
+                        .collect::<Vec<_>>(),
+                )?
                 else {
                     break;
                 };
                 active.insert(out.channel);
                 let discord = self.discord.clone();
                 workers.spawn(async move {
-                    let result = if let Some(receipt) = &out.receipt {
+                    let result = if out.id.contains(":activity:") {
+                        discord
+                            .activity(
+                                out.channel,
+                                &out.text,
+                                &out.nonce,
+                                out.reply_to,
+                                out.receipt.as_deref(),
+                            )
+                            .await
+                    } else if let Some(receipt) = &out.receipt {
                         discord.edit(out.channel, receipt, &out.text).await
                     } else {
                         discord
-                            .send(out.channel, &out.text, out.user, &out.nonce)
+                            .send_reply(out.channel, &out.text, out.user, &out.nonce, out.reply_to)
                             .await
                     };
                     (out, result)
@@ -1207,6 +1547,7 @@ impl Harness {
             tokio::select! {
                 Some(done)=workers.join_next(),if !workers.is_empty()=>{
                     let (out,result)=done.context("delivery worker failed")?;active.remove(&out.channel);
+                    if out.id.contains(":activity:"){ui_sent.insert(out.channel,Instant::now());}
                     match result {Ok(receipt)=>self.store.delivered(&out,&receipt)?,Err(_)=>{self.store.retry_outbound(&out.id)?;tracing::warn!(channel=out.channel,"Discord delivery pending retry");}}
                 },
                 _=tokio::time::sleep(Duration::from_millis(200))=>{},_=self.shutdown.cancelled()=>break,
@@ -1263,11 +1604,20 @@ impl Harness {
                         if !notified {
                             return Ok(());
                         }
-                        h.notice(
-                            &format!("job:{}:{}:fired", job.id, job.due),
+                        let context = h.store.reply_context(&job.id)?;
+                        h.store.activity_event(
+                            &context,
                             job.channel,
-                            None,
-                            &format!("◷ {} `{}` checked", job.kind, job.id),
+                            &format!("job:{}:{}:fired", job.id, job.due),
+                            &format!(
+                                "-> {} notification for {}",
+                                job.kind,
+                                h.store.agent_label(
+                                    job.payload["_owner"].as_str().unwrap_or("Coordinator")
+                                )?
+                            ),
+                            "event",
+                            Duration::ZERO,
                         )?;
                         if let Some(owner) = job.payload["_owner"]
                             .as_str()
@@ -1487,6 +1837,7 @@ mod tests {
             cancel: h.shutdown.child_token(),
             settings: (format!("{vendor}/test"), "medium".into()),
             history: Provider::start(vendor, &view, &input.text),
+            context: crate::ui::ReplyContext::request(&input.id),
             inputs: vec![input.id],
             trace: None,
             steering: vec![],
@@ -1507,6 +1858,73 @@ mod tests {
             out.push(item);
         }
         out
+    }
+
+    #[tokio::test]
+    async fn named_workers_inherit_reply_context_and_use_explicit_model_settings() {
+        let (_dir, h, mut run, mock, server) =
+            fixture("openai", vec![final_response("anthropic", "Scout report")]).await;
+        run.context = crate::ui::ReplyContext::request("123456789012345678");
+        let call = ToolCall {
+            id: "named".into(),
+            name: "spawn".into(),
+            arguments: json!({"tasks":[{"name":"Docs Scout","task":"Research documentation","model":"anthropic/test","reasoning":"low"}]}),
+        };
+        let result =
+            tokio::time::timeout(Duration::from_millis(500), h.execute_tool(&mut run, &call))
+                .await
+                .unwrap()
+                .unwrap();
+        let result: Value = serde_json::from_str(&result).unwrap();
+        let id = result["ids"][0].as_str().unwrap();
+        assert_eq!(result["agents"][0]["name"], "Docs Scout");
+        assert_eq!(result["agents"][0]["model"], "anthropic/test");
+        assert_eq!(h.store.agent_label(id).unwrap(), "Docs Scout");
+        assert_eq!(
+            h.store.reply_context(id).unwrap().reply_to,
+            run.context.reply_to
+        );
+        let record = h.store.agent(id).unwrap().unwrap();
+        assert_eq!(record.model, "anthropic/test");
+        assert_eq!(record.reasoning, "low");
+        mock.started.notified().await;
+        mock.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while h.children.lock().await.contains_key(id) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let activity = drain(&h);
+        assert!(activity.iter().any(|m|m.text.contains("spawned Docs Scout")&&m.text.contains("anthropic/test")));
+        assert!(
+            activity
+                .iter()
+                .any(|m| m.text.contains("incoming agent message from Docs Scout"))
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn command_cards_have_structured_context_and_configuration_fields() {
+        let (_dir, h, _run, _mock, server) = fixture("openai", vec![]).await;
+        for command in ["context", "status", "model", "reasoning", "subagents"] {
+            let result = h.command(1, 2, command, &json!([])).await.unwrap();
+            assert_eq!(result["content"], "");
+            assert!(result["embeds"][0]["title"].as_str().is_some());
+            assert!(result["embeds"][0]["color"].as_u64().is_some());
+            assert_eq!(result["allowed_mentions"]["parse"], json!([]));
+            if command == "context" {
+                assert!(
+                    result["embeds"][0]["fields"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|f| f["name"] == "Context budget")
+                );
+            }
+        }
+        server.abort();
     }
 
     #[tokio::test]
@@ -1651,7 +2069,16 @@ mod tests {
             .unwrap();
         mock.release.notify_one();
         task.await.unwrap().unwrap();
-        let out = drain(&h);
+        let activity = drain(&h);
+        assert!(
+            activity
+                .iter()
+                .any(|item| item.text.contains("-> steering message received"))
+        );
+        let out = activity
+            .into_iter()
+            .filter(|item| !item.id.contains(":activity:"))
+            .collect::<Vec<_>>();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].user, None);
         assert_eq!(out[1].user, Some(2));

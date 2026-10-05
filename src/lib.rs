@@ -7,4 +7,5 @@ pub mod provider;
 pub mod runtime;
 pub mod store;
 pub mod tools;
+pub mod ui;
 pub mod web;

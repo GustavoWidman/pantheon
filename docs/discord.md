@@ -2,7 +2,7 @@
 
 Pantheon uses the Discord v10 gateway directly, with REST delivery through a pooled Rustls client. The gateway maintains sequence numbers, resumes dropped sessions, applies heartbeat jitter, reconnects on missing acknowledgments, and stops on invalid credentials or unsupported intents. There is one gateway shard per deployment. Slash commands register globally at service startup.
 
-The configured user allowlist applies to both messages and slash commands. An empty allowlist prevents startup. DMs are accepted from authorized users; server channels and threads require an explicit bot mention for each prompt. Bots and webhook messages are ignored. Enable the **Message Content** privileged intent in the Discord Developer Portal. Install the bot with `bot` and `applications.commands` scopes, and grant View Channels, Send Messages, Send Messages in Threads, and Read Message History where it should operate.
+The configured user allowlist applies to both messages and slash commands. An empty allowlist prevents startup. DMs are accepted from authorized users; server channels and threads require an explicit bot mention for each prompt. Bots and webhook messages are ignored. Enable the **Message Content** privileged intent in the Discord Developer Portal. Install the bot with `bot` and `applications.commands` scopes, and grant View Channels, Send Messages, Send Messages in Threads, Read Message History, and Embed Links where it should operate.
 
 The transport acknowledges authorized slash commands with an ephemeral deferred response before handing them to the runtime. It uses a separate task for each acknowledgment so REST latency cannot block gateway heartbeats. Unauthorized command invocations receive a private denial. The runtime edits the ephemeral response after executing the command. Interaction tokens expire, so interactions are control responses rather than durable final-output destinations.
 
@@ -26,9 +26,13 @@ Command handling and validation belong to the runtime; Discord transports the co
 
 `split_message` counts UTF-16 code units, preserving emoji while staying below Discord's 2000-unit budget. It closes and reopens ordinary backtick or tilde fences at chunk boundaries, retaining the language label. Fences longer than 64 delimiters or opening lines longer than 256 units are treated as plain text to keep splitting memory and overhead bounded.
 
-Final response text receives one explicit owner mention in its first chunk. `send` does not insert mentions: it permits only the owner supplied by the durable outbox entry, with all automatically parsed mentions disabled. Agent-written `@everyone`, role mentions, and other user mentions therefore cannot trigger notifications. Commentary and tool activity use no permitted mentions.
+Responses use Discord's native reply reference to the original prompt, including asynchronous worker reports, shell completions and wakeups after newer prompts arrive. Only a settled completion enables `allowed_mentions.replied_user`; acknowledgments while background work remains, intermediate prose and activity do not ping. Automatically parsed mentions are disabled. Synthetic inputs without a message reference retain an explicit requester mention as a fallback.
 
-`render_tool` emits only the status marker, a sanitized tool name, and elapsed duration. Tool arguments, shell commands, output bodies, provider errors, browser credentials, and interaction tokens never appear in tool rows. The durable runtime records outcomes before delivering a final response.
+Each request has an accumulating fenced activity log. Tool rows update in place from running to success, failure, skipped or background, with elapsed time. Named worker spawns include their ID, model and reasoning effort; incoming reports appear as `-> incoming agent message from <name> [id]`. Arguments, shell commands, outputs, credentials and provider errors stay out of the activity log. Fixed twelve-row pages preserve earlier messages as activity grows. Original references, identities, event rows and Discord receipts are durable SQLite presentation metadata, separate from model context.
+
+A four-second heartbeat renews typing while the coordinator, workers, detached shell jobs, queued reports or context compaction are busy. The activity footer remains visible between typing renewals and describes the current phase. Activity edits are limited to one per two seconds per channel and use a two-second transport deadline; durable retries preserve backoff. Completion replies pass queued activity edits so presentation cannot hold up the answer.
+
+Slash commands return private, branded embeds with structured model, effort, context usage, cache and worker fields. Errors use a distinct error color. Embed and message limits count UTF-16 units, including emoji.
 
 ## Delivery guarantees
 
