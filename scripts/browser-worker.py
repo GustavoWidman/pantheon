@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""JSON-line RPC; one persistent Camoufox, private X display and authenticated noVNC.
+"""JSON-line RPC; one shared Camoufox profile, private window viewers and authenticated noVNC.
 
 Only the Rust supervisor starts this process. stdout is exclusively protocol frames.
 Browser downloads, pip installs and Playwright installs never happen at runtime.
@@ -7,12 +7,15 @@ Browser downloads, pip installs and Playwright installs never happen at runtime.
 import argparse
 import asyncio
 import contextlib
+import ctypes
+import ctypes.util
+import math
 import errno
+import fcntl
 import json
 import logging
 import os
 from pathlib import Path
-import signal
 import socket
 import subprocess
 import sys
@@ -47,11 +50,9 @@ async def wait_listener(port, process):
 
 
 async def run(args):
-    from playwright.async_api import async_playwright
 
     children = []
-    browser = None
-    playwright = None
+    writer = None
     token_file = args.profile / "viewer.tokens"
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -72,16 +73,23 @@ async def run(args):
         else:
             raise RuntimeError("browser port range exhausted by existing listeners")
         listener.listen(128)
-        # Xvfb atomically allocates a free display; no shared :99 or test-then-open race.
-        display_server = start([os.environ.get("PANTHEON_XVFB", "Xvfb"), "-displayfd", "1", "-screen", "0", "1440x900x24", "-nolisten", "tcp"], stdout=subprocess.PIPE)
-        children.append(display_server)
-        display_number = await asyncio.wait_for(asyncio.to_thread(display_server.stdout.readline), 15)
-        if not display_number.strip().isdigit():
-            raise RuntimeError("Xvfb did not allocate a display")
-        display = ":" + display_number.decode().strip()
-        os.environ["DISPLAY"] = display
+        reader, writer = await asyncio.open_unix_connection(str(args.shared_root / "backend.sock"))
+        async def rpc(request):
+            writer.write((json.dumps(request) + "\n").encode())
+            await writer.drain()
+            frame = await reader.readline()
+            if not frame:
+                raise RuntimeError("shared browser backend exited")
+            response = json.loads(frame)
+            if "error" in response:
+                raise RuntimeError(response["error"])
+            return response
+        ready = await rpc({"action": "open", "browser_id": args.profile.name})
+        display = ready["display"]
+        control_file = args.profile / "viewer.control"
+        control_file.write_text("")
         # -autoport starts at 5900 and lets the OS choose; parse x11vnc's PORT frame.
-        vnc = start([os.environ.get("PANTHEON_X11VNC", "x11vnc"), "-display", display, "-localhost", "-autoport", "5900", "-forever", "-shared", "-nopw", "-viewonly", "-quiet"], stdout=subprocess.PIPE)
+        vnc = start([os.environ.get("PANTHEON_X11VNC", "x11vnc"), "-display", display, "-localhost", "-autoport", "5900", "-forever", "-shared", "-nopw", "-viewonly", "-quiet", "-clip", ready["clip"], "-connect", str(control_file), "-novncconnect", "-nosel", "-nowireframe", "-noscrollcopyrect"], stdout=subprocess.PIPE)
         children.append(vnc)
         async def vnc_port():
             while True:
@@ -100,22 +108,8 @@ async def run(args):
         children.append(proxy)
         listener.close()
         await wait_listener(args.port, proxy)
-        executable = os.environ.get("PANTHEON_CAMOUFOX")
-        if not executable or not Path(executable).is_file():
-            raise RuntimeError("PANTHEON_CAMOUFOX must point to the packaged Camoufox executable")
-        playwright = await async_playwright().start()
-        browser = await playwright.firefox.launch_persistent_context(
-            str(args.profile / "profile"), executable_path=executable, headless=False,
-            viewport={"width": 1400, "height": 820},
-            firefox_user_prefs={"browser.shell.checkDefaultBrowser": False,
-                "browser.startup.homepage_override.mstone": "ignore",
-                "browser.cache.disk.enable": True,
-                "browser.cache.disk.capacity": 262144},
-        )
-        page = browser.pages[0] if browser.pages else await browser.new_page()
-        page.set_default_timeout(20000)
         human = False
-        emit({"ready": True, "display": display, "port": args.port})
+        emit({"ready": True, "display": display, "port": args.port, "profile": "pantheon-shared"})
         while True:
             line = await asyncio.to_thread(sys.stdin.readline)
             if not line:
@@ -126,64 +120,35 @@ async def run(args):
                 if any(child.poll() is not None for child in children):
                     raise RuntimeError("a browser desktop component exited; close and reopen this browser")
                 if action == "close":
-                    await browser.close()
-                    browser = None
+                    await rpc({"action": "close"})
                     emit({"closed": True})
                     break
                 if action in ("handoff", "resume"):
                     if action == "handoff":
                         human = True  # A partially applied VNC command fails closed.
+                        await rpc({"action": "handoff"})
                     control = "noviewonly" if action == "handoff" else "viewonly"
-                    result = await asyncio.create_subprocess_exec(os.environ.get("PANTHEON_X11VNC", "x11vnc"), "-display", display, "-sync", "-R", control, stdout=sys.stderr, stderr=sys.stderr)
+                    result = await asyncio.create_subprocess_exec(os.environ.get("PANTHEON_X11VNC", "x11vnc"), "-display", display, "-connect", str(control_file), "-sync", "-R", control, stdout=sys.stderr, stderr=sys.stderr)
                     if await result.wait() != 0:
                         raise RuntimeError("failed to change browser viewer ownership")
+                    if action == "resume":
+                        await rpc({"action": "resume"})
                     human = action == "handoff"
                     emit({"state": "human" if human else "agent"})
                     continue
                 if human:
                     raise RuntimeError("automation paused while human owns browser")
-                # Human interaction may close the active tab or open another.
-                if page.is_closed():
-                    page = browser.pages[-1] if browser.pages else await browser.new_page()
-                if action == "navigate":
-                    url = request["url"]
-                    if not isinstance(url, str) or not url.startswith(("http://", "https://", "about:blank")):
-                        raise ValueError("navigate requires an http(s) URL")
-                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                    emit({"url": page.url, "title": await page.title()})
-                elif action == "snapshot":
-                    # Semantic snapshot supplies stable role/name locators and bounded text.
-                    snapshot = await page.locator("body").aria_snapshot(timeout=20000)
-                    emit({"url": page.url, "title": await page.title(), "snapshot": snapshot[:50000], "truncated": len(snapshot) > 50000,
-                          "tabs": [{"index": i, "url": p.url} for i, p in enumerate(browser.pages)]})
-                elif action in ("click", "type"):
-                    if request.get("role"):
-                        locator = page.get_by_role(request["role"], name=request.get("name", ""), exact=True)
-                    elif request.get("selector"):
-                        locator = page.locator(request["selector"])
-                    else:
-                        raise ValueError("provide role and name from snapshot, or a CSS selector")
-                    if action == "click":
-                        await locator.click()
-                    else:
-                        await locator.fill(request["text"])
-                    emit({"url": page.url, "done": True})
-                elif action == "screenshot":
-                    destination = args.profile / ("screenshot-" + uuid.uuid4().hex + ".png")
-                    await page.screenshot(path=str(destination), full_page=False)
-                    emit({"path": str(destination), "mime_type": "image/png", "url": page.url})
-                else:
-                    raise ValueError("unknown browser action")
+                if action == "screenshot":
+                    request["path"] = str(args.profile / ("screenshot-" + uuid.uuid4().hex + ".png"))
+                emit(await rpc(request))
             except Exception as error:
                 emit({"error": str(error)[:2000]})
     finally:
         listener.close()
-        if browser:
+        if writer:
+            writer.close()
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(browser.close(), 5)
-        if playwright:
-            with contextlib.suppress(Exception):
-                await playwright.stop()
+                await writer.wait_closed()
         for child in reversed(children):
             with contextlib.suppress(ProcessLookupError):
                 child.terminate()
@@ -196,10 +161,371 @@ async def run(args):
         token_file.unlink(missing_ok=True)
 
 
+
+# Xlib is already in the browser closure. Keep window placement out of page JS
+# except for a short-lived title marker used to identify a newly created window.
+class XWindows:
+    def __init__(self, display):
+        self.x = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+        self.x.XOpenDisplay.restype = ctypes.c_void_p
+        self.x.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        self.display = self.x.XOpenDisplay(display.encode())
+        if not self.display:
+            raise RuntimeError("cannot connect to shared X display")
+        for name, restype, argtypes in (
+            ("XDefaultRootWindow", ctypes.c_ulong, [ctypes.c_void_p]),
+            ("XQueryTree", ctypes.c_int, [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong)), ctypes.POINTER(ctypes.c_uint)]),
+            ("XFetchName", ctypes.c_int, [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p)]),
+            ("XInternAtom", ctypes.c_ulong, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]),
+            ("XGetWindowProperty", ctypes.c_int, [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_long, ctypes.c_long, ctypes.c_int, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_void_p)]),
+            ("XFree", ctypes.c_int, [ctypes.c_void_p]),
+            ("XMoveResizeWindow", ctypes.c_int, [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint]),
+            ("XFlush", ctypes.c_int, [ctypes.c_void_p]),
+            ("XCloseDisplay", ctypes.c_int, [ctypes.c_void_p]),
+        ):
+            function = getattr(self.x, name)
+            function.restype, function.argtypes = restype, argtypes
+        # Windows can disappear between enumeration and placement. Ignore BadWindow.
+        self.error_handler = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)(lambda *_: 0)
+        self.x.XSetErrorHandler.argtypes = [ctypes.c_void_p]
+        self.x.XSetErrorHandler(self.error_handler)
+        self.root = self.x.XDefaultRootWindow(self.display)
+
+    def named(self, marker):
+        root, parent = ctypes.c_ulong(), ctypes.c_ulong()
+        children, count = ctypes.POINTER(ctypes.c_ulong)(), ctypes.c_uint()
+        self.x.XQueryTree(self.display, self.root, ctypes.byref(root), ctypes.byref(parent), ctypes.byref(children), ctypes.byref(count))
+        found = []
+        try:
+            for index in range(count.value):
+                name = ctypes.c_void_p()
+                actual, count_items, remaining, fmt = ctypes.c_ulong(), ctypes.c_ulong(), ctypes.c_ulong(), ctypes.c_int()
+                atom = self.x.XInternAtom(self.display, b"_NET_WM_NAME", 0)
+                self.x.XGetWindowProperty(self.display, children[index], atom, 0, 65536, 0, 0, ctypes.byref(actual), ctypes.byref(fmt), ctypes.byref(count_items), ctypes.byref(remaining), ctypes.byref(name))
+                if not name.value:
+                    self.x.XFetchName(self.display, children[index], ctypes.byref(name))
+                if name.value:
+                    try:
+                        if marker in ctypes.string_at(name).decode("utf-8", "replace"):
+                            found.append(children[index])
+                    finally:
+                        self.x.XFree(name)
+        finally:
+            if children:
+                self.x.XFree(children)
+        return found
+
+    def place(self, window, slot, columns):
+        self.x.XMoveResizeWindow(self.display, window, (slot % columns) * 1440 + 16, (slot // columns) * 900 + 16, 1408, 868)
+        self.x.XFlush(self.display)
+
+    def close(self):
+        self.x.XCloseDisplay(self.display)
+
+
+class WindowGroup:
+    def __init__(self, identity, slot):
+        self.identity, self.slot = identity, slot
+        self.pages, self.windows = {}, set()
+        self.active = None
+        self.human = False
+
+    def add(self, page):
+        if page not in self.pages.values():
+            identity = uuid.uuid4().hex
+            self.pages[identity] = page
+            self.active = identity
+
+    def live(self):
+        self.pages = {identity: page for identity, page in self.pages.items() if not page.is_closed()}
+        if self.active not in self.pages:
+            self.active = next(iter(self.pages), None)
+        return self.pages
+
+
+async def backend(args):
+    from playwright.async_api import async_playwright
+    args.shared_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    profile_lock = (args.shared_root / "backend.lock").open("a+")
+    fcntl.flock(profile_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    socket_path = args.shared_root / "backend.sock"
+    socket_path.unlink(missing_ok=True)
+    capacity = min(args.capacity, 256)
+    columns = math.ceil(math.sqrt(capacity + 1))
+    rows = math.ceil((capacity + 1) / columns)
+    display_server = start([os.environ.get("PANTHEON_XVFB", "Xvfb"), "-displayfd", "1", "-screen", "0", f"{columns * 1440}x{rows * 900}x24", "-nolisten", "tcp"], stdout=subprocess.PIPE)
+    browser = playwright = x = server = None
+    connections = set()
+    groups = {}
+    stopped = asyncio.Event()
+    stopping = False
+    opening = asyncio.Lock()
+    # Firefox/GTK has one core keyboard focus. Serialize input operations, and
+    # do not let another agent steal it during an explicit human lease.
+    focus = asyncio.Lock()
+
+    async def identify(page, group):
+        marker = "pantheon-window-" + uuid.uuid4().hex
+        old = await page.title()
+        try:
+            await page.evaluate("title => document.title = title", marker)
+            for _ in range(100):
+                windows = x.named(marker)
+                if windows:
+                    group.windows.update(windows)
+                    for window in windows:
+                        x.place(window, group.slot, columns)
+                    return
+                await asyncio.sleep(0.02)
+            # Background tabs use their already identified parent window.
+            if not group.windows:
+                raise RuntimeError("could not identify browser window")
+        finally:
+            if not page.is_closed():
+                await page.evaluate("title => document.title = title", old)
+
+    def owner_of(page):
+        return next((group for group in groups.values() if page in group.pages.values()), None)
+
+    async def new_page(page):
+        # Explicit opens are registered by their RPC before classifying popups.
+        await asyncio.sleep(0.1)
+        if owner_of(page):
+            return
+        opener = await page.opener()
+        group = owner_of(opener) if opener else None
+        if group is None:
+            await asyncio.sleep(0.5)
+            if owner_of(page):
+                return
+            group = next((group for group in groups.values() if group.human), None)
+        if group:
+            group.add(page)
+            await identify(page, group)
+        elif not page.is_closed():
+            # Unattributed windows never become visible to another agent.
+            await page.close()
+
+    async def close_group(group):
+        groups.pop(group.identity, None)
+        group.human = False
+        if stopping:
+            return
+        for page in list(group.pages.values()):
+            if not page.is_closed():
+                with contextlib.suppress(Exception):
+                    await page.close()
+
+    async def act(group, request):
+        action = request.get("action")
+        if action == "close":
+            await close_group(group)
+            return {"closed": True}
+        if action == "handoff":
+            async with focus:
+                if any(other.human and other is not group for other in groups.values()):
+                    raise RuntimeError("another window has human input ownership; resume it first")
+                group.human = True
+                if group.live():
+                    await group.pages[group.active].bring_to_front()
+            return {"state": "human"}
+        if action == "resume":
+            for identity, page in group.live().items():
+                if await page.evaluate("document.visibilityState") == "visible":
+                    group.active = identity
+            group.human = False
+            return {"state": "agent"}
+        if group.human:
+            raise RuntimeError("automation paused while human owns this window")
+        if action in ("click", "type", "select_tab", "new_tab", "close_tab", "screenshot"):
+            async with focus:
+                if any(other.human for other in groups.values()):
+                    raise RuntimeError("shared browser keyboard focus is leased to the user; navigation and snapshots in other windows remain available")
+                return await page_action(group, request)
+        return await page_action(group, request)
+
+    async def page_action(group, request):
+        action = request.get("action")
+        group.live()
+        if not group.pages:
+            # Closing every tab affects this group only; the hidden keeper holds
+            # the shared profile alive. Recreate a blank window in the same slot.
+            async with opening:
+                page = await browser.new_page()
+                group.add(page)
+                await identify(page, group)
+        page = group.pages[group.active]
+        page.set_default_timeout(20000)
+        if action == "navigate":
+            url = request["url"]
+            if not isinstance(url, str) or not url.startswith(("http://", "https://", "about:blank")):
+                raise ValueError("navigate requires an http(s) URL")
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            return {"url": page.url, "title": await page.title()}
+        if action in ("snapshot", "tabs"):
+            result = {"url": page.url, "tabs": [{"tab_id": identity, "url": tab.url, "active": identity == group.active} for identity, tab in group.live().items()]}
+            if action == "snapshot":
+                snapshot = await page.locator("body").aria_snapshot(timeout=20000)
+                result.update(title=await page.title(), snapshot=snapshot[:50000], truncated=len(snapshot) > 50000)
+            return result
+        if action in ("select_tab", "close_tab"):
+            identity = request["tab_id"]
+            if identity not in group.pages:
+                raise ValueError("tab does not belong to this browser window")
+            if action == "select_tab":
+                group.active = identity
+                await group.pages[identity].bring_to_front()
+            else:
+                await group.pages[identity].close()
+                group.live()
+            return {"done": True, "tab_id": identity}
+        if action == "new_tab":
+            async with browser.expect_page() as pending:
+                await page.evaluate("() => window.open('about:blank', '_blank')")
+            tab = await pending.value
+            group.add(tab)
+            await identify(tab, group)
+            return {"tab_id": group.active, "url": tab.url}
+        if action in ("click", "type"):
+            if request.get("role"):
+                locator = page.get_by_role(request["role"], name=request.get("name", ""), exact=True)
+            elif request.get("selector"):
+                locator = page.locator(request["selector"])
+            else:
+                raise ValueError("provide role/name or a CSS selector")
+            if action == "click":
+                await locator.click()
+            else:
+                await locator.fill(request["text"])
+            return {"url": page.url, "done": True}
+        if action == "screenshot":
+            destination = Path(request["path"]).resolve()
+            if destination.parent.parent != args.shared_root.parent.resolve() or destination.suffix != ".png":
+                raise ValueError("screenshot destination escapes browser state")
+            await page.screenshot(path=str(destination), full_page=False)
+            return {"path": str(destination), "mime_type": "image/png", "url": page.url}
+        raise ValueError("unknown browser action")
+
+    async def connection(reader, writer):
+        task = asyncio.current_task()
+        connections.add(task)
+        group = None
+        try:
+            while frame := await reader.readline():
+                try:
+                    request = json.loads(frame)
+                    if request.get("action") == "open":
+                        async with opening, focus:
+                            if group or request["browser_id"] in groups:
+                                raise ValueError("browser window already open")
+                            if any(existing.human for existing in groups.values()):
+                                raise RuntimeError("resume the human window before opening a new window")
+                            used = {existing.slot for existing in groups.values()}
+                            slot = next((slot for slot in range(capacity) if slot not in used), None)
+                            if slot is None:
+                                raise RuntimeError("shared browser window capacity exhausted")
+                            group = WindowGroup(request["browser_id"], slot)
+                            groups[group.identity] = group
+                            page = await browser.new_page()
+                            group.add(page)
+                            await identify(page, group)
+                            response = {"display": display, "clip": f"1440x900+{slot % columns * 1440}+{slot // columns * 900}"}
+                    elif group is None:
+                        raise ValueError("open a window first")
+                    else:
+                        response = await act(group, request)
+                except Exception as error:
+                    response = {"error": str(error)[:2000]}
+                writer.write((json.dumps(response) + "\n").encode())
+                await writer.drain()
+                if request.get("action") == "close":
+                    break
+        finally:
+            if group:
+                await close_group(group)
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+            connections.discard(task)
+
+    try:
+        number = await asyncio.wait_for(asyncio.to_thread(display_server.stdout.readline), 15)
+        if not number.strip().isdigit():
+            raise RuntimeError("Xvfb failed to allocate shared display")
+        display = ":" + number.decode().strip()
+        os.environ["DISPLAY"] = display
+        executable = os.environ.get("PANTHEON_CAMOUFOX")
+        if not executable or not Path(executable).is_file():
+            raise RuntimeError("PANTHEON_CAMOUFOX must point to the packaged executable")
+        playwright = await async_playwright().start()
+        browser = await playwright.firefox.launch_persistent_context(str(args.shared_root / "profile"), executable_path=executable, headless=False,
+            viewport={"width": 1280, "height": 720},
+            firefox_user_prefs={"browser.shell.checkDefaultBrowser": False, "browser.startup.homepage_override.mstone": "ignore",
+                "browser.cache.disk.enable": True, "browser.cache.disk.capacity": 262144,
+                "browser.link.open_newwindow": 3, "browser.link.open_newwindow.restriction": 0})
+        x = XWindows(display)
+        keeper = WindowGroup("keeper", capacity)
+        keeper.add(browser.pages[0] if browser.pages else await browser.new_page())
+        await identify(keeper.pages[keeper.active], keeper)
+        # A restart keeps login state, but does not resurrect unowned stale tabs.
+        for page in list(browser.pages):
+            if page not in keeper.pages.values():
+                await page.close()
+        def on_page(page):
+            task = asyncio.create_task(new_page(page))
+            task.add_done_callback(lambda finished: finished.exception() if not finished.cancelled() else None)
+        browser.on("page", on_page)
+        browser.on("close", lambda: stopped.set())
+        server = await asyncio.start_unix_server(connection, path=str(socket_path), limit=1_000_000)
+        socket_path.chmod(0o600)
+        emit({"ready": True, "display": display, "profile": "pantheon-shared"})
+        stdin = asyncio.StreamReader()
+        transport, _ = await asyncio.get_running_loop().connect_read_pipe(lambda: asyncio.StreamReaderProtocol(stdin), sys.stdin)
+        read_task = asyncio.create_task(stdin.readline())
+        close_task = asyncio.create_task(stopped.wait())
+        try:
+            await asyncio.wait([read_task, close_task], return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            read_task.cancel()
+            close_task.cancel()
+            await asyncio.gather(read_task, close_task, return_exceptions=True)
+            transport.close()
+    except Exception as error:
+        emit({"error": str(error)[:2000]})
+        raise
+    finally:
+        stopping = True
+        if server:
+            server.close()
+            await server.wait_closed()
+        for task in list(connections):
+            task.cancel()
+        await asyncio.gather(*list(connections), return_exceptions=True)
+        if browser:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(browser.close(), 10)
+        if playwright:
+            with contextlib.suppress(Exception):
+                await playwright.stop()
+        if x:
+            x.close()
+        display_server.terminate()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(asyncio.to_thread(display_server.wait), 3)
+        if display_server.poll() is None:
+            display_server.kill()
+            await asyncio.to_thread(display_server.wait)
+        socket_path.unlink(missing_ok=True)
+        profile_lock.close()
+
+
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", type=Path)
+    parser.add_argument("--shared-root", type=Path)
+    parser.add_argument("--backend", action="store_true")
+    parser.add_argument("--capacity", type=int, default=16)
     parser.add_argument("--port", type=int)
     parser.add_argument("--port-end", type=int)
     parser.add_argument("--reserved-ports", default="")
@@ -213,6 +539,18 @@ def main():
         logging.basicConfig(level=logging.WARNING)
         WebSocketProxy(listen_fd=args.proxy_fd, web=str(args.web), token_plugin=TokenFile(str(args.token_file))).start_server()
         return
+    if args.backend:
+        if args.shared_root is None:
+            parser.error("--shared-root is required for the shared backend")
+        try:
+            asyncio.run(backend(args))
+        except Exception as error:
+            with contextlib.suppress(BrokenPipeError):
+                emit({"error": str(error)[:2000]})
+            sys.exit(1)
+        return
+    if args.shared_root is None:
+        parser.error("--shared-root is required")
     if args.profile is None or args.port is None:
         parser.error("--profile and --port are required for browser workers")
     args.profile.mkdir(mode=0o700, parents=True, exist_ok=True)

@@ -10,7 +10,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-pub fn definitions(child: bool) -> Vec<Value> {
+pub fn definitions(child: bool, coordinator: bool) -> Vec<Value> {
     let mut tools = vec![
         tool(
             "zoom",
@@ -38,24 +38,34 @@ pub fn definitions(child: bool) -> Vec<Value> {
         ),
         tool(
             "shell",
-            "Execute a shell command in the workspace. Bounded by tool timeout. Use a subagent for long background work.",
+            "Execute a shell command. Commands exceeding the foreground budget return a background job ID; completion reaches your durable inbox. Never sleep or poll for it.",
             json!({"command":{"type":"string"}}),
             &["command"],
         ),
         tool(
             "browser",
-            "Control an isolated Camoufox browser. Open creates a browser with a dedicated live noVNC display. Handoff pauses automation until explicit resume with the returned lease token.",
-            json!({"action":{"type":"string","enum":["open","list","navigate","snapshot","click","type","screenshot","handoff","resume","close"]},"browser_id":{"type":"string"},"url":{"type":"string"},"selector":{"type":"string"},"role":{"type":"string"},"name":{"type":"string"},"text":{"type":"string"},"resume_token":{"type":"string"}}),
+            "Control your Camoufox window and tabs in the pantheon-shared profile. Cookies, logins and local storage are shared. Each window has a private live noVNC viewer. Claim an adopted browser before controlling it. Handoff pauses automation until explicit resume with the returned lease token.",
+            json!({"action":{"type":"string","enum":["open","list","navigate","snapshot","click","type","screenshot","handoff","resume","close","claim","tabs","new_tab","select_tab","close_tab"]},"browser_id":{"type":"string"},"tab_id":{"type":"string"},"url":{"type":"string"},"selector":{"type":"string"},"role":{"type":"string"},"name":{"type":"string"},"text":{"type":"string"},"resume_token":{"type":"string"}}),
             &["action"],
         ),
     ];
     if !child {
         tools.extend([
             tool("spawn","Start one background subagent per task and return their IDs immediately. Reports arrive together between tool calls or start a fresh turn. Never wait or poll for them. Children cannot spawn.",json!({"tasks":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":8}}),&["tasks"]),
-            tool("tell","Send a message to a running subagent; delivered between its tool calls.",json!({"id":{"type":"string"},"message":{"type":"string"}}),&["id","message"]),
-            tool("wakeup","Manage durable wakeups. Schedules: in 10m, once ISO8601, every 1h. Wakes preserve this channel and user.",json!({"action":{"type":"string","enum":["add","list","cancel"]},"schedule":{"type":"string"},"prompt":{"type":"string"},"id":{"type":"string"}}),&["action"]),
-            tool("monitor","Manage durable change monitors. A command runs at intervals; only changed status/output wakes the agent. Commands have timeout and bounded output.",json!({"action":{"type":"string","enum":["add","list","cancel"]},"command":{"type":"string"},"interval_seconds":{"type":"integer","minimum":5},"id":{"type":"string"}}),&["action"]),
+            tool("tell","Send a durable message to a subagent. It arrives between tool calls or resumes the same agent ID in a fresh background turn if idle.",json!({"id":{"type":"string"},"message":{"type":"string"}}),&["id","message"]),
         ]);
+    }
+    tools.extend([
+            tool("wakeup","Manage durable wakeups. Schedules: in 10m, once ISO8601, every 1h. Notifications reach the owning agent, including an idle background worker, and preserve channel and user.",json!({"action":{"type":"string","enum":["add","list","cancel"]},"schedule":{"type":"string"},"prompt":{"type":"string"},"id":{"type":"string"}}),&["action"]),
+            tool("monitor","Manage durable change monitors. A command runs at intervals; only changed status/output reaches your durable inbox. Commands have timeout and bounded output.",json!({"action":{"type":"string","enum":["add","list","cancel"]},"command":{"type":"string"},"interval_seconds":{"type":"integer","minimum":5},"id":{"type":"string"}}),&["action"]),
+    ]);
+    if !child && coordinator {
+        tools.retain(|tool| {
+            !matches!(
+                tool["name"].as_str(),
+                Some("read" | "write" | "shell" | "browser")
+            )
+        });
     }
     tools.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     tools
@@ -230,6 +240,28 @@ pub fn schedule(text: &str) -> Result<(i64, Option<i64>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coordinator_and_worker_tools_preserve_shared_scheduling() {
+        let names = |child| {
+            definitions(child, true)
+                .into_iter()
+                .map(|tool| tool["name"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(false),
+            vec!["date", "monitor", "spawn", "tell", "wakeup", "zoom"]
+        );
+        let worker = names(true);
+        for name in [
+            "read", "write", "shell", "browser", "wakeup", "monitor", "zoom", "date",
+        ] {
+            assert!(worker.contains(&name.to_owned()));
+        }
+        assert!(!worker.contains(&"spawn".to_owned()));
+        assert!(!worker.contains(&"tell".to_owned()));
+    }
     #[test]
     fn symlink_escape_is_denied() {
         let d = tempfile::tempdir().unwrap();

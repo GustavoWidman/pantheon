@@ -34,6 +34,15 @@ pub struct Job {
     pub due: i64,
     pub interval: Option<i64>,
 }
+#[derive(Debug)]
+pub struct AgentRecord {
+    pub channel: u64,
+    pub user: u64,
+    pub task: String,
+    pub report: String,
+    pub model: String,
+    pub reasoning: String,
+}
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let db = Connection::open(path)?;
@@ -50,7 +59,12 @@ impl Store {
         CREATE INDEX IF NOT EXISTS outbox_pending ON outbox(channel,seq) WHERE state='queued';
         CREATE INDEX IF NOT EXISTS jobs_due ON jobs(due) WHERE state='active';
         CREATE INDEX IF NOT EXISTS tasks_batch ON tasks(batch,state);
-        PRAGMA user_version=1;")?;
+        CREATE TABLE IF NOT EXISTS agent_settings(id TEXT PRIMARY KEY,model TEXT NOT NULL,reasoning TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS agent_runs(id TEXT PRIMARY KEY,owner TEXT NOT NULL,state TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS agent_inbox(id TEXT PRIMARY KEY,owner TEXT NOT NULL,channel TEXT NOT NULL,user TEXT NOT NULL,text TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'queued',created INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS agent_inbox_pending ON agent_inbox(owner,created) WHERE state='queued';
+        CREATE TABLE IF NOT EXISTS shell_runs(id TEXT PRIMARY KEY,owner TEXT NOT NULL,channel TEXT NOT NULL,user TEXT NOT NULL,command TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'running',background INTEGER NOT NULL DEFAULT 0,output TEXT);
+        PRAGMA user_version=2;")?;
         Ok(Self { db: Mutex::new(db) })
     }
     pub fn admit(&self, input: &Input) -> Result<bool> {
@@ -284,47 +298,56 @@ impl Store {
             params![id, channel.to_string()],
         )? == 1)
     }
-    pub fn fire_wakeup(&self, job: &Job, text: &str) -> Result<()> {
+    pub fn fire_wakeup(&self, job: &Job, text: &str) -> Result<bool> {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
         let id = format!("wake:{}:{}", job.id, job.due);
-        tx.execute(
-            "INSERT OR IGNORE INTO inbox(id,channel,user,text,created) VALUES(?1,?2,?3,?4,?5)",
-            params![
-                id,
-                job.channel.to_string(),
-                job.user.to_string(),
-                text,
-                now()
-            ],
+        if !job_active(&tx, job)? {
+            return Ok(false);
+        }
+        deliver_event(
+            &tx,
+            &id,
+            job.payload["_owner"]
+                .as_str()
+                .unwrap_or(&format!("channel:{}", job.channel)),
+            job.channel,
+            job.user,
+            text,
         )?;
         advance(&tx, job)?;
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
     pub fn monitor_result(&self, job: &Job, value: &str) -> Result<bool> {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
+        if !job_active(&tx, job)? {
+            return Ok(false);
+        }
         let previous: Option<String> =
             tx.query_row("SELECT last FROM jobs WHERE id=?1", [&job.id], |r| r.get(0))?;
         let changed = previous.as_deref() != Some(value);
         if changed {
-            tx.execute(
-                "INSERT OR IGNORE INTO inbox(id,channel,user,text,created) VALUES(?1,?2,?3,?4,?5)",
-                params![
-                    format!("monitor:{}:{}", job.id, job.due),
-                    job.channel.to_string(),
-                    job.user.to_string(),
-                    format!(
-                        "[monitor {}] {}\n{}",
-                        job.id,
-                        job.payload["prompt"]
-                            .as_str()
-                            .unwrap_or("Monitor output changed"),
-                        value
-                    ),
-                    now()
-                ],
+            if !job_active(&tx, job)? {
+                return Ok(false);
+            }
+            deliver_event(
+                &tx,
+                &format!("monitor:{}:{}", job.id, job.due),
+                job.payload["_owner"]
+                    .as_str()
+                    .unwrap_or(&format!("channel:{}", job.channel)),
+                job.channel,
+                job.user,
+                &format!(
+                    "[monitor {}] {}\n{}",
+                    job.id,
+                    job.payload["prompt"]
+                        .as_str()
+                        .unwrap_or("Monitor output changed"),
+                    value
+                ),
             )?;
         }
         tx.execute(
@@ -352,44 +375,7 @@ impl Store {
     pub fn finish_task(&self, id: &str, report: &str) -> Result<()> {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
-        tx.execute(
-            "UPDATE tasks SET state='done',report=?2 WHERE id=?1",
-            params![id, report],
-        )?;
-        let (batch, channel, user): (String, String, String) = tx.query_row(
-            "SELECT batch,channel,user FROM tasks WHERE id=?1",
-            [id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?;
-        let active: i64 = tx.query_row(
-            "SELECT count(*) FROM tasks WHERE batch=?1 AND state='running'",
-            [&batch],
-            |r| r.get(0),
-        )?;
-        if active == 0 {
-            let reports = {
-                let mut s =
-                    tx.prepare("SELECT id,report FROM tasks WHERE batch=?1 ORDER BY rowid")?;
-                s.query_map([&batch], |r| {
-                    Ok(format!(
-                        "[{}] {}",
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?
-                    ))
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-            };
-            tx.execute(
-                "INSERT OR IGNORE INTO inbox(id,channel,user,text,created) VALUES(?1,?2,?3,?4,?5)",
-                params![
-                    format!("batch:{batch}"),
-                    channel,
-                    user,
-                    reports.join("\n\n"),
-                    now()
-                ],
-            )?;
-        }
+        finish_task_transaction(&tx, id, report)?;
         tx.commit()?;
         Ok(())
     }
@@ -414,6 +400,130 @@ impl Store {
             .execute("UPDATE tool_runs SET state='done' WHERE id=?1", [id])?;
         Ok(())
     }
+
+    pub fn register_agent(&self, id: &str, model: &str, reasoning: &str) -> Result<()> {
+        self.db.lock().unwrap().execute(
+            "INSERT INTO agent_settings(id,model,reasoning) VALUES(?1,?2,?3)",
+            params![id, model, reasoning],
+        )?;
+        Ok(())
+    }
+    pub fn agent(&self, id: &str) -> Result<Option<AgentRecord>> {
+        Ok(self.db.lock().unwrap().query_row("SELECT t.channel,t.user,t.task,COALESCE(t.report,''),a.model,a.reasoning FROM tasks t JOIN agent_settings a ON a.id=t.id WHERE t.id=?1",[id],|r|Ok(AgentRecord{channel:r.get::<_,String>(0)?.parse().unwrap_or(0),user:r.get::<_,String>(1)?.parse().unwrap_or(0),task:r.get(2)?,report:r.get(3)?,model:r.get(4)?,reasoning:r.get(5)?})).optional()?)
+    }
+    pub fn admit_event(&self, input: &Input, owner: &str) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        deliver_event(
+            &tx,
+            &input.id,
+            owner,
+            input.channel,
+            input.user,
+            &input.text,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn agent_events(&self, owner: &str) -> Result<Vec<Input>> {
+        let db = self.db.lock().unwrap();
+        let mut stmt=db.prepare("SELECT id,channel,user,text FROM agent_inbox WHERE owner=?1 AND state='queued' ORDER BY created,rowid")?;
+        Ok(stmt
+            .query_map([owner], |r| {
+                Ok(Input {
+                    id: r.get(0)?,
+                    channel: r.get::<_, String>(1)?.parse().unwrap_or(0),
+                    user: r.get::<_, String>(2)?.parse().unwrap_or(0),
+                    text: r.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?)
+    }
+    pub fn agent_event_done(&self, id: &str) -> Result<()> {
+        self.db
+            .lock()
+            .unwrap()
+            .execute("UPDATE agent_inbox SET state='done' WHERE id=?1", [id])?;
+        Ok(())
+    }
+    pub fn pending_agents(&self) -> Result<Vec<String>> {
+        let db = self.db.lock().unwrap();
+        let mut stmt = db.prepare("SELECT DISTINCT owner FROM agent_inbox WHERE state='queued'")?;
+        Ok(stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?)
+    }
+    pub fn agent_run_start(&self, id: &str, owner: &str) -> Result<()> {
+        self.db.lock().unwrap().execute(
+            "INSERT INTO agent_runs(id,owner,state) VALUES(?1,?2,'running')",
+            params![id, owner],
+        )?;
+        Ok(())
+    }
+    pub fn finish_agent(&self, id: &str, report: &str, delivery_id: &str) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let (state, channel, user): (String, String, String) = tx.query_row(
+            "SELECT state,channel,user FROM tasks WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        if state == "running" {
+            finish_task_transaction(&tx, id, report)?;
+        } else {
+            tx.execute(
+                "UPDATE tasks SET report=?2 WHERE id=?1",
+                params![id, report],
+            )?;
+            deliver_event(
+                &tx,
+                delivery_id,
+                &format!("channel:{channel}"),
+                channel.parse()?,
+                user.parse()?,
+                &format!("[{id}] {report}"),
+            )?;
+        }
+        tx.execute(
+            "UPDATE agent_runs SET state='done' WHERE id=?1",
+            [delivery_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn shell_start(
+        &self,
+        id: &str,
+        owner: &str,
+        channel: u64,
+        user: u64,
+        command: &str,
+    ) -> Result<()> {
+        self.db.lock().unwrap().execute(
+            "INSERT INTO shell_runs(id,owner,channel,user,command) VALUES(?1,?2,?3,?4,?5)",
+            params![id, owner, channel.to_string(), user.to_string(), command],
+        )?;
+        Ok(())
+    }
+    pub fn shell_detach(&self, id: &str) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        tx.execute("UPDATE shell_runs SET background=1 WHERE id=?1", [id])?;
+        shell_delivery(&tx, id)?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn shell_finish(&self, id: &str, output: &str, cancelled: bool) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        tx.execute(
+            "UPDATE shell_runs SET state=?2,output=?3 WHERE id=?1",
+            params![id, if cancelled { "cancelled" } else { "done" }, output],
+        )?;
+        shell_delivery(&tx, id)?;
+        tx.commit()?;
+        Ok(())
+    }
     pub fn recover(&self) -> Result<()> {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
@@ -436,6 +546,49 @@ impl Store {
             "UPDATE tool_runs SET state='unknown' WHERE state='running'",
             [],
         )?;
+        let shells = {
+            let mut stmt = tx.prepare("SELECT id FROM shell_runs WHERE state='running'")?;
+            stmt.query_map([], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for id in shells {
+            tx.execute("UPDATE shell_runs SET state='done',background=1,output='Interrupted by harness restart. Inspect command effects before retrying; the command was not replayed.' WHERE id=?1",[&id])?;
+            shell_delivery(&tx, &id)?;
+        }
+        let active_agents = {
+            let mut stmt=tx.prepare("SELECT r.id,r.owner,t.channel,t.user,t.state FROM agent_runs r JOIN tasks t ON t.id=r.owner WHERE r.state='running'")?;
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for (run, owner, channel, user, initial_state) in active_agents {
+            if initial_state != "running" {
+                let report = "A resumed worker turn was interrupted by harness restart. Inspect its saved trace and tool effects before retrying; its provider conversation was not replayed.";
+                tx.execute(
+                    "UPDATE tasks SET report=?2 WHERE id=?1",
+                    params![owner, report],
+                )?;
+                deliver_event(
+                    &tx,
+                    &format!("recovery:{run}"),
+                    &format!("channel:{channel}"),
+                    channel.parse()?,
+                    user.parse()?,
+                    &format!("[{owner}] {report}"),
+                )?;
+            }
+            tx.execute(
+                "UPDATE agent_runs SET state='interrupted' WHERE id=?1",
+                [run],
+            )?;
+        }
         let unfinished = {
             let mut s = tx.prepare("SELECT id FROM tasks WHERE state='running'")?;
             s.query_map([], |r| r.get::<_, String>(0))?
@@ -452,6 +605,88 @@ impl Store {
         Ok(())
     }
 }
+fn finish_task_transaction(tx: &rusqlite::Transaction<'_>, id: &str, report: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE tasks SET state='done',report=?2 WHERE id=?1",
+        params![id, report],
+    )?;
+    let (batch, channel, user): (String, String, String) = tx.query_row(
+        "SELECT batch,channel,user FROM tasks WHERE id=?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let active: i64 = tx.query_row(
+        "SELECT count(*) FROM tasks WHERE batch=?1 AND state='running'",
+        [&batch],
+        |r| r.get(0),
+    )?;
+    if active == 0 {
+        let reports = {
+            let mut s = tx.prepare("SELECT id,report FROM tasks WHERE batch=?1 ORDER BY rowid")?;
+            s.query_map([&batch], |r| {
+                Ok(format!(
+                    "[{}] {}",
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        tx.execute(
+            "INSERT OR IGNORE INTO inbox(id,channel,user,text,created) VALUES(?1,?2,?3,?4,?5)",
+            params![
+                format!("batch:{batch}"),
+                channel,
+                user,
+                reports.join("\n\n"),
+                now()
+            ],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn job_active(tx: &rusqlite::Transaction<'_>, job: &Job) -> Result<bool> {
+    Ok(tx.query_row(
+        "SELECT state='active' AND due=?2 FROM jobs WHERE id=?1",
+        params![job.id, job.due],
+        |r| r.get(0),
+    )?)
+}
+fn deliver_event(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    owner: &str,
+    channel: u64,
+    user: u64,
+    text: &str,
+) -> Result<()> {
+    if owner == format!("channel:{channel}") {
+        tx.execute(
+            "INSERT OR IGNORE INTO inbox(id,channel,user,text,created) VALUES(?1,?2,?3,?4,?5)",
+            params![id, channel.to_string(), user.to_string(), text, now()],
+        )?;
+    } else {
+        tx.execute("INSERT OR IGNORE INTO agent_inbox(id,owner,channel,user,text,created) VALUES(?1,?2,?3,?4,?5,?6)",params![id,owner,channel.to_string(),user.to_string(),text,now()])?;
+    }
+    Ok(())
+}
+fn shell_delivery(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<()> {
+    let result:Option<(String,String,String,String)>=tx.query_row("SELECT owner,channel,user,output FROM shell_runs WHERE id=?1 AND state='done' AND background=1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+    if let Some((owner, channel, user, output)) = result {
+        deliver_event(
+            tx,
+            &format!("shell:{id}"),
+            &owner,
+            channel.parse()?,
+            user.parse()?,
+            &format!("[shell {id}] {output}"),
+        )?;
+    }
+    Ok(())
+}
+
 fn advance(tx: &rusqlite::Transaction<'_>, job: &Job) -> Result<()> {
     // Collapse missed intervals into one wake rather than flooding the inbox after downtime.
     if let Some(interval) = job.interval {
@@ -470,6 +705,108 @@ pub fn now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resumed_agent_interruption_is_reported_once_after_consuming_its_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("db");
+        let store = Store::open(&path).unwrap();
+        store.add_task("child", "batch", 1, 2, "work").unwrap();
+        store.finish_task("child", "initial report").unwrap();
+        store.agent_run_start("resumed", "child").unwrap();
+        store
+            .admit_event(
+                &Input {
+                    id: "event".into(),
+                    channel: 1,
+                    user: 2,
+                    text: "completion".into(),
+                },
+                "child",
+            )
+            .unwrap();
+        store.agent_event_done("event").unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        store.recover().unwrap();
+        store.recover().unwrap();
+        let reports = store.queued(1).unwrap();
+        assert_eq!(reports.len(), 2);
+        assert!(reports[1].text.contains("resumed worker turn"));
+        assert!(store.agent_events("child").unwrap().is_empty());
+    }
+    #[test]
+    fn owned_schedules_route_to_child_and_honor_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("db")).unwrap();
+        let job = Job {
+            id: "wake".into(),
+            channel: 1,
+            user: 2,
+            kind: "wakeup".into(),
+            payload: serde_json::json!({"_owner":"child","prompt":"check"}),
+            due: now(),
+            interval: None,
+        };
+        store.add_job(&job).unwrap();
+        store.fire_wakeup(&job, "wake child").unwrap();
+        store.fire_wakeup(&job, "duplicate").unwrap();
+        assert!(store.queued(1).unwrap().is_empty());
+        assert_eq!(store.agent_events("child").unwrap().len(), 1);
+        assert_eq!(store.agent_events("child").unwrap()[0].text, "wake child");
+        let monitor = Job {
+            id: "monitor".into(),
+            kind: "monitor".into(),
+            interval: Some(5),
+            ..job
+        };
+        store.add_job(&monitor).unwrap();
+        assert!(store.monitor_result(&monitor, "changed").unwrap());
+        store.cancel_job(1, "monitor").unwrap();
+        assert!(!store.monitor_result(&monitor, "later").unwrap());
+        assert_eq!(store.agent_events("child").unwrap().len(), 2);
+    }
+    #[test]
+    fn shell_completion_is_once_in_both_detach_race_orders() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("db")).unwrap();
+        for id in ["first", "second", "foreground", "cancelled"] {
+            store.shell_start(id, "child", 1, 2, "test").unwrap();
+        }
+        store.shell_detach("first").unwrap();
+        store.shell_finish("first", "first result", false).unwrap();
+        store.shell_detach("first").unwrap();
+        store
+            .shell_finish("second", "second result", false)
+            .unwrap();
+        store.shell_detach("second").unwrap();
+        store
+            .shell_finish("foreground", "inline result", false)
+            .unwrap();
+        store.shell_detach("cancelled").unwrap();
+        store.shell_finish("cancelled", "stopped", true).unwrap();
+        let events = store.agent_events("child").unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events[0].text.contains("first result"));
+        assert!(events[1].text.contains("second result"));
+        assert!(store.queued(1).unwrap().is_empty());
+    }
+    #[test]
+    fn interrupted_shell_is_reported_after_restart_and_never_replayed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("db");
+        let store = Store::open(&path).unwrap();
+        store
+            .shell_start("command", "child", 1, 2, "irreversible command")
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        store.recover().unwrap();
+        store.recover().unwrap();
+        let events = store.agent_events("child").unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].text.contains("not replayed"));
+    }
     #[test]
     fn admission_and_delivery_survive_restart() {
         let d = tempfile::tempdir().unwrap();

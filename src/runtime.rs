@@ -28,6 +28,8 @@ pub struct Harness {
     channels: Mutex<HashMap<u64, Arc<Channel>>>,
     children: Mutex<HashMap<String, Child>>,
     capacity: Arc<Semaphore>,
+    shell_capacity: Arc<Semaphore>,
+    shell_jobs: Mutex<HashMap<String, (u64, CancellationToken)>>,
     shutdown: CancellationToken,
     master_system: String,
     child_system: String,
@@ -40,8 +42,19 @@ struct Channel {
 }
 struct Child {
     channel: u64,
-    messages: mpsc::Sender<String>,
     cancel: CancellationToken,
+}
+struct ChildStart {
+    id: String,
+    channel: u64,
+    user: u64,
+    task: String,
+    previous: String,
+    settings: (String, String),
+    memory: Arc<Channel>,
+    view: Option<String>,
+    cancel: CancellationToken,
+    permit: tokio::sync::OwnedSemaphorePermit,
 }
 struct Run {
     channel: u64,
@@ -53,7 +66,6 @@ struct Run {
     settings: (String, String),
     history: Vec<Value>,
     inputs: Vec<String>,
-    mailbox: Option<mpsc::Receiver<String>>,
     trace: Option<Memory>,
     steering: Vec<String>,
 }
@@ -72,6 +84,8 @@ impl Harness {
             provider: Provider::new(config.agent.request_timeout_seconds)?,
             browser: BrowserManager::new(config.state_dir.join("browsers"), config.browser.clone()),
             capacity: Arc::new(Semaphore::new(config.agent.max_subagents)),
+            shell_capacity: Arc::new(Semaphore::new(config.agent.max_shell_jobs)),
+            shell_jobs: Mutex::new(HashMap::new()),
             master_system: format!("{}\n{}", include_str!("master.txt"), instructions),
             child_system: format!("{}\n{}", include_str!("child.txt"), instructions),
             config,
@@ -271,7 +285,6 @@ impl Harness {
                 history: Provider::start(vendor, &view.unwrap(), &texts.join("\n\n")),
                 settings,
                 inputs: ids,
-                mailbox: None,
                 trace: None,
                 steering: vec![],
             };
@@ -299,7 +312,7 @@ impl Harness {
         Box::pin(async move {
             let (vendor, _) = model_parts(&run.settings.0)?;
             let vendor = vendor.to_string();
-            let defs = tools::definitions(run.child);
+            let defs = tools::definitions(run.child, self.config.agent.coordinator_root);
             let system = if run.child {
                 &self.child_system
             } else {
@@ -413,7 +426,17 @@ impl Harness {
                 if final_steered {
                     continue;
                 }
-                return Ok(transcript);
+                return Ok(if run.child {
+                    response
+                        .texts
+                        .iter()
+                        .filter(|(_, thought)| !*thought)
+                        .map(|(text, _)| text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                } else {
+                    transcript
+                });
             }
             for (index, call) in response.calls.iter().enumerate() {
                 // Each boundary can receive steering; the next request keeps the exact prior prefix.
@@ -507,15 +530,12 @@ impl Harness {
     async fn steer(&self, run: &mut Run, _vendor: &str) -> Result<bool> {
         let mut received = false;
         if run.child {
-            let mut messages = vec![];
-            if let Some(rx) = run.mailbox.as_mut() {
-                while let Ok(text) = rx.try_recv() {
-                    messages.push(text);
+            for input in self.store.agent_events(&run.owner)? {
+                if let Some(trace) = run.trace.as_mut() {
+                    trace.append_with_id(Kind::User, &input.text, &input.id)?;
                 }
-            }
-            for text in messages {
-                self.log_run(run, Kind::User, &text).await?;
-                run.steering.push(text);
+                self.store.agent_event_done(&input.id)?;
+                run.steering.push(input.text);
                 received = true;
             }
         } else {
@@ -531,6 +551,13 @@ impl Harness {
         Ok(received)
     }
     async fn execute_tool(self: &Arc<Self>, run: &mut Run, call: &ToolCall) -> Result<String> {
+        ensure!(
+            tools::definitions(run.child, self.config.agent.coordinator_root)
+                .iter()
+                .any(|tool| tool["name"] == call.name),
+            "tool {} is unavailable to this agent",
+            call.name
+        );
         let a = &call.arguments;
         let value = match call.name.as_str() {
             "zoom" => {
@@ -569,15 +596,28 @@ impl Harness {
                 json!({"written":text.len()})
             }
             "shell" => {
-                return tools::shell(
-                    &self.config.workspace,
-                    tools::string(a, "command")?,
-                    self.config.agent.tool_timeout_seconds,
-                    &run.cancel,
-                )
-                .await;
+                return self.shell_tool(run, tools::string(a, "command")?).await;
             }
-            "browser" => self.browser.execute(&run.owner, a.clone()).await?,
+            "browser" => {
+                let parent = format!("channel:{}", run.channel);
+                if a["action"] == "claim" {
+                    self.browser
+                        .claim_owner(tools::string(a, "browser_id")?, &parent, &run.owner)
+                        .await?
+                } else if run.child && a["action"] == "list" {
+                    let mut own = self.browser.execute(&run.owner, a.clone()).await?;
+                    let adopted = self.browser.execute(&parent, a.clone()).await?;
+                    for browser in adopted["browsers"].as_array().into_iter().flatten() {
+                        let mut browser = browser.clone();
+                        browser["needs_claim"] = json!(true);
+                        own["browsers"].as_array_mut().unwrap().push(browser);
+                    }
+                    own
+                } else {
+                    self.browser.execute(&run.owner, a.clone()).await?
+                }
+            }
+
             "spawn" => {
                 ensure!(!run.child, "subagents cannot spawn");
                 let tasks = a["tasks"].as_array().context("tasks must be an array")?;
@@ -609,105 +649,257 @@ impl Harness {
                         .add_task(id, &batch, run.channel, run.user, task)?;
                 }
                 for ((id, task), permit) in ids.iter().zip(tasks).zip(permits) {
-                    let id = id.clone();
-                    let (tx, rx) = mpsc::channel(64);
-                    let cancel = run.cancel.child_token();
-                    self.children.lock().await.insert(
-                        id.clone(),
-                        Child {
-                            channel: run.channel,
-                            messages: tx,
-                            cancel: cancel.clone(),
-                        },
-                    );
-                    let h = self.clone();
-                    let memory = run.memory.clone();
-                    let settings = run.settings.clone();
-                    let channel = run.channel;
-                    let user = run.user;
-                    let view = view.clone();
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        let result = async {
-                            let mut trace = Memory::open(
-                                h.config.state_dir.join("subagents").join(&id),
-                                h.config.agent.view_bytes,
-                            )?;
-                            trace.append(Kind::User, &task)?;
-                            let (vendor, _) = model_parts(&settings.0)?;
-                            let child = Run {
-                                channel,
-                                user,
-                                owner: id.clone(),
-                                child: true,
-                                memory: memory.clone(),
-                                cancel,
-                                settings: settings.clone(),
-                                history: Provider::start(vendor, &view, &task),
-                                inputs: vec![],
-                                mailbox: Some(rx),
-                                trace: Some(trace),
-                                steering: vec![],
-                            };
-                            h.clone().run_agent(child).await
-                        }
-                        .await;
-                        let mut report = match result {
-                            Ok(text) => text,
-                            Err(e) => format!("Task stopped: {e}"),
-                        };
-                        if let Err(e) = h
-                            .browser
-                            .transfer_owner(&id, &format!("channel:{channel}"))
-                            .await
-                        {
-                            report.push_str(&format!("\nBrowser ownership transfer failed: {e}"));
-                            h.shutdown.cancel();
-                        }
-                        if let Err(e) = h.store.finish_task(&id, &report) {
-                            tracing::error!(error=%e,"persist subagent report failed");
-                            h.shutdown.cancel();
-                        }
-                        h.children.lock().await.remove(&id);
-                        memory.incoming.notify_one();
-                    });
+                    self.store
+                        .register_agent(id, &run.settings.0, &run.settings.1)?;
+                    self.start_child(ChildStart {
+                        id: id.clone(),
+                        channel: run.channel,
+                        user: run.user,
+                        task,
+                        previous: String::new(),
+                        settings: run.settings.clone(),
+                        memory: run.memory.clone(),
+                        view: Some(view.clone()),
+                        cancel: run.cancel.child_token(),
+                        permit,
+                    })
+                    .await?;
                 }
+
                 json!({"batch":batch,"ids":ids,"mode":"background"})
             }
             "tell" => {
                 ensure!(!run.child, "child cannot tell other agents");
                 let id = tools::string(a, "id")?;
-                let children = self.children.lock().await;
-                let child = children
-                    .get(id)
-                    .context("no running subagent with that ID")?;
-                ensure!(
-                    child.channel == run.channel,
-                    "subagent belongs to another channel"
-                );
-                child
-                    .messages
-                    .try_send(tools::string(a, "message")?.to_string())
-                    .context("subagent mailbox full or closed")?;
+                let agent = self.store.agent(id)?.context("unknown agent ID")?;
+                let channel = agent.channel;
+                ensure!(channel == run.channel, "agent belongs to another channel");
+                self.store.admit_event(
+                    &Input {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        channel: run.channel,
+                        user: run.user,
+                        text: tools::string(a, "message")?.to_string(),
+                    },
+                    id,
+                )?;
+                self.ensure_agent(id).await?;
                 json!({"delivered":id})
             }
             "wakeup" | "monitor" => {
-                ensure!(!run.child, "only master can schedule work");
-                self.manage_jobs(run.channel, run.user, &call.name, a)?
+                self.manage_jobs(run.channel, run.user, &run.owner, &call.name, a)?
             }
             _ => bail!("unknown tool {}", call.name),
         };
         Ok(value.to_string())
     }
-    fn manage_jobs(&self, channel: u64, user: u64, kind: &str, a: &Value) -> Result<Value> {
-        match tools::string(a,"action")? {
-            "list"=>Ok(json!(self.store.jobs(Some(channel),false)?.into_iter().filter(|j|j.kind==kind).map(|j|json!({"id":j.id,"due":j.due,"interval_seconds":j.interval,"payload":j.payload})).collect::<Vec<_>>())),
-            "cancel"=>Ok(json!({"cancelled":self.store.cancel_job(channel,tools::string(a,"id")?)?})),
+
+    async fn start_child(self: &Arc<Self>, start: ChildStart) -> Result<()> {
+        let mut children = self.children.lock().await;
+        if children.contains_key(&start.id) {
+            return Ok(());
+        }
+        let delivery_id = format!("agent:{}:{}", start.id, uuid::Uuid::new_v4());
+        self.store.agent_run_start(&delivery_id, &start.id)?;
+        children.insert(
+            start.id.clone(),
+            Child {
+                channel: start.channel,
+                cancel: start.cancel.clone(),
+            },
+        );
+        drop(children);
+        let h = self.clone();
+        tokio::spawn(async move {
+            let ChildStart {
+                id,
+                channel,
+                user,
+                task,
+                previous,
+                settings,
+                memory,
+                view,
+                cancel,
+                permit,
+            } = start;
+            let _permit = permit;
+            let outcome=async {
+                let view=match view {Some(view)=>view,None=>h.settle(&memory,&cancel).await?};
+                let mut trace=Memory::open(h.config.state_dir.join("subagents").join(&id),h.config.agent.view_bytes)?;
+                let prompt=if previous.is_empty() {task.clone()} else {format!("Original task: {task}\nYour previous report: {previous}\nContinue on the new inbox notifications. Inspect saved tool effects before repeating work.")};
+                trace.append(Kind::User,&prompt)?;
+                let (vendor,_)=model_parts(&settings.0)?;
+                let run=Run {channel,user,owner:id.clone(),child:true,memory:memory.clone(),cancel,settings:settings.clone(),history:Provider::start(vendor,&view,&prompt),inputs:vec![],trace:Some(trace),steering:vec![]};
+                h.clone().run_agent(run).await
+            }.await;
+            let mut report = match outcome {
+                Ok(text) => text,
+                Err(error) => format!("Task stopped: {error}"),
+            };
+            if let Err(error) = h
+                .browser
+                .transfer_owner(&id, &format!("channel:{channel}"))
+                .await
+            {
+                report.push_str(&format!("\nBrowser ownership transfer failed: {error}"));
+                h.shutdown.cancel();
+            }
+            if let Err(error) = h.store.finish_agent(&id, &report, &delivery_id) {
+                tracing::error!(error=%error,"persist agent report failed");
+                h.shutdown.cancel();
+            }
+            h.children.lock().await.remove(&id);
+            memory.incoming.notify_one();
+            // Events arriving at the final boundary remain durable. The job pump
+            // resumes this identity after releasing its concurrency permit.
+        });
+        Ok(())
+    }
+    async fn ensure_agent(self: &Arc<Self>, id: &str) -> Result<()> {
+        if self.shutdown.is_cancelled() || self.children.lock().await.contains_key(id) {
+            return Ok(());
+        }
+        if self.store.agent_events(id)?.is_empty() {
+            return Ok(());
+        }
+        let Some(crate::store::AgentRecord {
+            channel,
+            user,
+            task,
+            report: previous,
+            model,
+            reasoning,
+        }) = self.store.agent(id)?
+        else {
+            bail!("notification targets unknown agent {id}");
+        };
+        let Ok(permit) = self.capacity.clone().try_acquire_owned() else {
+            return Ok(());
+        };
+        let memory = self.channel(channel).await?;
+        self.start_child(ChildStart {
+            id: id.to_owned(),
+            channel,
+            user,
+            task,
+            previous,
+            settings: (model, reasoning),
+            memory,
+            view: None,
+            cancel: self.shutdown.child_token(),
+            permit,
+        })
+        .await?;
+        Ok(())
+    }
+    async fn shell_tool(self: &Arc<Self>, run: &Run, command: &str) -> Result<String> {
+        ensure!(!command.is_empty(), "empty command");
+        let permit = self
+            .shell_capacity
+            .clone()
+            .try_acquire_owned()
+            .context("background shell capacity full")?;
+        let id = uuid::Uuid::new_v4().to_string();
+        self.store
+            .shell_start(&id, &run.owner, run.channel, run.user, command)?;
+        let cancel = run.cancel.child_token();
+        self.shell_jobs
+            .lock()
+            .await
+            .insert(id.clone(), (run.channel, cancel.clone()));
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let h = self.clone();
+        let job_id = id.clone();
+        let command = command.to_owned();
+        let channel = run.channel;
+        tokio::spawn(async move {
+            let _permit = permit;
+            let result = tools::shell(
+                &h.config.workspace,
+                &command,
+                h.config.agent.shell_timeout_seconds,
+                &cancel,
+            )
+            .await;
+            let output = match &result {
+                Ok(output) => output.clone(),
+                Err(error) => format!("Error: {error}"),
+            };
+            if let Err(error) = h
+                .store
+                .shell_finish(&job_id, &output, cancel.is_cancelled())
+            {
+                tracing::error!(error=%error,"persist shell completion failed");
+                h.shutdown.cancel();
+            }
+            let _ = sender.send(result);
+            h.shell_jobs.lock().await.remove(&job_id);
+            // Wake root inboxes immediately; child inboxes are also checked by
+            // the durable job pump, including completions after a child ended.
+            if let Ok(memory) = h.channel(channel).await {
+                memory.incoming.notify_one();
+            }
+        });
+        match tokio::time::timeout(
+            Duration::from_secs(self.config.agent.shell_background_after_seconds),
+            receiver,
+        )
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => bail!("shell worker stopped; inspect saved effects"),
+            Err(_) => {
+                self.store.shell_detach(&id)?;
+                run.memory.incoming.notify_one();
+                Ok(json!({"job_id":id,"state":"background","delivery":"completion will arrive in your inbox; do not poll or wait"}).to_string())
+            }
+        }
+    }
+
+    fn manage_jobs(
+        &self,
+        channel: u64,
+        user: u64,
+        owner: &str,
+        kind: &str,
+        args: &Value,
+    ) -> Result<Value> {
+        let administrative = owner == "*";
+        let owner = if administrative {
+            format!("channel:{channel}")
+        } else {
+            owner.to_owned()
+        };
+        let owned = |job: &Job| {
+            job.kind == kind
+                && (administrative
+                    || job.payload["_owner"]
+                        .as_str()
+                        .unwrap_or(&format!("channel:{channel}"))
+                        == owner)
+        };
+        match tools::string(args,"action")? {
+            "list"=>Ok(json!(self.store.jobs(Some(channel),false)?.into_iter().filter(owned).map(|job|json!({"id":job.id,"owner":job.payload["_owner"].as_str().unwrap_or(&format!("channel:{channel}")),"due":job.due,"interval_seconds":job.interval,"payload":job.payload})).collect::<Vec<_>>())),
+            "cancel"=>{
+                let id=tools::string(args,"id")?;
+                let authorized=self.store.jobs(Some(channel),false)?.iter().any(|job|job.id==id && owned(job));
+                Ok(json!({"cancelled":authorized && self.store.cancel_job(channel,id)?}))
+            }
             "add"=>{
-                let (due,interval,payload)=if kind=="wakeup" {let (d,i)=tools::schedule(tools::string(a,"schedule")?)?;(d,i,json!({"prompt":a["prompt"].as_str().unwrap_or("Scheduled wakeup")}))}
-                else {let seconds=tools::number(a,"interval_seconds")?;ensure!((5..=31_536_000).contains(&seconds),"interval must be 5 seconds to 1 year");(crate::store::now()+seconds as i64,Some(seconds as i64),json!({"command":tools::string(a,"command")?,"prompt":a["prompt"].as_str().unwrap_or("Monitor output changed")}))};
-                let id=uuid::Uuid::new_v4().to_string();self.store.add_job(&Job{id:id.clone(),channel,user,kind:kind.into(),payload,due,interval})?;
-                self.notice(&format!("job:{id}:queued"),channel,None,&format!("◷ {kind} `{id}` saved; due <t:{due}:R>"))?;Ok(json!({"id":id,"due":due,"interval_seconds":interval}))
+                let (due,interval,mut payload)=if kind=="wakeup" {
+                    let (due,interval)=tools::schedule(tools::string(args,"schedule")?)?;
+                    (due,interval,json!({"prompt":args["prompt"].as_str().unwrap_or("Scheduled wakeup")}))
+                } else {
+                    let seconds=tools::number(args,"interval_seconds")?;
+                    ensure!((5..=31_536_000).contains(&seconds),"interval must be 5 seconds to 1 year");
+                    (crate::store::now()+seconds as i64,Some(seconds as i64),json!({"command":tools::string(args,"command")?,"prompt":args["prompt"].as_str().unwrap_or("Monitor output changed")}))
+                };
+                payload["_owner"]=json!(owner);
+                let id=uuid::Uuid::new_v4().to_string();
+                self.store.add_job(&Job{id:id.clone(),channel,user,kind:kind.into(),payload,due,interval})?;
+                self.notice(&format!("job:{id}:queued"),channel,None,&format!("◷ {kind} `{id}` saved; due <t:{due}:R>"))?;
+                Ok(json!({"id":id,"due":due,"interval_seconds":interval}))
             }
             _=>bail!("unknown job action"),
         }
@@ -799,6 +991,11 @@ impl Harness {
                 )
             }
             "stop" => {
+                for (job_channel, cancel) in self.shell_jobs.lock().await.values() {
+                    if *job_channel == channel {
+                        cancel.cancel();
+                    }
+                }
                 if let Some(cancel) = c.cancel.lock().await.as_ref() {
                     cancel.cancel();
                 }
@@ -838,7 +1035,7 @@ impl Harness {
                 }
             }
             "wakeup" | "monitor" => {
-                let result = self.manage_jobs(channel, user, name, &args)?;
+                let result = self.manage_jobs(channel, user, "*", name, &args)?;
                 if let Some(rows) = result.as_array() {
                     if rows.is_empty() {
                         format!("No active {name} jobs.")
@@ -972,6 +1169,9 @@ impl Harness {
             if self.shutdown.is_cancelled() {
                 break;
             }
+            for owner in self.store.pending_agents()? {
+                self.ensure_agent(&owner).await?;
+            }
             for job in self.store.jobs(None, true)? {
                 if workers.len() >= 8 {
                     break;
@@ -983,7 +1183,7 @@ impl Harness {
                 let h = self.clone();
                 workers.spawn(async move {
                     let result = async {
-                        if job.kind == "wakeup" {
+                        let notified = if job.kind == "wakeup" {
                             h.store.fire_wakeup(
                                 &job,
                                 &format!(
@@ -991,7 +1191,7 @@ impl Harness {
                                     job.id,
                                     job.payload["prompt"].as_str().unwrap_or("Scheduled wakeup")
                                 ),
-                            )?;
+                            )?
                         } else {
                             let result = tools::shell(
                                 &h.config.workspace,
@@ -1005,7 +1205,10 @@ impl Harness {
                                 Err(e) => format!("Monitor failed: {e}"),
                             };
                             h.store
-                                .monitor_result(&job, &crate::memory::cap_tool_result(&output))?;
+                                .monitor_result(&job, &crate::memory::cap_tool_result(&output))?
+                        };
+                        if !notified {
+                            return Ok(());
                         }
                         h.notice(
                             &format!("job:{}:{}:fired", job.id, job.due),
@@ -1013,7 +1216,14 @@ impl Harness {
                             None,
                             &format!("◷ {} `{}` checked", job.kind, job.id),
                         )?;
-                        h.channel(job.channel).await?.incoming.notify_one();
+                        if let Some(owner) = job.payload["_owner"]
+                            .as_str()
+                            .filter(|owner| !owner.starts_with("channel:"))
+                        {
+                            h.ensure_agent(owner).await?;
+                        } else {
+                            h.channel(job.channel).await?.incoming.notify_one();
+                        }
                         Ok::<_, anyhow::Error>(())
                     }
                     .await;
@@ -1192,6 +1402,7 @@ mod tests {
             workspace: directory.path().into(),
             ..Default::default()
         };
+        config.agent.coordinator_root = false;
         config.agent.model = format!("{vendor}/test");
         let discord = Arc::new(Discord::new("mock-token".into(), 1, vec![2]).unwrap());
         let mut h = Harness::new(config, discord, CancellationToken::new()).unwrap();
@@ -1202,6 +1413,7 @@ mod tests {
             incoming: Notify::new(),
             cancel: Mutex::new(None),
         });
+        h.channels.lock().await.insert(1, c.clone());
         let view = c.memory.lock().await.render();
         let input = Input {
             id: "first".into(),
@@ -1223,7 +1435,6 @@ mod tests {
             settings: (format!("{vendor}/test"), "medium".into()),
             history: Provider::start(vendor, &view, &input.text),
             inputs: vec![input.id],
-            mailbox: None,
             trace: None,
             steering: vec![],
         };
@@ -1243,6 +1454,127 @@ mod tests {
             out.push(item);
         }
         out
+    }
+
+    #[tokio::test]
+    async fn scheduler_tools_are_owned_by_each_agent() {
+        let (_directory, h, mut run, _mock, server) = fixture("openai", vec![]).await;
+        run.child = true;
+        run.owner = "child".into();
+        let add = ToolCall {
+            id: "job".into(),
+            name: "wakeup".into(),
+            arguments: json!({"action":"add","schedule":"in 5s","prompt":"check"}),
+        };
+        let reply: Value =
+            serde_json::from_str(&h.execute_tool(&mut run, &add).await.unwrap()).unwrap();
+        let cancel = ToolCall {
+            id: "cancel".into(),
+            name: "wakeup".into(),
+            arguments: json!({"action":"cancel","id":reply["id"]}),
+        };
+        run.child = false;
+        run.owner = "channel:1".into();
+        assert_eq!(
+            serde_json::from_str::<Value>(&h.execute_tool(&mut run, &cancel).await.unwrap())
+                .unwrap()["cancelled"],
+            false
+        );
+        run.child = true;
+        run.owner = "child".into();
+        assert_eq!(
+            serde_json::from_str::<Value>(&h.execute_tool(&mut run, &cancel).await.unwrap())
+                .unwrap()["cancelled"],
+            true
+        );
+        h.shutdown.cancel();
+        server.abort();
+    }
+    #[tokio::test]
+    async fn detached_shell_returns_then_delivers_completion_to_its_owner() {
+        let (_directory, mut h, mut run, _mock, server) = fixture("openai", vec![]).await;
+        Arc::get_mut(&mut h)
+            .unwrap()
+            .config
+            .agent
+            .shell_background_after_seconds = 0;
+        run.child = true;
+        run.owner = "child".into();
+        let reply: Value = serde_json::from_str(
+            &h.shell_tool(&run, "sleep 0.1; printf completed")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reply["state"], "background");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while h.store.agent_events("child").unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let events = h.store.agent_events("child").unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].text.contains("completed"));
+        assert!(h.store.queued(1).unwrap().is_empty());
+        h.shutdown.cancel();
+        server.abort();
+    }
+    #[tokio::test]
+    async fn idle_child_resumes_same_identity_on_durable_notification() {
+        let (_directory, h, mut run, mock, server) = fixture(
+            "openai",
+            vec![
+                final_response("openai", "initial report"),
+                final_response("openai", "completion report"),
+            ],
+        )
+        .await;
+        let spawn = ToolCall {
+            id: "spawn".into(),
+            name: "spawn".into(),
+            arguments: json!({"tasks":["handle background work"]}),
+        };
+        let response: Value =
+            serde_json::from_str(&h.execute_tool(&mut run, &spawn).await.unwrap()).unwrap();
+        let id = response["ids"][0].as_str().unwrap();
+        mock.started.notified().await;
+        mock.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !h.children.lock().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        h.store
+            .admit_event(
+                &Input {
+                    id: "completion".into(),
+                    channel: 1,
+                    user: 2,
+                    text: "[shell job] completed successfully".into(),
+                },
+                id,
+            )
+            .unwrap();
+        h.ensure_agent(id).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while h.store.queued(1).unwrap().len() != 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(h.store.agent_events(id).unwrap().is_empty());
+        assert!(h.store.queued(1).unwrap()[1].text.contains(id));
+        let requests = mock.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].to_string().contains("completed successfully"));
+        assert!(requests[1].to_string().contains("initial report"));
+        h.shutdown.cancel();
+        server.abort();
     }
     #[tokio::test]
     async fn steering_during_final_response_continues_without_premature_ping() {

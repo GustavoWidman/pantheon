@@ -30,6 +30,10 @@ pub struct AgentConfig {
     pub request_timeout_seconds: u64,
     pub tool_timeout_seconds: u64,
     pub show_reasoning: bool,
+    pub coordinator_root: bool,
+    pub shell_background_after_seconds: u64,
+    pub max_shell_jobs: usize,
+    pub shell_timeout_seconds: u64,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -55,6 +59,10 @@ impl Default for AgentConfig {
             request_timeout_seconds: 300,
             tool_timeout_seconds: 120,
             show_reasoning: false,
+            coordinator_root: true,
+            shell_background_after_seconds: 5,
+            max_shell_jobs: 16,
+            shell_timeout_seconds: 3600,
         }
     }
 }
@@ -75,11 +83,15 @@ impl Config {
             "view_bytes must be >= 1024"
         );
         ensure!(
-            config.agent.max_steps > 0 && config.agent.max_subagents > 0,
+            config.agent.max_steps > 0
+                && config.agent.max_subagents > 0
+                && config.agent.max_shell_jobs > 0,
             "agent limits must be positive"
         );
         ensure!(
-            config.agent.tool_timeout_seconds > 0 && config.agent.request_timeout_seconds > 0,
+            config.agent.tool_timeout_seconds > 0
+                && config.agent.request_timeout_seconds > 0
+                && config.agent.shell_timeout_seconds > 0,
             "timeouts must be positive"
         );
         crate::provider::model_parts(&config.agent.model)?;

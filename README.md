@@ -58,11 +58,11 @@ cargo run -- --config pantheon.toml run
 
 Slash replies are private. Ordinary prompts and agent output use the originating channel. Final replies mention the requester once; intermediate prose and tool rows do not ping. Tool rows reveal names and status rather than arguments/output. Long replies split on Discord's UTF-16 budget with code fences preserved. Provider reasoning can be shown with `agent.show_reasoning=true`, without persisting it locally.
 
-Every subagent runs in the background and reports to the master. There are no foreground children or wait/poll tools. Every browser keeps its own persistent profile, X display, loopback VNC and noVNC listener on `0.0.0.0`. Browser handoff pauses automation until explicit resume. Returned LAN/Tailscale URLs are candidates; routing and remote firewall access cannot be established by enumerating local interfaces.
+Every subagent runs in the background and reports to the master. There are no foreground children or wait/poll tools. The root coordinates background workers by default. Browser windows share one durable `pantheon-shared` profile and X display; each window group gets its own loopback VNC and noVNC listener on `0.0.0.0`. Browser handoff pauses automation until explicit resume. Returned LAN/Tailscale URLs are candidates; routing and remote firewall access cannot be established by enumerating local interfaces.
 
 ## State and checks
 
-Back up the state directory. `chats/<channel>/main/` and `tree/` contain immutable daily JSONL records; operational SQLite journals contain inbox/outbox, tasks and schedules; `subagents/` holds private child traces; `browsers/` contains profiles and screenshots. State is never committed to this repository.
+Back up the state directory. `chats/<channel>/main/` and `tree/` contain immutable daily JSONL records; operational SQLite journals contain inbox/outbox, tasks and schedules; `subagents/` holds private child traces; `browsers/pantheon-shared/profile/` holds shared browser state, and the other browser directories hold viewer metadata and screenshots. State is never committed to this repository.
 
 ```sh
 cargo fmt --all -- --check
@@ -81,3 +81,11 @@ pantheon --config pantheon.toml import --channel 123 --file old-history.txt
 Crash recovery resumes queued prompts, wakeups and unsent output. Interrupted turns are reported rather than replaying uncertain tool side effects. Discord delivery is at least once; nonce deduplication has a finite remote window. Complete provider responses are rendered per step; token-by-token prose streaming is not implemented yet. Live bot/model validation requires your credentials.
 
 See [architecture](docs/architecture.md), [memory](docs/memory.md), [Discord](docs/discord.md) and [browsers](docs/browser.md) for invariants, tradeoffs and recovery details.
+
+## Development and releases
+
+Use Conventional Commits, for example `feat(browser): share login state` or `fix(runtime): deliver a completion once`. PR titles and development commits are checked in CI. `Cargo.toml` is the version source; `Cargo.lock` must agree and the Nix package reads that version directly.
+
+Like Thoth, PRs to `main` require a stable SemVer increase unless labeled `no-release` for changes that do not warrant a release. On `main`, Rust formatting, Clippy, tests, Nix builds and the live packaged-browser test must pass before CI tags the exact validated commit and publishes a GitHub release. Existing tags never move; an interrupted release can be repaired by rerunning at its original commit. Install a release with `nix run github:GustavoWidman/pantheon/v0.2.0` or pin that tag in your NixOS flake. Service deployment remains controlled by the consuming NixOS configuration.
+
+Both root and workers can own wakeups and monitors. Shell commands return a background job ID after five seconds by default; their results reach the owning agent’s durable inbox. An idle worker resumes under its existing ID, and reports its result to the root. See [architecture](docs/architecture.md) for delivery, cancellation and recovery behavior, and [browser ownership](docs/browser.md) for shared storage and handoff details.

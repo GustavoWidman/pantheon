@@ -16,8 +16,13 @@ max_steps = 128
 max_subagents = 8
 request_timeout_seconds = 300
 tool_timeout_seconds = 120
+coordinator_root = true
+shell_background_after_seconds = 5
+max_shell_jobs = 16
+shell_timeout_seconds = 3600
 show_reasoning = false
 
 [browser]
+max_windows = 16
 port_start = 6080
 port_end = 6180

@@ -1,4 +1,4 @@
-//! Per-browser process isolation, durable profiles, authenticated viewing and explicit handoff.
+//! One durable browser profile, separately owned windows, authenticated viewers and handoff.
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -6,7 +6,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -22,6 +25,7 @@ pub struct BrowserConfig {
     pub port_start: u16,
     pub port_end: u16,
     pub display_start: u16,
+    pub max_windows: usize,
     pub novnc_web: PathBuf,
     pub python: PathBuf,
     pub worker: PathBuf,
@@ -39,6 +43,7 @@ impl Default for BrowserConfig {
             port_start: 6080,
             port_end: 6180,
             display_start: 100,
+            max_windows: 16,
             novnc_web: env("PANTHEON_NOVNC_WEB", "/usr/share/novnc"),
             python: env("PANTHEON_BROWSER_PYTHON", "python3"),
             worker: env("PANTHEON_BROWSER_WORKER", "scripts/browser-worker.py"),
@@ -53,6 +58,21 @@ pub struct BrowserManager {
     config: BrowserConfig,
     sessions: Arc<Mutex<BTreeMap<String, Arc<Mutex<Session>>>>>,
     open_lock: Arc<Mutex<()>>,
+    backend: Arc<Mutex<Option<SharedBackend>>>,
+    stopping: Arc<AtomicBool>,
+}
+struct SharedBackend {
+    process: Child,
+    input: ChildStdin,
+    process_group_id: i32,
+}
+impl Drop for SharedBackend {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            kill(-self.process_group_id, 9);
+        }
+    }
 }
 struct Session {
     id: String,
@@ -130,7 +150,8 @@ impl Session {
         json!({"browser_id": self.id, "state": if self.lease.is_some() { "human" } else { "agent" },
             "view_urls": candidate_urls(self.port, &self.token),
             "reachability": "candidate interface addresses; remote firewall/routing reachability is not verified",
-            "profile_persistent": true, "view_only": self.lease.is_none()})
+            "profile_persistent": true, "profile": "pantheon-shared", "profile_shared": true,
+            "view_only": self.lease.is_none()})
     }
 }
 impl BrowserManager {
@@ -140,7 +161,30 @@ impl BrowserManager {
             config,
             sessions: Arc::default(),
             open_lock: Arc::default(),
+            backend: Arc::default(),
+            stopping: Arc::default(),
         }
+    }
+    pub async fn claim_owner(&self, id: &str, from: &str, to: &str) -> Result<Value> {
+        let session = self
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .cloned()
+            .context("unknown browser_id")?;
+        let mut session = session.lock().await;
+        if session.owner != from {
+            bail!("browser is not available for adoption");
+        }
+        let directory = self.root.join(id);
+        let temporary = directory.join(format!(".owner-{}.tmp", Uuid::new_v4()));
+        tokio::fs::write(&temporary, serde_json::to_vec(to)?).await?;
+        std::fs::File::open(&temporary)?.sync_all()?;
+        tokio::fs::rename(&temporary, directory.join("owner.json")).await?;
+        std::fs::File::open(&directory)?.sync_all()?;
+        session.owner = to.to_owned();
+        Ok(session.info())
     }
     /// Adopt a completed child's live browsers without invalidating viewers or human leases.
     pub async fn transfer_owner(&self, from: &str, to: &str) -> Result<()> {
@@ -188,6 +232,9 @@ impl BrowserManager {
         Ok(())
     }
     pub async fn execute(&self, owner: &str, request: Value) -> Result<Value> {
+        if self.stopping.load(Ordering::Acquire) {
+            bail!("browser service is stopping");
+        }
         let action = request
             .get("action")
             .and_then(Value::as_str)
@@ -258,7 +305,7 @@ impl BrowserManager {
                 Ok(session.info())
             }
             "close" => {
-                // graceful close flushes cookies/profile; Drop subsequently terminates any descendants.
+                // Close this window only. The backend flushes the shared profile at shutdown.
                 let outcome = session.request(&json!({"action":"close"}), deadline).await;
                 #[cfg(unix)]
                 {
@@ -272,7 +319,8 @@ impl BrowserManager {
                 self.sessions.lock().await.remove(id);
                 outcome.map(|_| json!({"closed":id,"profile_retained":true}))
             }
-            "navigate" | "snapshot" | "click" | "type" | "screenshot" => {
+            "navigate" | "snapshot" | "click" | "type" | "screenshot" | "tabs" | "new_tab"
+            | "select_tab" | "close_tab" => {
                 let result = session.request(&request, deadline).await;
                 if result.is_err() && session.process.try_wait()?.is_some() {
                     drop(session);
@@ -286,10 +334,19 @@ impl BrowserManager {
     async fn open(&self, owner: &str, request: Value) -> Result<Value> {
         // Serialize reservations, not browser actions. OS bind is the authority for port availability.
         let _reservation = self.open_lock.lock().await;
+        if self.stopping.load(Ordering::Acquire) {
+            bail!("browser service is stopping");
+        }
         if self.config.port_start == 0 || self.config.port_end < self.config.port_start {
             bail!("invalid browser port range");
         }
+        if self.config.max_windows == 0 || self.config.max_windows > 256 {
+            bail!("max_windows must be 1 to 256");
+        }
         let sessions: Vec<_> = self.sessions.lock().await.values().cloned().collect();
+        if sessions.len() >= self.config.max_windows {
+            bail!("browser window capacity exhausted");
+        }
         let mut used = BTreeSet::new();
         for session in sessions {
             used.insert(session.lock().await.port);
@@ -327,12 +384,15 @@ impl BrowserManager {
             std::fs::File::open(&ownership)?.sync_all()?;
             std::fs::File::open(&profile)?.sync_all()?;
         }
+        self.ensure_backend().await?;
         let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
         let mut command = Command::new(&self.config.python);
         command
             .arg(&self.config.worker)
             .arg("--profile")
             .arg(&profile)
+            .arg("--shared-root")
+            .arg(self.root.join("pantheon-shared"))
             .arg("--port")
             .arg(port.to_string())
             .arg("--port-end")
@@ -410,13 +470,79 @@ impl BrowserManager {
             .insert(id, Arc::new(Mutex::new(session)));
         Ok(info)
     }
+    async fn ensure_backend(&self) -> Result<()> {
+        let mut backend = self.backend.lock().await;
+        if let Some(existing) = backend.as_mut()
+            && existing.process.try_wait()?.is_none()
+        {
+            return Ok(());
+        }
+        *backend = None;
+        let root = self.root.join("pantheon-shared");
+        tokio::fs::create_dir_all(&root).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).await?;
+        }
+        let mut command = Command::new(&self.config.python);
+        command
+            .arg(&self.config.worker)
+            .arg("--backend")
+            .arg("--shared-root")
+            .arg(&root)
+            .arg("--capacity")
+            .arg(
+                self.config
+                    .max_windows
+                    .min(usize::from(self.config.port_end - self.config.port_start) + 1)
+                    .to_string(),
+            )
+            .arg("--web")
+            .arg(&self.config.novnc_web)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut process = command.spawn().context("launch shared Camoufox profile")?;
+        let input = process.stdin.take().context("shared browser stdin")?;
+        let mut output = BufReader::new(process.stdout.take().context("shared browser stdout")?);
+        let process_group_id = process.id().context("shared browser process ID")? as i32;
+        let shared = SharedBackend {
+            process,
+            input,
+            process_group_id,
+        };
+        let mut line = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(self.config.startup_timeout_secs),
+            output.read_line(&mut line),
+        )
+        .await
+        .context("shared browser startup timeout")??;
+        let reply: Value =
+            serde_json::from_str(&line).context("shared browser startup response")?;
+        if reply["ready"] != true {
+            bail!("shared browser startup: {}", reply["error"]);
+        }
+        *backend = Some(shared);
+        Ok(())
+    }
     pub async fn shutdown(&self) {
+        self.stopping.store(true, Ordering::Release);
+        let _reservation = self.open_lock.lock().await;
+        // Flush the one profile first. Closing the backend aborts in-flight
+        // page operations, so a busy window cannot delay every profile flush.
+        if let Some(mut backend) = self.backend.lock().await.take() {
+            let _ = backend.input.write_all(b"shutdown\n").await;
+            let _ = backend.input.flush().await;
+            let _ = tokio::time::timeout(Duration::from_secs(20), backend.process.wait()).await;
+        }
         let sessions = std::mem::take(&mut *self.sessions.lock().await);
         for (_, session) in sessions {
             let mut session = session.lock().await;
-            let _ = session
-                .request(&json!({"action":"close"}), Duration::from_secs(5))
-                .await;
             #[cfg(unix)]
             {
                 unsafe {
@@ -495,6 +621,7 @@ mod tests {
 import json, sys
 print(json.dumps({'ready':True,'display':':123'}),flush=True)
 for line in sys.stdin:
+    if line.strip()=='shutdown':break
     request=json.loads(line)
     print(json.dumps({'done':True}),flush=True)
     if request['action']=='close':break
@@ -586,6 +713,7 @@ for line in sys.stdin:
 import json, sys
 print(json.dumps({'ready':True,'display':':123'}),flush=True)
 for line in sys.stdin:
+    if line.strip()=='shutdown':break
     request=json.loads(line)
     print(json.dumps({'done':True}),flush=True)
     if request['action']=='close':break

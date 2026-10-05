@@ -1,8 +1,12 @@
-# Browser ownership and durable profiles
+# Shared browser profile and window ownership
 
-Every `browser.open` starts one Camoufox with its own Xvfb display, persistent Firefox profile, loopback-only x11vnc listener and always-running noVNC server. Browser operations use a packaged Python Playwright driver over local JSON-line pipes; the harness, ownership checks and supervision are Rust. The Nix closure contains the Camoufox release and driver, so service startup never downloads a browser or installs packages.
+Pantheon runs one Camoufox process with one durable profile at `browsers/pantheon-shared/profile`. Cookies, logins, local storage, IndexedDB, permissions and disk cache are naturally shared across windows. Logging out or changing same-site storage in one window can affect another, as in a normal browser.
 
-Xvfb allocates displays atomically with `-displayfd`. The `display_start` configuration field is reserved for compatibility; displays are selected by the X server rather than forcing a shared display number. Browsers are independent within the service, while the service user and agent workspace remain a shared trust boundary.
+Each `browser.open` creates a separately owned window and tab group, with its own loopback x11vnc listener and authenticated noVNC URL on `0.0.0.0`. The windows share one atomically allocated Xvfb display. The supervisor places windows in separate framebuffer regions; each viewer exports only its group's region. File paths, screenshots, viewer tokens and ownership records remain per browser ID. These are logical ownership boundaries within the shared service user, workspace, display and browser profile.
+
+The packaged Python bridge controls the shared browser through Playwright and private Unix pipes. Its profile lock prevents a second backend from unlinking a live socket or opening the same profile. Window workers have separate process groups; killing or closing one worker closes its tabs and viewer without terminating the shared browser. The Nix closure contains the browser and driver, with no runtime installs or downloads.
+
+`max_windows` defaults to 16, bounded additionally by the available viewer ports. Xvfb allocates a framebuffer sized for that capacity, approximately 100 MiB at the default layout, while all groups reuse the same browser process and cache. Reduce the window limit to reduce framebuffer memory; the accepted limit is 1–256. `display_start` is retained for configuration compatibility; Xvfb chooses the actual display using `-displayfd`.
 
 The browser tool accepts these actions:
 
@@ -10,6 +14,11 @@ The browser tool accepts these actions:
 {"action":"open","url":"https://example.com"}
 {"action":"navigate","browser_id":"…","url":"https://example.com"}
 {"action":"snapshot","browser_id":"…"}
+{"action":"tabs","browser_id":"…"}
+{"action":"new_tab","browser_id":"…"}
+{"action":"select_tab","browser_id":"…","tab_id":"…"}
+{"action":"close_tab","browser_id":"…","tab_id":"…"}
+{"action":"claim","browser_id":"…"}
 {"action":"click","browser_id":"…","role":"button","name":"Sign in"}
 {"action":"type","browser_id":"…","role":"textbox","name":"Email","text":"…"}
 {"action":"screenshot","browser_id":"…"}
@@ -19,11 +28,13 @@ The browser tool accepts these actions:
 {"action":"close","browser_id":"…"}
 ```
 
-`open`, `list` and `handoff` return viewer URLs. During agent ownership, noVNC is view-only. `handoff` changes the VNC server to interactive mode and establishes a human lease. Rust rejects automation while the lease exists; the worker independently checks the same state. The lease never expires and disconnected viewers never silently resume automation. `resume` requires the explicit lease token and switches viewers back to view-only before permitting automation. The agent should resume only after the user says they have finished. The browser ID belongs to its creating root agent or background subagent; another agent cannot list or control it while that child is active.
+`open`, `list` and `handoff` return viewer URLs. During agent ownership, noVNC is view-only. `handoff` changes the VNC server to interactive mode and establishes a human lease. Rust rejects automation while the lease exists; the worker independently checks the same state. The lease never expires and disconnected viewers never silently resume automation. `resume` requires the explicit lease token and switches viewers back to view-only before permitting automation. The agent should resume only after the user says they have finished. The browser ID belongs to its creating worker or slash-command operator. Another worker cannot list or control it while its owner is active. Tab IDs are scoped to their window group. New tabs and popups are assigned to their opener; unattributed windows are not exposed as another worker’s tabs.
 
-When a background subagent finishes, the harness transfers its live browsers to the parent channel before reporting completion. The supervisor atomically replaces and fsyncs each persistent ownership record before updating the live owner under its session lock. The browser process, display, viewer URL, bearer token and any human lease remain unchanged. The parent can then list, hand off, resume or close the adopted browser, and can reopen its retained profile after a restart. Adoption preserves a paused human lease and requires the existing resume token; it does not silently resume automation.
+When a background subagent finishes, the harness transfers its live browsers to the parent channel before reporting completion. The supervisor atomically replaces and fsyncs each persistent ownership record before updating the live owner under its session lock. The browser process, display, viewer URL, bearer token and any human lease remain unchanged. The parent can delegate another worker to list and `claim` an adopted live browser before continuing work. Human slash commands can also manage the adopted browser. Adoption preserves a paused human lease and requires the existing resume token; it does not silently resume automation.
 
-Profiles and their ownership records remain after close or a daemon restart. Reopen an existing profile with `{"action":"open","browser_id":"the previous UUID"}` from the same owner. Viewer tokens rotate on every open, and an old human lease ends with its process. Cookies, disk cache and local browser storage use that durable profile; unsaved in-memory browser state cannot survive a crash. A supervisor action timeout poisons the RPC stream, so the agent must close and reopen before issuing further actions. Shutdown attempts a graceful profile flush and then terminates the worker process group. NixOS additionally kills the entire service cgroup on stop.
+Closing a group closes only its pages and viewer. The shared profile remains open and keeps its cache and login state. Browser IDs and ownership records remain after close; reopening an ID from its owner creates a fresh window using the shared profile, with a new viewer token. Service shutdown gracefully flushes the shared profile and then terminates the backend group. A browser-process crash affects every window; close the failed groups and reopen them. Disk-backed profile state survives normal restarts; unsaved in-memory state cannot survive a crash. Old per-browser profile directories are retained during upgrade but are not merged into the new shared profile.
+
+Firefox/GTK has one core keyboard focus. Agent input operations are serialized. During a human handoff, other windows can navigate and take semantic snapshots, but operations that change focus (including typing, clicking, selecting tabs, screenshots and opening windows) are rejected until explicit resume. Only one group can hold a human input lease at once. Each VNC server uses its own protected control file, so handing off one viewer does not enable input in the others. Clipboard forwarding is disabled to avoid cross-window interference.
 
 ## Viewer networking
 
@@ -39,7 +50,7 @@ networking.firewall.interfaces.tailscale0.allowedTCPPortRanges = [
 ];
 ```
 
-The worker atomically binds a socket from the configured range, skips occupied ports and transfers that same socket to websockify. Port assignment among Pantheon's own workers is serialized, and an exhausted range fails startup cleanly. Each live browser costs its own browser, framebuffer, VNC server and WebSocket proxy; opening 101 browsers with the default range is the configured ceiling, not a throughput guarantee.
+The worker atomically binds a socket from the configured range, skips occupied ports and transfers that same socket to websockify. Port assignment among Pantheon's own workers is serialized, and an exhausted range fails startup cleanly. Each live group costs a window, VNC server and WebSocket proxy. The browser process, profile, disk cache and framebuffer are shared; the window limit and available port range bound concurrency.
 
 ## NixOS service
 
