@@ -45,6 +45,7 @@
               pkgs.git
               pkgs.ripgrep
               pkgs.curl
+              pkgs.codex
               pkgs.findutils
               browser
             ];

@@ -42,7 +42,7 @@ in
     };
     environmentFile = lib.mkOption {
       type = lib.types.str;
-      description = "Absolute file outside the Nix store containing DISCORD_TOKEN and provider API keys.";
+      description = "Absolute file outside the Nix store containing DISCORD_TOKEN and any API provider keys. Codex models use the service account's separate ChatGPT login cache.";
     };
     stateDirectory = lib.mkOption {
       type = lib.types.str;

@@ -23,6 +23,11 @@ enum Action {
     Run,
     /// Check configuration, credentials and bundled browser dependencies without network calls.
     Doctor,
+    /// Sign in with ChatGPT using the bundled official Codex CLI and configured auth home.
+    LoginCodex {
+        #[arg(long)]
+        device_auth: bool,
+    },
     /// Export one channel's complete memory tree as HTML (stop the service first).
     Export {
         #[arg(long)]
@@ -51,6 +56,9 @@ async fn main() -> Result<()> {
     let config = Config::load(&cli.config)?;
     if matches!(cli.command, Some(Action::Doctor)) {
         return doctor(&config);
+    }
+    if let Some(Action::LoginCodex { device_auth }) = cli.command {
+        return config.auth.login(device_auth).await;
     }
     std::fs::create_dir_all(&config.state_dir)?;
     // Entire daemon, operational DB and offline CLI share one lifetime writer lock.
@@ -120,7 +128,7 @@ async fn main() -> Result<()> {
             result?;
             gateway_result?;
         }
-        Action::Doctor => unreachable!(),
+        Action::Doctor | Action::LoginCodex { .. } => unreachable!(),
     }
     drop(lock);
     Ok(())
@@ -136,6 +144,13 @@ fn doctor(config: &Config) -> Result<()> {
         missing.push("DISCORD_TOKEN".to_string());
     }
     for model in [&config.agent.model, &config.agent.compactor_model] {
+        if model.starts_with("codex/") {
+            if config.auth.inspect().is_err() && !missing.iter().any(|s| s == "Codex ChatGPT login")
+            {
+                missing.push("Codex ChatGPT login".into());
+            }
+            continue;
+        }
         let (vendor, _) = pantheon::provider::model_parts(model)?;
         let key = if vendor == "openai" {
             "OPENAI_API_KEY"
@@ -144,6 +159,42 @@ fn doctor(config: &Config) -> Result<()> {
         };
         if std::env::var(key).is_err() && !missing.iter().any(|s| s == key) {
             missing.push(key.into());
+        }
+    }
+    if let Some(model) = &config.web.search_model {
+        if model.starts_with("codex/") {
+            config.auth.inspect()?;
+        } else {
+            let (vendor, _) = pantheon::provider::model_parts(model)?;
+            let key = if vendor == "openai" {
+                "OPENAI_API_KEY"
+            } else {
+                "ANTHROPIC_API_KEY"
+            };
+            if std::env::var(key).is_err() && !missing.iter().any(|s| s == key) {
+                missing.push(key.into());
+            }
+        }
+    }
+    if [&config.agent.model, &config.agent.compactor_model]
+        .into_iter()
+        .any(|model| model.starts_with("codex/"))
+        || config
+            .web
+            .search_model
+            .as_deref()
+            .is_some_and(|model| model.starts_with("codex/"))
+    {
+        let cli = config.auth.cli();
+        let exists = if cli.components().count() > 1 {
+            cli.is_file()
+        } else {
+            std::env::var_os("PATH").is_some_and(|path| {
+                std::env::split_paths(&path).any(|directory| directory.join(&cli).is_file())
+            })
+        };
+        if !exists {
+            missing.push("official Codex CLI (auth.codex_cli)".into());
         }
     }
     for binary in ["bash", "Xvfb", "x11vnc", "websockify"] {

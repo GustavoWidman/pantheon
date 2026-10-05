@@ -4,4 +4,7 @@
 /.env
 /pantheon.toml
 /state
+/.codex
+auth.json
+.credentials.json
 __pycache__/

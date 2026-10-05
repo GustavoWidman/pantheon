@@ -37,7 +37,7 @@ A fresh turn renders the settled view **before** appending its new user input. I
 
 ## Cache boundaries
 
-Request prefixes remain ordered: constant tools, constant system prompt, view, whole new input, and the turn's verbatim provider conversation. `cache_chunks` cuts the view at the preceding newline for 50,000, 80,000, and 100,000 Unicode characters, skipping marks beyond the end and duplicate cuts. Concatenating the blocks always reproduces the original view exactly. The provider attaches the same cache marks on every step, plus the request-end automatic breakpoint. There are no one-hour cache entries or renewal pings.
+Request prefixes remain ordered: constant tools, constant system prompt, view, whole new input, and the turn's verbatim provider conversation. `cache_chunks` cuts the view at the preceding newline for 50,000, 80,000, and 100,000 Unicode characters, skipping marks beyond the end and duplicate cuts. Concatenating the blocks always reproduces the original view exactly. Supporting API providers attach the same cache marks on every step, plus the request-end automatic breakpoint. Codex subscription requests preserve the chunks but omit unsupported API cache metadata. There are no one-hour cache entries or renewal pings.
 
 `cap_tool_result` retains equal head/tail portions with an omission notice, keeping the complete returned string at or below 30,000 Unicode characters. The cap is applied before provider replay and before the permanent `echo` append. It never splits UTF-8 characters; original user messages are not capped.
 

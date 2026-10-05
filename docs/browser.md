@@ -70,7 +70,7 @@ The worker atomically binds a socket from the configured range, skips occupied p
 }
 ```
 
-The environment file holds `DISCORD_TOKEN` and the selected provider's API key. It must be outside the Nix store. Generated TOML contains settings only. State defaults to `/var/lib/pantheon`, owned by the dedicated service user with mode 0700. The service restarts automatically, waits for networking, uses private temporary directories and retains state across upgrades. Agent processes can write the configured workspace and state directory; add deliberate `ReadWritePaths` overrides if their tasks require other paths.
+The environment file holds `DISCORD_TOKEN` and any selected API provider keys. Codex models instead use the service account’s separate ChatGPT login cache; see [authentication](auth.md). Secrets must stay outside the Nix store. Generated TOML contains settings only. State defaults to `/var/lib/pantheon`, owned by the dedicated service user with mode 0700. The service restarts automatically, waits for networking, uses private temporary directories and retains state across upgrades. Agent processes can write the configured workspace and state directory; add deliberate `ReadWritePaths` overrides if their tasks require other paths.
 
 The package supplies Bash, coreutils, Git, ripgrep, curl and findutils on the agent PATH. Add project-specific tools through `services.pantheon.extraPackages = [ pkgs.cargo pkgs.nodejs ];`. `pantheon doctor` checks the packaged executable, worker, noVNC files and required commands without making API calls.
 
