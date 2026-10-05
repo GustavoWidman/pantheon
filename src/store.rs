@@ -255,7 +255,9 @@ impl Store {
         self.db.lock().unwrap().execute("INSERT INTO settings(channel,model,reasoning) VALUES(?1,?2,?3) ON CONFLICT(channel) DO UPDATE SET model=excluded.model,reasoning=excluded.reasoning",params![channel.to_string(),model,reasoning])?;
         Ok(())
     }
-    pub fn usage(&self, channel: u64, usage: &Value) -> Result<()> {
+    pub fn usage(&self, channel: u64, model: &str, usage: &Value) -> Result<()> {
+        let mut usage = usage.clone();
+        usage["_pantheon_model"] = serde_json::json!(model);
         self.db.lock().unwrap().execute(
             "UPDATE settings SET usage=?2 WHERE channel=?1",
             params![channel.to_string(), usage.to_string()],
@@ -282,8 +284,22 @@ impl Store {
             )
             .optional()?
             .unwrap_or("{}".into());
+        let shells: i64 = db.query_row(
+            "SELECT count(*) FROM shell_runs WHERE channel=?1 AND state='running'",
+            [channel.to_string()],
+            |r| r.get(0),
+        )?;
+        let worker_queue: i64 = db.query_row(
+            "SELECT count(*) FROM agent_inbox WHERE channel=?1 AND state='queued'",
+            [channel.to_string()],
+            |r| r.get(0),
+        )?;
+        let mut stmt = db.prepare(
+            "SELECT name,phase,owner FROM ui_agents WHERE channel=?1 AND active=1 ORDER BY rowid",
+        )?;
+        let agents=stmt.query_map([channel.to_string()],|r|Ok(serde_json::json!({"name":r.get::<_,String>(0)?,"phase":r.get::<_,String>(1)?,"id":r.get::<_,String>(2)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
         Ok(
-            serde_json::json!({"queued_prompts":pending,"pending_delivery":out,"last_request_usage":serde_json::from_str::<Value>(&usage)?}),
+            serde_json::json!({"queued_prompts":pending,"pending_delivery":out,"running_shells":shells,"queued_worker_messages":worker_queue,"active_agents":agents,"last_request_usage":serde_json::from_str::<Value>(&usage)?}),
         )
     }
     pub fn add_job(&self, job: &Job) -> Result<()> {

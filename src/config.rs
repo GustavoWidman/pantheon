@@ -1,6 +1,9 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -27,6 +30,7 @@ pub struct AgentConfig {
     pub compactor_model: String,
     pub reasoning: String,
     pub view_bytes: usize,
+    pub context_windows: BTreeMap<String, u64>,
     pub max_steps: usize,
     pub max_subagents: usize,
     pub request_timeout_seconds: u64,
@@ -58,6 +62,7 @@ impl Default for AgentConfig {
             compactor_model: "openai/gpt-5-mini".into(),
             reasoning: "medium".into(),
             view_bytes: 128_000,
+            context_windows: BTreeMap::new(),
             max_steps: 128,
             max_subagents: 8,
             request_timeout_seconds: 300,
@@ -101,6 +106,10 @@ impl Config {
         crate::provider::model_parts(&config.agent.model)?;
         crate::provider::model_parts(&config.agent.compactor_model)?;
         validate_reasoning(&config.agent.reasoning)?;
+        for (model, tokens) in &config.agent.context_windows {
+            crate::provider::model_parts(model)?;
+            ensure!(*tokens > 0, "context window limits must be positive");
+        }
         config.auth.validate()?;
         config.web.validate()?;
         Ok(config)

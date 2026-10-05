@@ -47,7 +47,8 @@ cargo run -- --config pantheon.toml run
 
 | Command | Behavior |
 |---|---|
-| `/context`, `/status` | Memory, queue, delivery and last provider usage |
+| `/context` | Square grids for recorded model-window usage and compacted memory; cache and token breakdown |
+| `/status` | Active agent phases, shell jobs, message queues, schedules and delivery |
 | `/model id:provider/model` | Persist model selection for the next turn |
 | `/reasoning level:medium` | Persist reasoning effort for the next turn |
 | `/stop` | Cancel active master and its background agents |
@@ -86,6 +87,6 @@ See [architecture](docs/architecture.md), [memory](docs/memory.md), [Discord](do
 
 Use Conventional Commits, for example `feat(browser): share login state` or `fix(runtime): deliver a completion once`. PR titles and development commits are checked in CI. `Cargo.toml` is the version source; `Cargo.lock` must agree and the Nix package reads that version directly.
 
-Like Thoth, PRs to `main` require a stable SemVer increase unless labeled `no-release` for changes that do not warrant a release. Protected `main` requires an up-to-date PR with passing `version`, `rust` and `nix` checks, squash/rebase merges, and no force push or administrator bypass. On `main`, Rust formatting, Clippy, tests, Nix builds and the live packaged-browser test must pass before CI tags the exact validated commit and publishes a GitHub release. Existing tags never move; an interrupted release can be repaired by rerunning at its original commit. Install a release with `nix run github:GustavoWidman/pantheon/v0.4.0` or pin that tag in your NixOS flake. Service deployment remains controlled by the consuming NixOS configuration.
+Like Thoth, PRs to `main` require a stable SemVer increase unless labeled `no-release` for changes that do not warrant a release. Protected `main` requires an up-to-date PR with passing `version`, `rust` and `nix` checks, squash/rebase merges, and no force push or administrator bypass. On `main`, Rust formatting, Clippy, tests, Nix builds and the live packaged-browser test must pass before CI tags the exact validated commit and publishes a GitHub release. Existing tags never move; an interrupted release can be repaired by rerunning at its original commit. Install a release with `nix run github:GustavoWidman/pantheon/v0.5.0` or pin that tag in your NixOS flake. Service deployment remains controlled by the consuming NixOS configuration.
 
 Both root and workers can own wakeups and monitors. Shell commands return a background job ID after five seconds by default; their results reach the owning agent’s durable inbox. An idle worker resumes under its existing ID, and reports its result to the root. See [architecture](docs/architecture.md) for delivery, cancellation and recovery behavior, and [browser ownership](docs/browser.md) for shared storage and handoff details.
