@@ -63,11 +63,12 @@ pub fn definitions(child: bool, coordinator: bool) -> Vec<Value> {
     ];
     if !child {
         tools.extend([
-            tool("spawn","Start named background agents and return their names, IDs, models and reasoning immediately. Give each worker a short descriptive name. Omitted model/reasoning inherit yours. Reports arrive together between tool calls or start a fresh turn. Never wait or poll for them. Children cannot spawn.",json!({"tasks":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":48},"task":{"type":"string"},"model":{"type":"string"},"reasoning":{"type":"string","enum":["none","minimal","low","medium","high","xhigh"]}},"required":["name","task"],"additionalProperties":false},"minItems":1,"maxItems":8}}),&["tasks"]),
-            tool("tell","Send a durable message to a subagent. It arrives between tool calls or resumes the same agent ID in a fresh background turn if idle.",json!({"id":{"type":"string"},"message":{"type":"string"}}),&["id","message"]),
+            tool("spawn","Start named background agents and return their names, IDs, models and reasoning immediately. Give each worker a short descriptive name. Omitted model/reasoning inherit yours. Reports arrive independently between tool calls or start a fresh turn. Never wait or poll for them. Children cannot spawn.",json!({"tasks":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":48},"task":{"type":"string"},"model":{"type":"string"},"reasoning":{"type":"string","enum":["none","minimal","low","medium","high","xhigh"]}},"required":["name","task"],"additionalProperties":false},"minItems":1,"maxItems":8}}),&["tasks"]),
         ]);
     }
     tools.extend([
+            tool("list_agents","Discover same-channel workers (kind=workers, default). Coordinators can also discover other channel coordinators with kind=coordinators; workers cannot. Idle archived agents are hidden unless include_archived=true. Follow next_before with before for further pages. Results include IDs, names, settings, state and activity timestamps.",json!({"kind":{"type":"string","enum":["workers","coordinators"]},"include_archived":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":25},"before":{"type":"integer","minimum":1}}),&[]),
+            tool("tell","Send a durable message to any worker in your channel, including peers or yourself. Coordinators may also target another known coordinator with channel:<id>. The harness identifies the sender. Delivery happens between provider steps or wakes an idle/archived identity in a fresh background turn. Never wait or poll; avoid message loops and unnecessary acknowledgements.",json!({"id":{"type":"string"},"message":{"type":"string","minLength":1,"maxLength":64000}}),&["id","message"]),
             tool("wakeup","Manage durable wakeups. Schedules: in 10m, once ISO8601, every 1h. Notifications reach the owning agent, including an idle background worker, and preserve channel and user.",json!({"action":{"type":"string","enum":["add","list","cancel"]},"schedule":{"type":"string"},"prompt":{"type":"string"},"id":{"type":"string"}}),&["action"]),
             tool("monitor","Manage durable change monitors. A command runs at intervals; only changed status/output reaches your durable inbox. Commands have timeout and bounded output.",json!({"action":{"type":"string","enum":["add","list","cancel"]},"command":{"type":"string"},"interval_seconds":{"type":"integer","minimum":5},"id":{"type":"string"}}),&["action"]),
     ]);
@@ -263,7 +264,15 @@ mod tests {
         };
         assert_eq!(
             names(false),
-            vec!["date", "monitor", "spawn", "tell", "wakeup", "zoom"]
+            vec![
+                "date",
+                "list_agents",
+                "monitor",
+                "spawn",
+                "tell",
+                "wakeup",
+                "zoom"
+            ]
         );
         let worker = names(true);
         for name in [
@@ -277,11 +286,13 @@ mod tests {
             "monitor",
             "zoom",
             "date",
+            "list_agents",
+            "tell",
         ] {
             assert!(worker.contains(&name.to_owned()));
         }
         assert!(!worker.contains(&"spawn".to_owned()));
-        assert!(!worker.contains(&"tell".to_owned()));
+        assert!(!worker.contains(&"revive_agent".to_owned()));
     }
     #[test]
     fn symlink_escape_is_denied() {

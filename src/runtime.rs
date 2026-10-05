@@ -461,7 +461,9 @@ impl Harness {
                             run.user,
                             &split_message(
                                 &text,
-                                if run.context.reply_to.is_some() {
+                                if run.context.reply_to.is_some()
+                                    || run.context.activity.starts_with("peer:")
+                                {
                                     None
                                 } else {
                                     Some(run.user)
@@ -840,25 +842,56 @@ impl Harness {
 
                 json!({"batch":batch,"ids":ids,"agents":agents,"mode":"background"})
             }
+            "list_agents" => {
+                self.store
+                    .archive_idle_agents(self.config.agent.agent_idle_seconds)?;
+                let limit = a
+                    .get("limit")
+                    .map(|v| v.as_u64().context("limit must be an integer"))
+                    .transpose()?
+                    .unwrap_or(20);
+                ensure!((1..=25).contains(&limit), "limit must be between 1 and 25");
+                let before = a
+                    .get("before")
+                    .map(|v| v.as_i64().context("before must be an integer"))
+                    .transpose()?;
+                let archived = a
+                    .get("include_archived")
+                    .map(|v| v.as_bool().context("include_archived must be a boolean"))
+                    .transpose()?
+                    .unwrap_or(false);
+                match a
+                    .get("kind")
+                    .map(|v| v.as_str().context("kind must be a string"))
+                    .transpose()?
+                    .unwrap_or("workers")
+                {
+                    "workers" => {
+                        self.store
+                            .list_agents(run.channel, archived, limit as usize, before)?
+                    }
+                    "coordinators" => {
+                        ensure!(!run.child, "workers cannot discover coordinators");
+                        self.store
+                            .list_coordinators(archived, limit as usize, before)?
+                    }
+                    _ => bail!("unknown agent kind"),
+                }
+            }
             "tell" => {
-                ensure!(!run.child, "child cannot tell other agents");
                 let id = tools::string(a, "id")?;
-                let agent = self.store.agent(id)?.context("unknown agent ID")?;
-                let channel = agent.channel;
-                ensure!(channel == run.channel, "agent belongs to another channel");
-                self.store.admit_event(
-                    &Input {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        channel: run.channel,
-                        user: run.user,
-                        text: tools::string(a, "message")?.to_string(),
-                    },
+                let message_id = self.store.send_agent_message(
+                    run.channel,
+                    run.user,
+                    &run.owner,
                     id,
+                    tools::string(a, "message")?,
                 )?;
-                self.store.activity_event(
+                self.store.agent_activity_event(
+                    &run.owner,
                     &run.context,
                     run.channel,
-                    &format!("tell:{}", uuid::Uuid::new_v4()),
+                    &format!("tell:{message_id}"),
                     &format!(
                         "-> message sent to {} [{}]",
                         self.store.agent_label(id)?,
@@ -867,7 +900,11 @@ impl Harness {
                     "event",
                     Duration::ZERO,
                 )?;
-                self.ensure_agent(id).await?;
+                if let Some(channel) = id.strip_prefix("channel:") {
+                    self.channel(channel.parse()?).await?.incoming.notify_one();
+                } else {
+                    self.ensure_agent(id).await?;
+                }
                 json!({"delivered":id,"name":self.store.agent_label(id)?})
             }
             "wakeup" | "monitor" => {
@@ -1292,6 +1329,8 @@ impl Harness {
                 "Cancellation requested for this channel and its background subagents.".into()
             }
             "subagents" => {
+                self.store
+                    .archive_idle_agents(self.config.agent.agent_idle_seconds)?;
                 let tasks = self.store.tasks(channel)?;
                 let entries = tasks
                     .as_array()
@@ -1314,9 +1353,9 @@ impl Harness {
                 return Ok(crate::ui::card(
                     "Background agents",
                     if tasks.as_array().is_none_or(Vec::is_empty) {
-                        "No workers yet. Ask Pantheon to delegate a task."
+                        "No visible workers. Idle workers are archived after an hour by default; their identities and history remain available."
                     } else {
-                        "Workers keep their identity when resumed by a message, wakeup or monitor."
+                        "Idle workers leave this list after an hour by default. Messages, wakeups and monitors revive the same identity."
                     },
                     entries,
                     false,
@@ -1567,9 +1606,17 @@ impl Harness {
     async fn job_worker(self: Arc<Self>) -> Result<()> {
         let mut active = HashSet::new();
         let mut workers = tokio::task::JoinSet::new();
+        let mut last_archive = Instant::now();
+        self.store
+            .archive_idle_agents(self.config.agent.agent_idle_seconds)?;
         loop {
             if self.shutdown.is_cancelled() {
                 break;
+            }
+            if last_archive.elapsed() >= Duration::from_secs(60) {
+                self.store
+                    .archive_idle_agents(self.config.agent.agent_idle_seconds)?;
+                last_archive = Instant::now();
             }
             for owner in self.store.pending_agents()? {
                 self.ensure_agent(&owner).await?;
@@ -2051,7 +2098,7 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
-    async fn idle_child_resumes_same_identity_on_durable_notification() {
+    async fn archived_child_resumes_same_identity_when_told() {
         let (_directory, h, mut run, mock, server) = fixture(
             "openai",
             vec![
@@ -2078,17 +2125,24 @@ mod tests {
         .await
         .unwrap();
         h.store
-            .admit_event(
-                &Input {
-                    id: "completion".into(),
-                    channel: 1,
-                    user: 2,
-                    text: "[shell job] completed successfully".into(),
-                },
-                id,
-            )
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE agent_lifecycle SET last_active=0 WHERE id=?1", [id])
             .unwrap();
-        h.ensure_agent(id).await.unwrap();
+        h.store.archive_idle_agents(3600).unwrap();
+        assert!(h.store.tasks(1).unwrap().as_array().unwrap().is_empty());
+        h.execute_tool(
+            &mut run,
+            &ToolCall {
+                id: "tell".into(),
+                name: "tell".into(),
+                arguments: json!({"id":id,"message":"[shell job] completed successfully"}),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(h.store.tasks(1).unwrap()[0]["id"], id);
         tokio::time::timeout(Duration::from_secs(2), async {
             while h.store.queued(1).unwrap().len() != 2 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2284,6 +2338,138 @@ mod tests {
         h.shutdown.cancel();
         server.abort();
     }
+    #[tokio::test]
+    async fn peer_message_wakes_archived_coordinator_with_channel_owned_memory() {
+        let (_directory, h, mut run, mock, server) = fixture(
+            "openai",
+            vec![final_response("openai", "neighbor response")],
+        )
+        .await;
+        run.memory
+            .memory
+            .lock()
+            .await
+            .append(Kind::User, "private source channel note")
+            .unwrap();
+        h.store
+            .admit(&Input {
+                id: "old-neighbor".into(),
+                channel: 3,
+                user: 2,
+                text: "past discussion".into(),
+            })
+            .unwrap();
+        h.store.input_state("old-neighbor", "done").unwrap();
+        h.store
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE ui_sessions SET closed=1 WHERE channel='3'", [])
+            .unwrap();
+        h.store
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE coordinator_lifecycle SET last_active=0 WHERE channel='3'",
+                [],
+            )
+            .unwrap();
+        h.store.archive_idle_agents(3600).unwrap();
+        assert!(
+            h.store.list_coordinators(false, 10, None).unwrap()["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|a| a["id"] != "channel:3")
+        );
+        // Capability restrictions are enforced by the harness, not only prompts.
+        h.store.add_task("worker", "batch", 1, 2, "work").unwrap();
+        run.child = true;
+        run.owner = "worker".into();
+        for call in [
+            ToolCall {
+                id: "find".into(),
+                name: "list_agents".into(),
+                arguments: json!({"kind":"coordinators"}),
+            },
+            ToolCall {
+                id: "tell".into(),
+                name: "tell".into(),
+                arguments: json!({"id":"channel:3","message":"forbidden"}),
+            },
+        ] {
+            assert!(h.execute_tool(&mut run, &call).await.is_err());
+        }
+        run.child = false;
+        run.owner = "channel:1".into();
+        h.execute_tool(
+            &mut run,
+            &ToolCall {
+                id: "tell".into(),
+                name: "tell".into(),
+                arguments: json!({"id":"channel:3","message":"please share findings"}),
+            },
+        )
+        .await
+        .unwrap();
+        mock.started.notified().await;
+        {
+            let requests = mock.requests.lock().await;
+            assert_eq!(requests.len(), 1);
+            let input = requests[0]["input"].to_string();
+            assert!(input.contains("[channel:1] please share findings"));
+            assert!(!input.contains("private source channel note"));
+        }
+        mock.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2),async {
+            loop {
+                let ready:bool=h.store.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE channel='3' AND text='neighbor response')",[],|r|r.get(0)).unwrap();
+                if ready {break;}
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
+        let timeline = drain(&h);
+        assert!(
+            timeline
+                .iter()
+                .any(|m| m.channel == 1
+                    && m.text.contains("message sent to Coordinator [channel:3]"))
+        );
+        let answer = timeline
+            .iter()
+            .find(|m| m.text == "neighbor response")
+            .unwrap();
+        assert_eq!(answer.channel, 3);
+        assert!(answer.reply_to.is_none());
+        assert!(answer.user.is_none());
+        assert!(timeline.iter().any(|m| {
+            m.channel == 3
+                && m.text
+                    .contains("incoming coordinator message from channel:1")
+        }));
+        assert!(
+            h.channel(3)
+                .await
+                .unwrap()
+                .memory
+                .lock()
+                .await
+                .export_html()
+                .contains("please share findings")
+        );
+        assert!(
+            !run.memory
+                .memory
+                .lock()
+                .await
+                .export_html()
+                .contains("neighbor response")
+        );
+        h.shutdown.cancel();
+        server.abort();
+    }
+
     #[tokio::test]
     async fn worker_tools_and_notifications_stay_private_until_detached_work_finishes() {
         let calls = json!({"status":"completed","output":[
