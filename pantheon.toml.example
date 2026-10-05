@@ -50,3 +50,25 @@ allow_private_network = false
 max_windows = 16
 port_start = 6080
 port_end = 6180
+
+[skills]
+bundled = true
+# Libraries or individual directories with SKILL.md. Reload on service restart.
+directories = []
+
+# MCP servers are optional; executable packages and credentials are configured
+# by the operator. Full transport/access details are in docs/mcp.md.
+# [mcp.servers.calendar]
+# description = "Personal calendar"
+# command = "/absolute/path/to/calendar-mcp-server"
+# args = []
+# env = { CALENDAR_TOKEN = "PANTHEON_CALENDAR_TOKEN" }
+# allowed_channels = [123456789012345678]
+# allowed_tools = ["list_events", "create_event"]
+# workers = true
+# timeout_seconds = 120
+
+# [mcp.servers.remote]
+# description = "Remote integration"
+# url = "https://your-mcp-service.example/mcp"
+# bearer_env = "REMOTE_MCP_TOKEN"

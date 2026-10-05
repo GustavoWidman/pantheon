@@ -16,6 +16,8 @@ pub struct Config {
     pub auth: crate::auth::AuthConfig,
     pub web: crate::web::WebConfig,
     pub browser: crate::browser::BrowserConfig,
+    pub skills: crate::skills::SkillsConfig,
+    pub mcp: crate::mcp::McpConfig,
 }
 #[derive(Clone, Deserialize, Serialize, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -53,6 +55,8 @@ impl Default for Config {
             auth: Default::default(),
             web: Default::default(),
             browser: Default::default(),
+            skills: Default::default(),
+            mcp: Default::default(),
         }
     }
 }
@@ -116,6 +120,8 @@ impl Config {
         }
         config.auth.validate()?;
         config.web.validate()?;
+        config.skills.validate()?;
+        config.mcp.validate()?;
         Ok(config)
     }
     pub fn instructions(&self) -> Result<String> {

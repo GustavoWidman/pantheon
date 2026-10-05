@@ -53,6 +53,8 @@ cargo run -- --config pantheon.toml run
 | `/reasoning level:medium` | Persist reasoning effort for the next turn |
 | `/stop` | Cancel active master and its background agents |
 | `/subagents` | Named workers, settings and state; idle archived workers are hidden |
+| `/skills` | Task guide catalog; inspect one with `id:<name>` |
+| `/mcp` | Configured integrations available in this channel |
 | `/browser` | List owned live browser links; manage handoff/resume |
 | `/wakeup action:add schedule:in 10m prompt:…` | Durable one-shot or repeating wake |
 | `/monitor action:add command:… interval_seconds:30` | Wake when a bounded command's output changes |
@@ -62,6 +64,8 @@ Slash replies are private. Ordinary prompts and agent output use the originating
 Every subagent runs in the background and reports to the master. There are no foreground children or wait/poll tools. By default the root has the full execution toolkit: it handles short or tightly connected work directly and delegates substantial independent work, parallel investigations and noisy exploration. Workers inherit the settled channel memory at spawn and can zoom into earlier findings. Set `agent.coordinator_root = true` for a strict coordinator that delegates all execution; existing configurations that explicitly set it retain that behavior. Root and workers have [web search and fetch](docs/web.md): hosted search with cited source URLs, and credential-free HTTP fetching with a durable, revalidating cache. Browser windows share one durable `pantheon-shared` profile and X display; each window group gets its own loopback VNC and noVNC listener on `0.0.0.0`. Browser handoff pauses automation until explicit resume. Returned LAN/Tailscale URLs are candidates; routing and remote firewall access cannot be established by enumerating local interfaces.
 
 Idle workers and coordinators leave default agent listings after one hour (`agent.agent_idle_seconds = 3600`). Their identities, histories and schedules remain durable. All agents can discover and message same-channel workers; coordinators can also find and message known neighboring coordinators using `list_agents(kind="coordinators")` and `tell(id="channel:<id>", message="...")`. `include_archived=true` finds hidden identities; `tell` automatically restores and wakes them, as do user input and scheduled notifications. Memory stays channel-owned; coordinator messages explicitly carry information across channels.
+
+Root and workers have [skill discovery/loading](docs/skills.md) and [MCP integrations](docs/mcp.md). Bundled guides cover product research, browser activities, learning and engineering. Configured SKILL.md libraries load on demand behind a small startup index. MCP supports stdio and Streamable HTTP tools, resources and prompts, with role/channel controls and durable retrieval of large results. Schemas stay fixed while external catalogs enter tool results. The shared behavior guide treats explicit requests about the user's own environment and authorized credential entry as ordinary work, carries tasks through to evidence, and scales process to everyday interactions.
 
 ## State and checks
 

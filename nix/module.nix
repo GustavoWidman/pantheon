@@ -20,6 +20,10 @@ let
         port_start = cfg.browserPortStart;
         port_end = cfg.browserPortEnd;
       };
+      skills = {
+        directories = map toString cfg.skillDirectories;
+        bundled = cfg.bundledSkills;
+      };
     }
   );
 in
@@ -76,6 +80,16 @@ in
       type = lib.types.listOf lib.types.package;
       default = [ ];
       description = "Additional commands exposed to agents through the service PATH.";
+    };
+    skillDirectories = lib.mkOption {
+      type = lib.types.listOf lib.types.path;
+      default = [ ];
+      description = "Skill libraries or individual folders containing SKILL.md. Index and main guides are frozen at service startup. Repository-local or packaged skills work without runtime downloads.";
+    };
+    bundledSkills = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = "Include Pantheon's research, browser activities, learning and engineering guides.";
     };
   };
   config = lib.mkIf cfg.enable {
