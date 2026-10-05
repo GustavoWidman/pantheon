@@ -1,0 +1,47 @@
+# Runtime invariants
+
+Pantheon implements [OptChat's pinned specification](https://gist.githubusercontent.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449/raw/f51fe5c910427fd6f384d22823140b1693c76207/optchat.md) as a native Rust service. Thoth's interaction design informed the command surface; its Prime Agent runtime is not a dependency.
+
+One channel has one endless memory and one serialized master actor. Different channels run concurrently. Discord ingress, model calls, compaction, background subagents, browser RPC, scheduled checks and outbound delivery have independent workers. One daemon-level lifetime lock protects all operational state, and each memory journal also holds its own lock. Systemd owns restart and process cleanup.
+
+## Memory and request layout
+
+Every master turn takes a settled summary view **before** appending its new input. System instructions and sorted tool definitions are frozen at startup. No date, status, browser URL or task ID enters these fixed prefixes. The provider conversation is fresh per turn. Within a turn, native OpenAI output items (including encrypted reasoning), or Anthropic thinking blocks/signatures, are replayed without reconstructing them. Reasoning is never written to the chat, subagent trace, database or logs. Optional reasoning display is best-effort and bypasses the durable Discord outbox.
+
+View chunks end at line boundaries before 50k/80k/100k characters. Anthropic receives ephemeral breakpoints on those three pieces and automatic request-end caching. OpenAI receives explicit breakpoints with mode=explicit for GPT-5.6/6 families and implicit request-end caching. Earlier OpenAI models receive implicit caching only because their API does not support explicit view breakpoints. No cache keepalive calls or long cache TTLs are used. `/context` shows provider-reported input, output and cached-token counts. Raw usage, including cache-write fields when supplied, is retained in the operational database. Local state is never presented as proof of a remote cache hit.
+
+The compactor follows the contextual binary-tree ordering, eight jobs, five size attempts, a 512-byte scale example, shortest answer retention, and ten-second indefinite retries. It receives bare summary text without harness addresses. Short source text forms a free node. A failing compactor holds new turns at the settle barrier; `/stop` cancels the barrier without discarding the user's admitted message.
+
+## Steering and completion
+
+Admission commits each Discord prompt before waking its channel. During a run, the actor reads the durable queue at tool boundaries. It logs exact new input immediately, buffers provider injection until outstanding tool results are complete, and appends the input after the prior native response. This satisfies Anthropic tool-result adjacency and preserves OpenAI reasoning with `context=all_turns`. If steering arrives before an issued tool is executed, the remaining tools get skipped results and the next model request reconsiders them. An already executing tool finishes or is cancelled with `/stop`; arbitrary in-flight side effects cannot be rolled back.
+
+If steering arrives while a final provider response is being generated, that response is emitted as intermediate prose and the agent continues. It receives no final ping. A terminal response is logged first, then its durable chunks and input completion are committed. Discord rendering adds the requester's mention only to the first terminal chunk. Every send sets `allowed_mentions.parse=[]` and explicitly permits at most that requester. Tool rows are updated in place through durable outbox revisions. A send/finish race preserves the receipt and schedules the latest edit rather than sealing a stale running row. Delivery runs concurrently across up to eight channels, with one in-flight item per channel, so one channel's rate limit cannot block all others. Rows contain only sanitized tool names, state and elapsed time; tool arguments and outputs never appear in rows.
+
+Slash commands run separately from the ingress dispatcher. Browser startup and slow interaction replies therefore do not stop prompt admission. Model/reasoning settings are durable and apply at the next fresh turn; no mid-run schema or system-prefix changes are made.
+
+## Background work
+
+`spawn` reserves capacity, snapshots settled memory, records all task IDs, and returns immediately after spawning. No foreground mode or waiting tool exists. Children get zoom/date, workspace tools and isolated browsers, but no spawn/tell/scheduler capabilities. Their logs stay under `subagents/`, outside the master's memory. Only their final reports reach the master. One spawn batch produces one atomic inbox message once every child has a report. `tell` delivers into a bounded mailbox at tool boundaries. A successful master ending does not cancel its children; `/stop` cancels all active work in the channel.
+
+Wakeups capture channel and authorized requester when created. Missed repeating ticks collapse to one wake on restart. Monitors run bounded shell checks independently and wake on changed exit/output, including errors. Output is retained as bounded head/tail text. A monitor is not a webhook listener; this version's monitor watches commands rather than exposing public ingress.
+
+## Durability and failure boundaries
+
+SQLite WAL with synchronous=FULL stores admissions, outbox receipts, settings, tasks, schedule state and tool intents. Daily JSONL files store the permanent chat and summary tree. User admission provenance makes recovery across the two stores idempotent. Tree summaries are durable even though they are theoretically rebuildable. Back up the entire state directory; stop the daemon or use SQLite's online backup mechanism for a consistent operational database backup. Browser profiles belong in the backup and may contain authentication material.
+
+Restart preserves queued admissions and deliveries. Interrupted turns and subagents receive visible interruption outcomes, and pending tool intents become unknown. Side-effecting tools are never blindly replayed. A reply sent to Discord just before a crash may be sent again after Discord's finite nonce deduplication window: delivery is at least once, not an exactly-once external transaction. Failed delivery remains queued in channel order, without blocking other channels.
+
+Rust handles all orchestration. A packaged Python subprocess is the browser driver bridge to Playwright/Camoufox and websockify; it installs or downloads nothing at runtime. Dedicated displays, ownership, leases, persistent profiles and viewer networking are detailed in [browser.md](browser.md).
+
+## Deliberate differences from the reference
+
+- One endless chat per Discord channel rather than a single terminal chat globally.
+- Subagents can be used by default for useful independent work, as requested; every invocation remains background-only.
+- Kernel file locks replace Unix socket locks. They release on crash without stale lock stealing or PID inference.
+- SQLite operational journals replace the reference's post-turn git commit. Canonical log/tree writes retain individual fsync barriers.
+- Reasoning display is optional and off by default; reasoning is still retained exactly in the ephemeral provider transcript and never logged locally.
+- Provider calls currently use complete HTTP responses, so model prose is delivered per finished provider step. Ingress and background work remain concurrent during inference. Partial tool arguments are never executed.
+- The built-in monitor is a command change watcher; there is no unauthenticated webhook endpoint.
+
+Provider wire contracts were checked against [OpenAI reasoning](https://developers.openai.com/api/docs/guides/reasoning), [Responses reference](https://developers.openai.com/api/reference/resources/responses/methods/create), [Anthropic caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching) and [thinking](https://platform.claude.com/docs/en/build-with-claude/extended-thinking). Model availability and supported effort levels remain provider/account-specific; API failures are surfaced rather than silently switching models.

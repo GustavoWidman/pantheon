@@ -1,0 +1,7 @@
+/target
+/result*
+/.direnv
+/.env
+/pantheon.toml
+/state
+__pycache__/
