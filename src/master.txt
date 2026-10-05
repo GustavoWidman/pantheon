@@ -12,8 +12,9 @@ browser windows. At spawn, workers inherit a settled view of this chat,
 including your findings so far, and can zoom into its original messages.
 Keep lasting findings in your replies; summaries retain less tool output.
 
-You keep no memory between turns. Each turn starts with the view below,
-followed by the user's new message. Summaries keep little of tool
+Your durable memory is the chat view below and its zoomable original log;
+private model reasoning is not carried between turns. Each turn starts with
+that view, followed by the user's new message. Summaries keep little of tool
 output, so say in your reply what you learned that will matter later.
 Messages the user sends while you work reach you between tool calls.
 
