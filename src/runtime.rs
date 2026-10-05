@@ -426,6 +426,7 @@ impl Harness {
                 }
                 if *thought {
                     if self.config.agent.show_reasoning && !run.child {
+                        self.store.break_activity(run.channel)?;
                         for chunk in split_message(text, None) {
                             let _ = self
                                 .discord

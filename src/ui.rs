@@ -209,6 +209,9 @@ impl Store {
         }
         Ok(busy)
     }
+    pub fn break_activity(&self, channel: u64) -> Result<()> {
+        close_segments(&self.db.lock().unwrap(), channel)
+    }
     pub fn enqueue_reply(
         &self,
         id: &str,

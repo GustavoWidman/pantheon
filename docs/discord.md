@@ -49,7 +49,7 @@ Each accepted input receives 📥. That becomes 🧠 when an actual model reques
 
 A four-second heartbeat renews typing while the coordinator, workers, detached shell jobs, queued reports or context compaction are busy. Activity edits are limited to one per two seconds per channel and use a two-second transport deadline; durable retries preserve backoff. New fences and prose can pass delayed edits of existing messages, while an unsent earlier fence preserves the order of new messages.
 
-Codex reasoning choices resolve against the CLI's local model capability metadata. A request for `minimal` uses `low` when a model does not support `minimal`; spawn metadata and saved settings show the actual effort. Other unsupported known efforts produce a visible validation error before dispatch.
+Codex reasoning choices resolve against the CLI's local model capability metadata. A request for `minimal` uses `low` when available, or the first supported effort, when a model does not support `minimal`; spawn metadata and saved settings show the actual effort. Other unsupported known efforts produce a visible validation error before dispatch.
 
 Slash commands return private, branded embeds with structured model, effort, context usage, cache and worker fields. Errors use a distinct error color. Embed and message limits count UTF-16 units, including emoji.
 
