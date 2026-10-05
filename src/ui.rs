@@ -328,9 +328,254 @@ pub fn card(
     json!({"content":"","embeds":[{"title":clean(title,200),"description":description,"color":if error{0xED4245}else{0x7C83FD},"fields":rows,"footer":{"text":"Pantheon • This channel"},"timestamp":chrono::Utc::now().to_rfc3339()}],"allowed_mentions":{"parse":[],"replied_user":false}})
 }
 
+/// Context capacity is display metadata, never an inference limit override.
+pub fn model_window(config: &crate::config::Config, model: &str) -> Option<(u64, &'static str)> {
+    if let Some(tokens) = config
+        .agent
+        .context_windows
+        .get(model)
+        .copied()
+        .filter(|n| *n > 0)
+    {
+        return Some((tokens, "Configured model limit"));
+    }
+    let slug = model.strip_prefix("codex/")?;
+    use std::io::Read;
+    let file = std::fs::File::open(config.auth.home().ok()?.join("models_cache.json")).ok()?;
+    let mut bytes = Vec::new();
+    file.take(4_194_305).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > 4_194_304 {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    let tokens = value["models"]
+        .as_array()?
+        .iter()
+        .find(|m| m["slug"] == slug)?["context_window"]
+        .as_u64()
+        .filter(|n| *n > 0)?;
+    Some((tokens, "Codex model metadata"))
+}
+fn number(n: u64) -> String {
+    let digits = n.to_string();
+    let mut result = String::new();
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            result.push(',');
+        }
+        result.push(ch);
+    }
+    result
+}
+/// Allocate cells by cumulative boundaries, so rounding cannot overfill the grid.
+fn squares(parts: &[(u64, &str)], capacity: u64, cells: usize) -> String {
+    let mut result = String::from("```\n");
+    let mut boundary = 0usize;
+    let mut total = 0u128;
+    for (count, glyph) in parts {
+        total += u128::from(*count);
+        let next = ((total.min(u128::from(capacity)) * cells as u128)
+            .div_ceil(u128::from(capacity.max(1))) as usize)
+            .min(cells);
+        for i in boundary..next {
+            result.push_str(glyph);
+            if (i + 1).is_multiple_of(10) {
+                result.push('\n');
+            }
+        }
+        boundary = next;
+    }
+    for i in boundary..cells {
+        result.push('⬛');
+        if (i + 1).is_multiple_of(10) {
+            result.push('\n');
+        }
+    }
+    result.push_str("```");
+    result
+}
+pub fn context_card(
+    config: &crate::config::Config,
+    model: &str,
+    reasoning: &str,
+    memory: &Value,
+    usage: &Value,
+) -> Value {
+    let recorded_model = usage["_pantheon_model"].as_str();
+    let cached = usage["input_tokens_details"]["cached_tokens"]
+        .as_u64()
+        .or_else(|| usage["cache_read_input_tokens"].as_u64())
+        .unwrap_or(0);
+    let input = usage["input_tokens"].as_u64().unwrap_or(0).saturating_add(
+        if usage.get("cache_read_input_tokens").is_some() {
+            cached.saturating_add(usage["cache_creation_input_tokens"].as_u64().unwrap_or(0))
+        } else {
+            0
+        },
+    );
+    let output = usage["output_tokens"].as_u64().unwrap_or(0);
+    let total = input.saturating_add(output);
+    let fresh = input.saturating_sub(cached);
+    let window_model = recorded_model.unwrap_or(model);
+    let capacity = model_window(config, window_model);
+    let has_usage = usage.get("input_tokens").is_some();
+    let mut fields = vec![("Channel model", format!("`{model}` · {reasoning}"), false)];
+    let window = match capacity {
+        Some((limit, source)) if recorded_model.is_some() && has_usage => format!("{}\n**{} / {} tokens · {:.1}%**\nLast recorded request · {source}{}",squares(&[(cached.min(input),"🟦"),(fresh,"🟪"),(output,"🟧")],limit,100),number(total),number(limit),total as f64 / limit as f64 * 100.0,if total>limit {" · exceeds displayed limit"}else{""}),
+        Some((limit, source)) => format!("{}\n**{}-token window** · {source}\n⬜ Usage unavailable · {}",squares(&[],limit,100).replace("⬛","⬜"),number(limit),if has_usage {"Previous usage has no recorded model; occupancy unavailable."}else{"No request recorded yet."}),
+        None => "Model capacity unavailable. Set `agent.context_windows` for this model to enable its window grid.".into(),
+    };
+    fields.push(("Model window", window, false));
+    if has_usage {
+        fields.push(("Request breakdown",format!("🟦 Cached input  **{}**\n🟪 Fresh input  **{}**\n🟧 Output  **{}**{}\nInput total  **{}**",number(cached.min(input)),number(fresh),number(output),if recorded_model.is_some(){capacity.map(|(limit,_)|format!("\n⬛ Remaining  **{}**",number(limit.saturating_sub(total)))).unwrap_or_default()}else{String::new()},number(input)),true));
+        fields.push((
+            "Prompt cache",
+            if input > 0 {
+                format!(
+                    "**{:.1}%** of input reused\nCached input occupies context normally.",
+                    cached.min(input) as f64 / input as f64 * 100.0
+                )
+            } else {
+                "No input usage recorded".into()
+            },
+            true,
+        ));
+        if let Some(last) = recorded_model.filter(|last| *last != model) {
+            fields.push((
+                "Recorded request model",
+                format!("`{last}`\nChannel model has changed since this request."),
+                false,
+            ));
+        }
+    }
+    let view = memory["view_bytes"].as_u64().unwrap_or(0);
+    let budget = memory["view_budget_bytes"].as_u64().unwrap_or(1).max(1);
+    fields.push(("Memory view",format!("{}\n🟩 **{:.1} / {:.1} KiB · {:.1}%**\nCompacted view for the next fresh turn · byte budget",squares(&[(view,"🟩")],budget,20),view as f64 / 1024.0,budget as f64 / 1024.0,view as f64 / budget as f64 * 100.0),false));
+    fields.push((
+        "Durable history",
+        format!(
+            "{} messages · {} summaries\n{} loaded view lines",
+            memory["messages"], memory["summaries"], memory["view_lines"]
+        ),
+        true,
+    ));
+    fields.push((
+        "Memory state",
+        if memory["settled"] == true {
+            "Settled".into()
+        } else {
+            format!("Compacting · {} jobs ready", memory["ready_jobs"])
+        },
+        true,
+    ));
+    let mut result = card(
+        "Context",
+        "Last recorded coordinator request and the memory view for the next turn. Model squares use rounded 1% cells; token counts below come from provider reports.",
+        fields,
+        false,
+    );
+    result["embeds"][0]["color"] = json!(0x5865F2);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn field<'a>(card: &'a Value, name: &str) -> &'a str {
+        card["embeds"][0]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["name"] == name)
+            .unwrap()["value"]
+            .as_str()
+            .unwrap()
+    }
+    #[test]
+    fn context_grid_accounts_for_anthropic_cache_and_retains_recorded_model() {
+        let mut config = crate::config::Config::default();
+        config
+            .agent
+            .context_windows
+            .insert("anthropic/old".into(), 1000);
+        config
+            .agent
+            .context_windows
+            .insert("openai/new".into(), 9000);
+        let usage = json!({"_pantheon_model":"anthropic/old","input_tokens":100,"cache_read_input_tokens":200,"cache_creation_input_tokens":50,"output_tokens":50});
+        let memory = json!({"view_bytes":256,"view_budget_bytes":1024,"messages":4,"summaries":2,"view_lines":2,"settled":true});
+        let card = context_card(&config, "openai/new", "low", &memory, &usage);
+        let window = field(&card, "Model window");
+        assert!(window.contains("400 / 1,000 tokens · 40.0%"));
+        assert_eq!(window.matches("🟦").count(), 20);
+        assert_eq!(window.matches("🟪").count(), 15);
+        assert_eq!(window.matches("🟧").count(), 5);
+        assert_eq!(window.matches("⬛").count(), 60);
+        assert!(field(&card, "Request breakdown").contains("Remaining  **600**"));
+        assert!(field(&card, "Recorded request model").contains("anthropic/old"));
+        assert!(field(&card, "Memory view").contains("25.0%"));
+    }
+    #[test]
+    fn context_metadata_fallback_and_legacy_usage_do_not_invent_occupancy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.auth.codex_home = Some(dir.path().into());
+        std::fs::write(
+            dir.path().join("models_cache.json"),
+            r#"{"models":[{"slug":"test","context_window":2000,"max_context_window":9000}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            model_window(&config, "codex/test"),
+            Some((2000, "Codex model metadata"))
+        );
+        assert_eq!(model_window(&config, "openai/test"), None);
+        let card = context_card(
+            &config,
+            "codex/test",
+            "low",
+            &json!({}),
+            &json!({"input_tokens":100}),
+        );
+        let window = field(&card, "Model window");
+        assert!(window.contains("occupancy unavailable"));
+        assert_eq!(
+            window.split("```").nth(1).unwrap().matches("⬜").count(),
+            100
+        );
+        config
+            .agent
+            .context_windows
+            .insert("codex/test".into(), 3000);
+        assert_eq!(
+            model_window(&config, "codex/test"),
+            Some((3000, "Configured model limit"))
+        );
+        config.agent.context_windows.clear();
+        std::fs::write(dir.path().join("models_cache.json"), "invalid").unwrap();
+        assert_eq!(model_window(&config, "codex/test"), None);
+    }
+    #[test]
+    fn context_grid_clamps_overflow_without_losing_reported_counts() {
+        let mut config = crate::config::Config::default();
+        config
+            .agent
+            .context_windows
+            .insert("openai/test".into(), 100);
+        let card = context_card(
+            &config,
+            "openai/test",
+            "low",
+            &json!({}),
+            &json!({"_pantheon_model":"openai/test","input_tokens":200,"output_tokens":10}),
+        );
+        let grid = field(&card, "Model window");
+        assert_eq!(grid.matches("🟪").count(), 100);
+        assert_eq!(grid.matches("⬛").count(), 0);
+        assert!(grid.contains("210 / 100"));
+        assert!(grid.contains("exceeds displayed limit"));
+        assert!(field(&card, "Request breakdown").contains("Remaining  **0**"));
+    }
     #[test]
     fn activity_accumulates_updates_and_preserves_reply_and_receipt_after_restart() {
         let dir = tempfile::tempdir().unwrap();

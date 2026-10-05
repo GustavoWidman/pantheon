@@ -10,17 +10,32 @@ Registered commands:
 
 | Command | Purpose |
 | --- | --- |
-| `/context` | Inspect durable context and cache state |
+| `/context` | Inspect model-window and memory grids, token counts and prompt-cache reuse |
 | `/model [id]` | Inspect or choose the channel model |
 | `/reasoning [level]` | Inspect or choose reasoning effort |
 | `/stop` | Cancel the current run and its background agents |
-| `/status` | Inspect active work and delivery |
+| `/status` | Inspect active agent phases, shell jobs, message queues, schedules and delivery |
 | `/subagents` | List background agents |
 | `/browser [action] [browser_id] [resume_token] [url]` | List/open desktops, hand off, explicitly resume, or close |
 | `/wakeup action [schedule] [prompt] [id]` | Add, list, or cancel durable prompts |
 | `/monitor action [command] [interval_seconds] [prompt] [id]` | Add, list, or cancel command monitors; interval minimum five seconds |
 
 Command handling and validation belong to the runtime; Discord transports the command name and the options array without changing them. Wakeup schedules accept `in 5m`, `every 1h`, or `once <RFC3339 timestamp>`. Normal messages retain their Discord snowflake ID, which the durable inbox uses for replay deduplication. Incoming prompts should steer the active session at a model boundary; gateway code never cancels and recreates an agent implicitly.
+
+## Context and work status
+
+`/context` uses a 10×10 model-window grid: blue is cached input, purple is fresh input, orange is output, and dark squares are remaining capacity. Each cell represents a rounded one percent; the legend retains exact provider-reported counts. Cached input occupies the window normally. Anthropic input totals include cache reads and writes. This is the **last recorded coordinator request**, not a live counter. Its model remains attached to the snapshot when `/model` changes. Worker search usage cannot overwrite it.
+
+A separate green memory grid shows the compacted view against `agent.view_bytes`, in bytes rather than estimated tokens. Durable history can be much larger than this loaded view. Memory state indicates whether compaction has settled.
+
+Model capacities come from exact per-model `agent.context_windows` overrides or the Codex CLI's cached model metadata. Metadata is read locally without contacting a provider or refreshing credentials. Missing capacities remain explicitly unavailable; legacy usage without a recorded model does not invent an occupancy percentage. The capacity setting affects display only. For API models or absent Codex metadata, configure the verified model limit:
+
+```toml
+[agent.context_windows]
+"anthropic/YOUR_MODEL" = 200000 # Replace with your model and its verified token limit.
+```
+
+`/status` focuses on execution: active agent names/phases, shell jobs, prompt and worker-message queues, pending deliveries, active wakeups/monitors, and whether memory is settling. Its color changes from amber during work to green when ready; `/context` uses blue.
 
 ## Final messages and tool activity
 

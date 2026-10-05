@@ -406,7 +406,8 @@ impl Harness {
                 _=run.cancel.cancelled()=>bail!("cancelled"),
             };
             if !run.child {
-                self.store.usage(run.channel, &response.usage)?;
+                self.store
+                    .usage(run.channel, &run.settings.0, &response.usage)?;
             }
             Provider::append_response(vendor, &mut run.history, &response);
             let final_steered = if response.calls.is_empty() {
@@ -757,7 +758,6 @@ impl Harness {
                     value = tokio::time::timeout(Duration::from_secs(self.config.web.search_timeout_seconds), self.provider.search(model, tools::string(a, "query")?, limit, &domains)) => value.context("web search timed out")??,
                     _ = run.cancel.cancelled() => bail!("web search cancelled"),
                 };
-                self.store.usage(run.channel, &value["usage"])?;
                 value
             }
             "browser" => {
@@ -1193,101 +1193,112 @@ impl Harness {
                     false,
                 ));
             }
-            "context" | "status" => {
+            "context" => {
                 let stats = c.memory.lock().await.stats();
                 let operational = self.store.stats(channel)?;
-                let active = c
-                    .cancel
-                    .lock()
-                    .await
-                    .as_ref()
-                    .is_some_and(|token| !token.is_cancelled());
-                let children = self
-                    .children
-                    .lock()
-                    .await
-                    .values()
-                    .filter(|child| child.channel == channel)
-                    .count();
-                let usage = &operational["last_request_usage"];
-                let cached = usage["input_tokens_details"]["cached_tokens"]
-                    .as_u64()
-                    .or_else(|| usage["cache_read_input_tokens"].as_u64())
-                    .unwrap_or(0);
-                let input = usage["input_tokens"].as_u64().unwrap_or(0)
-                    + if usage.get("cache_read_input_tokens").is_some() {
-                        cached + usage["cache_creation_input_tokens"].as_u64().unwrap_or(0)
-                    } else {
-                        0
-                    };
-                let output = usage["output_tokens"].as_u64().unwrap_or(0);
-                let cache = if input > 0 {
-                    format!(
-                        "{cached} tokens · {:.0}% of input",
-                        cached as f64 / input as f64 * 100.0
-                    )
-                } else {
-                    "No usage recorded yet".into()
-                };
-                let view = stats["view_bytes"].as_u64().unwrap_or(0);
-                let budget = stats["view_budget_bytes"].as_u64().unwrap_or(1).max(1);
-                let filled = ((view.saturating_mul(10) / budget).min(10)) as usize;
-                let bar = format!("{}{}", "▰".repeat(filled), "▱".repeat(10 - filled));
-                let state = if active {
-                    "Coordinator is working"
-                } else if children > 0 {
-                    "Background agents are working"
+                return Ok(crate::ui::context_card(
+                    &self.config,
+                    &model,
+                    &reasoning,
+                    &stats,
+                    &operational["last_request_usage"],
+                ));
+            }
+            "status" => {
+                let stats = c.memory.lock().await.stats();
+                let operational = self.store.stats(channel)?;
+                let agents = operational["active_agents"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                let state = if !agents.is_empty() {
+                    "Work in progress"
+                } else if operational["running_shells"].as_u64().unwrap_or(0) > 0 {
+                    "Background shell work in progress"
+                } else if operational["queued_worker_messages"].as_u64().unwrap_or(0) > 0
+                    || operational["queued_prompts"].as_u64().unwrap_or(0) > 0
+                {
+                    "Processing queued messages"
+                } else if operational["pending_delivery"].as_u64().unwrap_or(0) > 0 {
+                    "Delivering responses"
                 } else if stats["settled"] != true {
-                    "Updating context"
+                    "Updating memory"
                 } else {
-                    "Ready"
+                    "Ready for your next message"
                 };
-                return Ok(crate::ui::card(
-                    if name == "context" {
-                        "Context"
-                    } else {
-                        "Work status"
-                    },
+                let phases = if agents.is_empty() {
+                    "No agents currently executing".into()
+                } else {
+                    agents
+                        .iter()
+                        .take(8)
+                        .map(|a| {
+                            format!(
+                                "**{}** · {}",
+                                crate::ui::clean(a["name"].as_str().unwrap_or("Agent"), 32),
+                                crate::ui::clean(a["phase"].as_str().unwrap_or("Working"), 60)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                let jobs = self.store.jobs(Some(channel), false)?;
+                let mut card = crate::ui::card(
+                    "Work status",
                     state,
                     vec![
-                        ("Model", format!("`{model}`"), false),
-                        ("Reasoning", reasoning.clone(), true),
-                        ("Background agents", children.to_string(), true),
+                        ("Active work", phases, false),
                         (
-                            "Context budget",
+                            "Shell jobs",
+                            operational["running_shells"].to_string(),
+                            true,
+                        ),
+                        (
+                            "Queued messages",
                             format!(
-                                "{bar}\n{:.1} / {:.1} KiB · {:.0}%",
-                                view as f64 / 1024.0,
-                                budget as f64 / 1024.0,
-                                view as f64 / budget as f64 * 100.0
+                                "{} prompts · {} worker messages",
+                                operational["queued_prompts"],
+                                operational["queued_worker_messages"]
                             ),
+                            true,
+                        ),
+                        (
+                            "Delivery",
+                            format!("{} messages pending", operational["pending_delivery"]),
+                            true,
+                        ),
+                        (
+                            "Schedules",
+                            format!(
+                                "{} wakeups · {} monitors",
+                                jobs.iter().filter(|j| j.kind == "wakeup").count(),
+                                jobs.iter().filter(|j| j.kind == "monitor").count()
+                            ),
+                            true,
+                        ),
+                        (
+                            "Memory",
+                            if stats["settled"] == true {
+                                "Settled".into()
+                            } else {
+                                format!("Compacting · {} jobs ready", stats["ready_jobs"])
+                            },
+                            true,
+                        ),
+                        (
+                            "Channel settings",
+                            format!("`{model}` · {reasoning}"),
                             false,
                         ),
-                        (
-                            "Durable memory",
-                            format!(
-                                "{} messages · {} summaries\n{} view lines",
-                                stats["messages"], stats["summaries"], stats["view_lines"]
-                            ),
-                            true,
-                        ),
-                        (
-                            "Delivery queue",
-                            format!(
-                                "{} prompts · {} messages",
-                                operational["queued_prompts"], operational["pending_delivery"]
-                            ),
-                            true,
-                        ),
-                        (
-                            "Last request",
-                            format!("{input} input · {output} output tokens"),
-                            true,
-                        ),
-                        ("Prompt cache", cache, true),
                     ],
                     false,
-                ));
+                );
+                card["embeds"][0]["color"] = json!(if state == "Ready for your next message" {
+                    0x57F287
+                } else {
+                    0xFEE75C
+                });
+                return Ok(card);
             }
 
             "stop" => {
@@ -1920,10 +1931,56 @@ mod tests {
                         .as_array()
                         .unwrap()
                         .iter()
-                        .any(|f| f["name"] == "Context budget")
+                        .any(|f| f["name"] == "Memory view")
                 );
             }
         }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn status_and_context_show_distinct_data_and_worker_search_keeps_root_usage() {
+        let response = json!({"status":"completed","output":[{"type":"web_search_call","id":"search","status":"completed"},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Result","annotations":[]}]}],"usage":{"input_tokens":999,"output_tokens":20}});
+        let (_dir, h, mut run, mock, server) = fixture("openai", vec![response]).await;
+        h.store.set_settings(1, "openai/test", "low").unwrap();
+        h.store
+            .usage(
+                1,
+                "openai/test",
+                &json!({"input_tokens":42,"output_tokens":5}),
+            )
+            .unwrap();
+        run.child = true;
+        mock.release.notify_one();
+        h.execute_tool(
+            &mut run,
+            &ToolCall {
+                id: "s".into(),
+                name: "web_search".into(),
+                arguments: json!({"query":"official docs"}),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            h.store.stats(1).unwrap()["last_request_usage"]["input_tokens"],
+            42
+        );
+        let context = h.command(1, 2, "context", &json!([])).await.unwrap();
+        let status = h.command(1, 2, "status", &json!([])).await.unwrap();
+        let names = |card: &Value| {
+            card["embeds"][0]["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f["name"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(names(&context).contains(&"Model window".into()));
+        assert!(!names(&context).contains(&"Delivery".into()));
+        assert!(names(&status).contains(&"Active work".into()));
+        assert!(names(&status).contains(&"Schedules".into()));
+        assert!(!names(&status).contains(&"Model window".into()));
         server.abort();
     }
 

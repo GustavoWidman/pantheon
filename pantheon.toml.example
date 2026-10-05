@@ -22,6 +22,11 @@ max_shell_jobs = 16
 shell_timeout_seconds = 3600
 show_reasoning = false
 
+# Optional display limits for /context; these do not change inference limits.
+# Codex models can use their locally cached CLI metadata instead.
+# [agent.context_windows]
+# "anthropic/YOUR_MODEL" = 200000 # Replace with the verified model limit.
+
 [auth]
 # Reuse a file-based Codex login; omitted defaults to CODEX_HOME or ~/.codex.
 # For a service, sign in separately under its own writable state directory.
