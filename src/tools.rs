@@ -68,7 +68,6 @@ pub fn definitions(child: bool, coordinator: bool) -> Vec<Value> {
     }
     tools.extend([
             tool("list_agents","Discover same-channel workers (kind=workers, default). Coordinators can also discover other channel coordinators with kind=coordinators; workers cannot. Idle archived agents are hidden unless include_archived=true. Follow next_before with before for further pages. Results include IDs, names, settings, state and activity timestamps.",json!({"kind":{"type":"string","enum":["workers","coordinators"]},"include_archived":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":25},"before":{"type":"integer","minimum":1}}),&[]),
-            tool("revive_agent","Restore an archived identity to the list without starting a model turn. Workers can restore same-channel workers; coordinators can also restore a known channel:<id> coordinator. Task, settings and saved history are retained. Tell also revives automatically.",json!({"id":{"type":"string"}}),&["id"]),
             tool("tell","Send a durable message to any worker in your channel, including peers or yourself. Coordinators may also target another known coordinator with channel:<id>. The harness identifies the sender. Delivery happens between provider steps or wakes an idle/archived identity in a fresh background turn. Never wait or poll; avoid message loops and unnecessary acknowledgements.",json!({"id":{"type":"string"},"message":{"type":"string","minLength":1,"maxLength":64000}}),&["id","message"]),
             tool("wakeup","Manage durable wakeups. Schedules: in 10m, once ISO8601, every 1h. Notifications reach the owning agent, including an idle background worker, and preserve channel and user.",json!({"action":{"type":"string","enum":["add","list","cancel"]},"schedule":{"type":"string"},"prompt":{"type":"string"},"id":{"type":"string"}}),&["action"]),
             tool("monitor","Manage durable change monitors. A command runs at intervals; only changed status/output reaches your durable inbox. Commands have timeout and bounded output.",json!({"action":{"type":"string","enum":["add","list","cancel"]},"command":{"type":"string"},"interval_seconds":{"type":"integer","minimum":5},"id":{"type":"string"}}),&["action"]),
@@ -269,7 +268,6 @@ mod tests {
                 "date",
                 "list_agents",
                 "monitor",
-                "revive_agent",
                 "spawn",
                 "tell",
                 "wakeup",
@@ -289,12 +287,12 @@ mod tests {
             "zoom",
             "date",
             "list_agents",
-            "revive_agent",
             "tell",
         ] {
             assert!(worker.contains(&name.to_owned()));
         }
         assert!(!worker.contains(&"spawn".to_owned()));
+        assert!(!worker.contains(&"revive_agent".to_owned()));
     }
     #[test]
     fn symlink_escape_is_denied() {

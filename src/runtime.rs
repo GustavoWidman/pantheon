@@ -878,16 +878,6 @@ impl Harness {
                     _ => bail!("unknown agent kind"),
                 }
             }
-            "revive_agent" => {
-                let id = tools::string(a, "id")?;
-                if let Some(channel) = id.strip_prefix("channel:") {
-                    ensure!(!run.child, "workers cannot revive coordinators");
-                    self.store.revive_coordinator(channel.parse()?)?;
-                } else {
-                    self.store.revive_agent(run.channel, id)?;
-                }
-                json!({"revived":id,"name":self.store.agent_label(id)?,"mode":"idle"})
-            }
             "tell" => {
                 let id = tools::string(a, "id")?;
                 let message_id = self.store.send_agent_message(
@@ -2108,7 +2098,7 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
-    async fn idle_child_resumes_same_identity_on_durable_notification() {
+    async fn archived_child_resumes_same_identity_when_told() {
         let (_directory, h, mut run, mock, server) = fixture(
             "openai",
             vec![
@@ -2135,17 +2125,24 @@ mod tests {
         .await
         .unwrap();
         h.store
-            .admit_event(
-                &Input {
-                    id: "completion".into(),
-                    channel: 1,
-                    user: 2,
-                    text: "[shell job] completed successfully".into(),
-                },
-                id,
-            )
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE agent_lifecycle SET last_active=0 WHERE id=?1", [id])
             .unwrap();
-        h.ensure_agent(id).await.unwrap();
+        h.store.archive_idle_agents(3600).unwrap();
+        assert!(h.store.tasks(1).unwrap().as_array().unwrap().is_empty());
+        h.execute_tool(
+            &mut run,
+            &ToolCall {
+                id: "tell".into(),
+                name: "tell".into(),
+                arguments: json!({"id":id,"message":"[shell job] completed successfully"}),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(h.store.tasks(1).unwrap()[0]["id"], id);
         tokio::time::timeout(Duration::from_secs(2), async {
             while h.store.queued(1).unwrap().len() != 2 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2400,11 +2397,6 @@ mod tests {
                 id: "tell".into(),
                 name: "tell".into(),
                 arguments: json!({"id":"channel:3","message":"forbidden"}),
-            },
-            ToolCall {
-                id: "revive".into(),
-                name: "revive_agent".into(),
-                arguments: json!({"id":"channel:3"}),
             },
         ] {
             assert!(h.execute_tool(&mut run, &call).await.is_err());

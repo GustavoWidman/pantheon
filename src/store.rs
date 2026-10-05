@@ -537,11 +537,6 @@ impl Store {
             AND NOT EXISTS(SELECT 1 FROM shell_runs r WHERE r.owner=agent_lifecycle.id AND r.state='running')
             AND NOT EXISTS(SELECT 1 FROM agent_inbox i WHERE i.owner=agent_lifecycle.id AND i.state='queued')",[cutoff])?)
     }
-    pub fn revive_agent(&self, channel: u64, id: &str) -> Result<()> {
-        let db = self.db.lock().unwrap();
-        ensure!(db.execute("UPDATE agent_lifecycle SET archived=0,last_active=?3 WHERE id=?1 AND EXISTS(SELECT 1 FROM tasks t WHERE t.id=?1 AND t.channel=?2)",params![id,channel.to_string(),now()])?==1,"unknown agent in this channel");
-        Ok(())
-    }
     fn archive_coordinators_before(&self, cutoff: i64) -> Result<usize> {
         Ok(self.db.lock().unwrap().execute("UPDATE coordinator_lifecycle SET archived=1 WHERE archived=0 AND last_active<=?1
             AND NOT EXISTS(SELECT 1 FROM ui_agents a WHERE a.owner='channel:'||coordinator_lifecycle.channel AND a.active=1)
@@ -571,16 +566,6 @@ impl Store {
             Ok((serde_json::json!({"id":format!("channel:{channel}"),"name":format!("Coordinator {channel}"),"channel":channel,"model":crate::ui::clean(&r.get::<_,String>(1)?,128),"reasoning":r.get::<_,String>(2)?,"state":r.get::<_,String>(3)?,"archived":r.get::<_,bool>(4)?,"last_active":r.get::<_,i64>(5)?}),r.get::<_,i64>(6)?))
         })?.collect::<std::result::Result<Vec<_>,_>>()?;
         agent_page(rows, limit, "coordinators")
-    }
-    pub fn revive_coordinator(&self, channel: u64) -> Result<()> {
-        ensure!(
-            self.db.lock().unwrap().execute(
-                "UPDATE coordinator_lifecycle SET archived=0,last_active=?2 WHERE channel=?1",
-                params![channel.to_string(), now()]
-            )? == 1,
-            "unknown coordinator"
-        );
-        Ok(())
     }
     pub fn send_agent_message(
         &self,
@@ -1140,9 +1125,11 @@ mod tests {
         assert_eq!(record.task, "original task");
         assert_eq!(record.report, "saved findings");
         assert_eq!(record.model, "openai/test");
-        assert!(store.revive_agent(3, "worker").is_err());
-        store.revive_agent(1, "worker").unwrap();
-        assert_eq!(store.tasks(1).unwrap()[0]["id"], "worker");
+        assert!(
+            store
+                .send_agent_message(3, 2, "channel:3", "worker", "wrong channel")
+                .is_err()
+        );
         store
             .db
             .lock()
