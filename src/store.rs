@@ -83,12 +83,19 @@ impl Store {
             ],
         )? == 1;
         if admitted {
-            let context = crate::ui::ReplyContext::request(&input.id);
-            tx.execute("INSERT OR IGNORE INTO ui_contexts(source,reply_to,activity,is_prompt) VALUES(?1,?2,?3,1)", params![input.id,context.reply_to.map(|id|id.to_string()),context.activity])?;
+            let context = tx.query_row("SELECT reply_to,activity FROM ui_contexts WHERE source=?1",[&input.id],|r|Ok(crate::ui::ReplyContext{reply_to:r.get::<_,Option<String>>(0)?.and_then(|s|s.parse().ok()),activity:r.get(1)?})).optional()?.or(tx.query_row("SELECT reply_to,activity FROM ui_sessions WHERE channel=?1 AND closed=0 ORDER BY rowid DESC LIMIT 1",[input.channel.to_string()],|r|Ok(crate::ui::ReplyContext{reply_to:r.get::<_,Option<String>>(0)?.and_then(|s|s.parse().ok()),activity:r.get(1)?})).optional()?).unwrap_or_else(||crate::ui::ReplyContext::request(&input.id));
+            tx.execute("INSERT OR IGNORE INTO ui_contexts(source,reply_to,activity,is_prompt) VALUES(?1,?2,?3,1)",params![input.id,context.reply_to.map(|id|id.to_string()),context.activity])?;
             tx.execute(
                 "UPDATE ui_contexts SET is_prompt=1 WHERE source=?1",
                 [&input.id],
             )?;
+            tx.execute("INSERT OR IGNORE INTO ui_sessions(activity,channel,reply_to,closed) VALUES(?1,?2,?3,0)",params![context.activity,input.channel.to_string(),context.reply_to.map(|id|id.to_string())])?;
+            if input.id.parse::<u64>().is_ok_and(|n| n > 0) {
+                tx.execute(
+                    "INSERT OR IGNORE INTO ui_reactions(message,channel,activity) VALUES(?1,?2,?3)",
+                    params![input.id, input.channel.to_string(), context.activity],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(admitted)
@@ -162,7 +169,31 @@ impl Store {
         if queued != 0 {
             return Ok(false);
         }
-        let background:i64=tx.query_row("SELECT (SELECT count(*) FROM tasks t JOIN ui_contexts c ON c.source=t.id WHERE c.activity=?1 AND t.state='running')+(SELECT count(*) FROM ui_agents a WHERE a.activity=?1 AND active=1 AND owner NOT LIKE 'channel:%')+(SELECT count(*) FROM shell_runs r JOIN ui_contexts c ON c.source=r.id WHERE c.activity=?1 AND r.state='running')+(SELECT count(*) FROM agent_inbox i JOIN ui_contexts c ON c.source=i.id WHERE c.activity=?1 AND i.state='queued')",[context.as_ref().map(|(_,activity)|activity)],|row|row.get(0))?;
+        let recipient: String = context
+            .as_ref()
+            .and_then(|(reply, _)| reply.as_ref())
+            .map(|id| {
+                tx.query_row("SELECT user FROM inbox WHERE id=?1", [id], |r| {
+                    r.get::<_, String>(0)
+                })
+                .optional()
+            })
+            .transpose()?
+            .flatten()
+            .unwrap_or_else(|| user.to_string());
+        let activity = context
+            .as_ref()
+            .map(|(_, activity)| activity.as_str())
+            .unwrap_or("");
+        let background = crate::ui::background_count(&tx, activity)?;
+        crate::ui::close_segments(&tx, channel)?;
+        if background == 0 {
+            tx.execute(
+                "UPDATE ui_sessions SET closed=1 WHERE activity=?1",
+                [activity],
+            )?;
+        }
+
         for (i, text) in chunks.iter().enumerate() {
             let id = format!("{id}:{i}");
             let hash = Sha256::digest(id.as_bytes());
@@ -172,10 +203,10 @@ impl Store {
                 params![
                     id,
                     channel.to_string(),
-                    if i == 0 && background==0 { Some(user.to_string()) } else { None },
+                    if i == 0 && background==0 { Some(recipient.clone()) } else { None },
                     text,
                     nonce,
-                    context.as_ref().and_then(|(reply,_)|reply.as_deref())
+                    if i==0 && background==0 {context.as_ref().and_then(|(reply,_)|reply.as_deref())} else {None}
                 ],
             )?;
         }
@@ -195,7 +226,10 @@ impl Store {
     pub fn enqueue(&self, id: &str, channel: u64, user: Option<u64>, text: &str) -> Result<()> {
         let hash = Sha256::digest(id.as_bytes());
         let nonce = u64::from_le_bytes(hash[..8].try_into().unwrap()).to_string();
-        self.db.lock().unwrap().execute(
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        crate::ui::close_segments(&tx, channel)?;
+        tx.execute(
             "INSERT INTO outbox(id,channel,user,text,nonce) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET text=excluded.text,state='queued',next_try=0 WHERE outbox.text!=excluded.text",
             params![
                 id,
@@ -205,6 +239,7 @@ impl Store {
                 nonce
             ],
         )?;
+        tx.commit()?;
         Ok(())
     }
     pub fn next_outbound(&self) -> Result<Option<Outbound>> {
@@ -218,8 +253,8 @@ impl Store {
         channels: &[u64],
         ui_throttled: &[u64],
     ) -> Result<Option<Outbound>> {
-        // Text replies preserve order and can pass pending activity edits.
-        Ok(self.db.lock().unwrap().query_row("SELECT id,channel,user,text,nonce,receipt,reply_to FROM outbox o WHERE state='queued' AND next_try<=?1 AND channel NOT IN (SELECT value FROM json_each(?2)) AND (o.id NOT LIKE '%:activity:%' OR channel NOT IN (SELECT value FROM json_each(?3))) AND NOT EXISTS(SELECT 1 FROM outbox p WHERE p.channel=o.channel AND p.state='queued' AND p.seq<o.seq AND (o.id LIKE '%:activity:%' OR p.id NOT LIKE '%:activity:%')) ORDER BY seq LIMIT 1",params![now(),serde_json::to_string(&channels.iter().map(|c|c.to_string()).collect::<Vec<_>>())?,serde_json::to_string(&ui_throttled.iter().map(|c|c.to_string()).collect::<Vec<_>>())?],|r|Ok(Outbound{id:r.get(0)?,channel:r.get::<_,String>(1)?.parse().unwrap_or(0),user:r.get::<_,Option<String>>(2)?.and_then(|s|s.parse().ok()),text:r.get(3)?,nonce:r.get(4)?,receipt:r.get(5)?,reply_to:r.get::<_,Option<String>>(6)?.and_then(|s|s.parse().ok())})).optional()?)
+        // New messages preserve order and can pass edits of existing activity.
+        Ok(self.db.lock().unwrap().query_row("SELECT id,channel,user,text,nonce,receipt,reply_to FROM outbox o WHERE state='queued' AND next_try<=?1 AND channel NOT IN (SELECT value FROM json_each(?2)) AND (o.id NOT LIKE '%:activity:%' OR o.receipt IS NULL OR channel NOT IN (SELECT value FROM json_each(?3))) AND NOT EXISTS(SELECT 1 FROM outbox p WHERE p.channel=o.channel AND p.state='queued' AND p.seq<o.seq AND (p.id NOT LIKE '%:activity:%' OR p.receipt IS NULL)) ORDER BY seq LIMIT 1",params![now(),serde_json::to_string(&channels.iter().map(|c|c.to_string()).collect::<Vec<_>>())?,serde_json::to_string(&ui_throttled.iter().map(|c|c.to_string()).collect::<Vec<_>>())?],|r|Ok(Outbound{id:r.get(0)?,channel:r.get::<_,String>(1)?.parse().unwrap_or(0),user:r.get::<_,Option<String>>(2)?.and_then(|s|s.parse().ok()),text:r.get(3)?,nonce:r.get(4)?,receipt:r.get(5)?,reply_to:r.get::<_,Option<String>>(6)?.and_then(|s|s.parse().ok())})).optional()?)
     }
     pub fn delivered(&self, item: &Outbound, receipt: &str) -> Result<()> {
         self.db.lock().unwrap().execute("UPDATE outbox SET receipt=?2,state=CASE WHEN text=?3 THEN 'sent' ELSE 'queued' END,next_try=0 WHERE id=?1",params![item.id,receipt,item.text])?;
@@ -514,6 +549,17 @@ impl Store {
     pub fn finish_agent(&self, id: &str, report: &str, delivery_id: &str) -> Result<()> {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
+        let finished: bool = tx
+            .query_row(
+                "SELECT state!='running' FROM agent_runs WHERE id=?1",
+                [delivery_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if finished {
+            return Ok(());
+        }
         let (state, channel, user): (String, String, String) = tx.query_row(
             "SELECT state,channel,user FROM tasks WHERE id=?1",
             [id],
@@ -527,6 +573,7 @@ impl Store {
                 params![id, report],
             )?;
             crate::ui::copy_context(&tx, id, delivery_id)?;
+            crate::ui::worker_report(&tx, id, delivery_id, channel.parse()?)?;
             deliver_event(
                 &tx,
                 delivery_id,
@@ -675,44 +722,28 @@ impl Store {
     }
 }
 fn finish_task_transaction(tx: &rusqlite::Transaction<'_>, id: &str, report: &str) -> Result<()> {
-    tx.execute(
-        "UPDATE tasks SET state='done',report=?2 WHERE id=?1",
+    let changed = tx.execute(
+        "UPDATE tasks SET state='done',report=?2 WHERE id=?1 AND state='running'",
         params![id, report],
     )?;
-    let (batch, channel, user): (String, String, String) = tx.query_row(
-        "SELECT batch,channel,user FROM tasks WHERE id=?1",
-        [id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    )?;
-    let active: i64 = tx.query_row(
-        "SELECT count(*) FROM tasks WHERE batch=?1 AND state='running'",
-        [&batch],
-        |r| r.get(0),
-    )?;
-    if active == 0 {
-        crate::ui::copy_context(tx, id, &format!("batch:{batch}"))?;
-        let reports = {
-            let mut s = tx.prepare("SELECT id,report FROM tasks WHERE batch=?1 ORDER BY rowid")?;
-            s.query_map([&batch], |r| {
-                Ok(format!(
-                    "[{}] {}",
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?
-                ))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        tx.execute(
-            "INSERT OR IGNORE INTO inbox(id,channel,user,text,created) VALUES(?1,?2,?3,?4,?5)",
-            params![
-                format!("batch:{batch}"),
-                channel,
-                user,
-                reports.join("\n\n"),
-                now()
-            ],
-        )?;
+    if changed == 0 {
+        return Ok(());
     }
+    let (channel, user): (String, String) =
+        tx.query_row("SELECT channel,user FROM tasks WHERE id=?1", [id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+    let delivery = format!("report:{id}:initial");
+    crate::ui::copy_context(tx, id, &delivery)?;
+    crate::ui::worker_report(tx, id, &delivery, channel.parse()?)?;
+    deliver_event(
+        tx,
+        &delivery,
+        &format!("channel:{channel}"),
+        channel.parse()?,
+        user.parse()?,
+        &format!("[{id}] {report}"),
+    )?;
 
     Ok(())
 }
@@ -902,19 +933,26 @@ mod tests {
         assert!(s.next_outbound().unwrap().is_none());
     }
     #[test]
-    fn batch_report_is_atomic_and_once() {
+    fn each_worker_report_is_immediate_and_once() {
         let d = tempfile::tempdir().unwrap();
         let s = Store::open(&d.path().join("db")).unwrap();
         s.add_task("a", "b", 1, 2, "task").unwrap();
         s.add_task("c", "b", 1, 2, "task").unwrap();
         s.finish_task("a", "A").unwrap();
-        assert!(s.queued(1).unwrap().is_empty());
+        let first = s.queued(1).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].id, "report:a:initial");
+        assert_eq!(first[0].text, "[a] A");
         s.finish_task("c", "C").unwrap();
         s.finish_task("c", "C").unwrap();
         let q = s.queued(1).unwrap();
-        assert_eq!(q.len(), 1);
-        assert!(q[0].text.contains("[a] A"));
-        assert!(q[0].text.contains("[c] C"));
+        assert_eq!(q.len(), 2);
+        assert_eq!(q[0].text, "[a] A");
+        assert_eq!(q[1].text, "[c] C");
+        drop(s);
+        let s = Store::open(&d.path().join("db")).unwrap();
+        s.finish_task("a", "duplicate").unwrap();
+        assert_eq!(s.queued(1).unwrap().len(), 2);
     }
     #[test]
     fn recovery_never_reexecutes_interrupted_tool_turn() {

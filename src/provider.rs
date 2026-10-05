@@ -218,9 +218,22 @@ impl Provider {
         history: &[Value],
         tools: &[Value],
     ) -> Result<Response> {
+        self.step_observed(model, reasoning, system, history, tools, None)
+            .await
+    }
+    pub async fn step_observed(
+        &self,
+        model: &str,
+        reasoning: &str,
+        system: &str,
+        history: &[Value],
+        tools: &[Value],
+        submitted: Option<&(dyn Fn() -> Result<()> + Sync)>,
+    ) -> Result<Response> {
         let (vendor, _) = model_parts(model)?;
-        let body = Self::request_body(model, reasoning, system, history, tools)?;
-        let value = self.send_body(model, &body).await?;
+        let effective = self.codex.reasoning_for_model(model, reasoning)?;
+        let body = Self::request_body(model, &effective, system, history, tools)?;
+        let value = self.send_body_observed(model, &body, submitted).await?;
         let mut response = Self::parse(vendor, value)?;
         if model.starts_with("codex/") {
             for call in &mut response.calls {
@@ -232,6 +245,14 @@ impl Provider {
         Ok(response)
     }
     async fn send_body(&self, model: &str, body: &Value) -> Result<Value> {
+        self.send_body_observed(model, body, None).await
+    }
+    async fn send_body_observed(
+        &self,
+        model: &str,
+        body: &Value,
+        submitted: Option<&(dyn Fn() -> Result<()> + Sync)>,
+    ) -> Result<Value> {
         let (vendor, _) = model_parts(model)?;
         let is_codex = model.starts_with("codex/");
         if is_codex {
@@ -258,11 +279,11 @@ impl Provider {
                 if let Some(residency) = &credentials.residency {
                     request = request.header("x-openai-internal-codex-residency", residency);
                 }
-                let response = request
-                    .json(body)
-                    .send()
-                    .await
-                    .context("Codex transport failure")?;
+                let pending = request.json(body).send();
+                if let Some(submitted) = submitted {
+                    submitted()?;
+                }
+                let response = pending.await.context("Codex transport failure")?;
                 if response.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
                     credentials = self.codex.credentials(Some(&credentials.access)).await?;
                     continue;
@@ -309,11 +330,11 @@ impl Provider {
                 .header("x-api-key", key)
                 .header("anthropic-version", "2023-06-01")
         };
-        let response = req
-            .json(&body)
-            .send()
-            .await
-            .context("provider transport failure")?;
+        let pending = req.json(body).send();
+        if let Some(submitted) = submitted {
+            submitted()?;
+        }
+        let response = pending.await.context("provider transport failure")?;
         let status = response.status();
         // Do not expose provider error bodies: they can echo prompts or credentials.
         if !status.is_success() {
@@ -809,10 +830,31 @@ mod tests {
         let server = tokio::spawn(axum::serve(listener, Router::new().route("/", post(|headers: axum::http::HeaderMap, Json(body): Json<Value>| async move {
             assert_eq!(headers["originator"], "pantheon");
             assert_eq!(body["tools"][0]["name"], "pantheon_web_search");
+            assert_eq!(body["reasoning"]["effort"],"low");
             axum::response::Response::new(axum::body::Body::from("data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"name\":\"pantheon_web_search\",\"call_id\":\"c\",\"arguments\":\"{}\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n"))
         }))).into_future());
-        let response = Provider::mock(endpoint).with_auth(AuthConfig { codex_home: Some(directory.path().into()), codex_cli: None })
-            .step("codex/test", "medium", "fixed", &[], &[json!({"name":"web_search","description":"search","input_schema":{"type":"object"}})]).await.unwrap();
+        let dispatched = std::sync::atomic::AtomicUsize::new(0);
+        let submitted = || {
+            dispatched.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        };
+        let provider = Provider::mock(endpoint).with_auth(AuthConfig {
+            codex_home: Some(directory.path().into()),
+            codex_cli: None,
+        });
+        let tools =
+            [json!({"name":"web_search","description":"search","input_schema":{"type":"object"}})];
+        let pending = provider.step_observed(
+            "codex/test",
+            "minimal",
+            "fixed",
+            &[],
+            &tools,
+            Some(&submitted),
+        );
+        assert_eq!(dispatched.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let response = pending.await.unwrap();
+        assert_eq!(dispatched.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(response.calls[0].name, "web_search");
         assert_eq!(response.native[0]["name"], "pantheon_web_search");
         server.abort();

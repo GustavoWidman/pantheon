@@ -160,6 +160,8 @@ impl Harness {
         });
         let h = self.clone();
         let progress = tokio::spawn(async move { h.progress_worker().await });
+        let h = self.clone();
+        let reactions = tokio::spawn(async move { h.reaction_worker().await });
         let mut commands = tokio::task::JoinSet::new();
         let command_capacity = Arc::new(Semaphore::new(16));
         for id in self.store.queued_channels()? {
@@ -205,6 +207,7 @@ impl Harness {
             let _ = out.await;
             let _ = jobs.await;
             let _ = progress.await;
+            let _ = reactions.await;
         })
         .await;
         Ok(())
@@ -258,21 +261,21 @@ impl Harness {
                 })
                 .collect::<Vec<_>>();
             let owner = format!("channel:{channel}");
-            let settings = self.store.settings(
+            let mut settings = self.store.settings(
                 channel,
                 &self.config.agent.model,
                 &self.config.agent.reasoning,
             )?;
+            settings.1 = self
+                .config
+                .auth
+                .reasoning_for_model(&settings.0, &settings.1)
+                // Invalid saved settings become a visible turn error in Provider,
+                // rather than killing the channel actor before it admits inputs.
+                .unwrap_or(settings.1);
+            self.store.set_settings(channel, &settings.0, &settings.1)?;
             self.store
                 .present_agent(&owner, channel, &context, "Coordinator", &settings.0)?;
-            self.store.activity_event(
-                &context,
-                channel,
-                &format!("received:{}", queued[0].id),
-                "-> request received",
-                "event",
-                Duration::ZERO,
-            )?;
             self.store.agent_phase(&owner, true, "Preparing context")?;
             let cancel = self.shutdown.child_token();
             *c.cancel.lock().await = Some(cancel.clone());
@@ -401,8 +404,10 @@ impl Harness {
                 run.history.push(Provider::user(vendor, &text));
             }
             self.store.agent_phase(&run.owner, true, "Thinking")?;
+            let submitted_inputs = run.inputs.clone();
+            let submitted = || self.store.submitted_inputs(&submitted_inputs);
             let response = tokio::select! {
-                r=self.provider.step(&run.settings.0,&run.settings.1,system,&run.history,defs)=>r?,
+                r=self.provider.step_observed(&run.settings.0,&run.settings.1,system,&run.history,defs,Some(&submitted))=>r?,
                 _=run.cancel.cancelled()=>bail!("cancelled"),
             };
             if !run.child {
@@ -421,6 +426,7 @@ impl Harness {
                 }
                 if *thought {
                     if self.config.agent.show_reasoning && !run.child {
+                        self.store.break_activity(run.channel)?;
                         for chunk in split_message(text, None) {
                             let _ = self
                                 .discord
@@ -517,14 +523,17 @@ impl Harness {
                 let label = format!("{} / {}", self.store.agent_label(&run.owner)?, call.name);
                 self.store
                     .agent_phase(&run.owner, true, &format!("Running {}", call.name))?;
-                self.store.activity_event(
-                    &run.context,
-                    run.channel,
-                    &tool_id,
-                    &label,
-                    "running",
-                    Duration::ZERO,
-                )?;
+                let control = matches!(call.name.as_str(), "spawn" | "tell");
+                if !control {
+                    self.store.activity_event(
+                        &run.context,
+                        run.channel,
+                        &tool_id,
+                        &label,
+                        "running",
+                        Duration::ZERO,
+                    )?;
+                }
                 let result = if steered {
                     Ok("Skipped because new steering arrived; reconsider this call before executing.".to_string())
                 } else {
@@ -566,22 +575,24 @@ impl Harness {
                 let background = !error
                     && serde_json::from_str::<Value>(&output)
                         .is_ok_and(|v| v["state"] == "background");
-                self.store.activity_event(
-                    &run.context,
-                    run.channel,
-                    &tool_id,
-                    &label,
-                    if steered {
-                        "skipped"
-                    } else if error {
-                        "error"
-                    } else if background {
-                        "background"
-                    } else {
-                        "done"
-                    },
-                    start.elapsed(),
-                )?;
+                if !control || error || steered {
+                    self.store.activity_event(
+                        &run.context,
+                        run.channel,
+                        &tool_id,
+                        &label,
+                        if steered {
+                            "skipped"
+                        } else if error {
+                            "error"
+                        } else if background {
+                            "background"
+                        } else {
+                            "done"
+                        },
+                        start.elapsed(),
+                    )?;
+                }
             }
         }
         bail!("maximum tool steps reached")
@@ -639,16 +650,6 @@ impl Harness {
                         run.channel,
                         &format!("incoming:{}", input.id),
                         "-> shell completion for Coordinator",
-                        "event",
-                        Duration::ZERO,
-                    )?;
-                }
-                if prompt {
-                    self.store.activity_event(
-                        &run.context,
-                        run.channel,
-                        &format!("steering:{}", input.id),
-                        "-> steering message received",
                         "event",
                         Duration::ZERO,
                     )?;
@@ -795,7 +796,8 @@ impl Harness {
                     ensure!(!name.trim().is_empty() && name.encode_utf16().count()<=48 && name.chars().all(|c|c.is_alphanumeric() || matches!(c,' '|'-'|'_')),"agent names must be short words without formatting or control characters");
                     ensure!(names.insert(name.to_lowercase()),"agent names must be unique within a spawn batch");
                     let model=value["model"].as_str().unwrap_or(&run.settings.0).to_owned();
-                    let reasoning=value["reasoning"].as_str().unwrap_or(&run.settings.1).to_owned();
+                    let requested=value["reasoning"].as_str().unwrap_or(&run.settings.1);
+                    let reasoning=self.config.auth.reasoning_for_model(&model,requested)?;
                     model_parts(&model)?; crate::config::validate_reasoning(&reasoning)?;
                     Ok((task,name,(model,reasoning)))
                 }).collect::<Result<Vec<_>>>()?;
@@ -956,22 +958,6 @@ impl Harness {
             }
             if let Err(error) = h.store.finish_agent(&id, &report, &delivery_id) {
                 tracing::error!(error=%error,"persist agent report failed");
-                h.shutdown.cancel();
-            }
-            let _ = h.store.agent_phase(&id, false, "Idle");
-            if let Err(error) = h.store.activity_event(
-                &context,
-                channel,
-                &format!("report:{delivery_id}"),
-                &format!(
-                    "-> incoming agent message from {} [{}]",
-                    h.store.agent_label(&id).unwrap_or_else(|_| id.clone()),
-                    crate::ui::short_id(&id)
-                ),
-                "event",
-                Duration::ZERO,
-            ) {
-                tracing::error!(%error,"persist report presentation failed");
                 h.shutdown.cancel();
             }
             h.children.lock().await.remove(&id);
@@ -1160,6 +1146,7 @@ impl Harness {
                 if let Some(id) = args["id"].as_str() {
                     model_parts(id)?;
                     model = id.into();
+                    reasoning = self.config.auth.reasoning_for_model(&model, &reasoning)?;
                     self.store.set_settings(channel, &model, &reasoning)?;
                 }
                 return Ok(crate::ui::card(
@@ -1180,7 +1167,7 @@ impl Harness {
             "reasoning" => {
                 if let Some(level) = args["level"].as_str() {
                     crate::config::validate_reasoning(level)?;
-                    reasoning = level.into();
+                    reasoning = self.config.auth.reasoning_for_model(&model, level)?;
                     self.store.set_settings(channel, &model, &reasoning)?;
                 }
                 return Ok(crate::ui::card(
@@ -1465,26 +1452,8 @@ impl Harness {
     }
     fn notice(&self, id: &str, channel: u64, mention: Option<u64>, text: &str) -> Result<()> {
         let context = self.store.reply_context(&format!("channel:{channel}"))?;
-        for (i, chunk) in split_message(
-            text,
-            if context.reply_to.is_some() {
-                None
-            } else {
-                mention
-            },
-        )
-        .iter()
-        .enumerate()
-        {
-            self.store.enqueue_reply(
-                &format!("{id}:{i}"),
-                channel,
-                if i == 0 { mention } else { None },
-                chunk,
-                context.reply_to,
-            )?;
-        }
-        Ok(())
+        self.store
+            .enqueue_notice(&context, id, channel, mention, text)
     }
     async fn progress_worker(self: Arc<Self>) -> Result<()> {
         let mut typing = tokio::task::JoinSet::new();
@@ -1510,6 +1479,47 @@ impl Harness {
             }
         }
         typing.abort_all();
+        Ok(())
+    }
+    async fn reaction_worker(&self) -> Result<()> {
+        let mut workers = tokio::task::JoinSet::new();
+        let mut active = HashSet::new();
+        loop {
+            if self.shutdown.is_cancelled() {
+                break;
+            }
+            while workers.len() < 8 {
+                let Some((message, channel, phase, previous)) = self
+                    .store
+                    .next_reaction(&active.iter().cloned().collect::<Vec<_>>())?
+                else {
+                    break;
+                };
+                active.insert(message.clone());
+                let discord = self.discord.clone();
+                workers.spawn(async move {
+                    let result = match message.parse::<u64>() {
+                        Ok(id) => {
+                            discord
+                                .delivery_reaction(channel, id, phase, previous)
+                                .await
+                        }
+                        Err(_) => Err(anyhow::anyhow!("invalid reaction message")),
+                    };
+                    (message, phase, result)
+                });
+            }
+            tokio::select! {
+                Some(done)=workers.join_next(),if !workers.is_empty()=>{
+                    let (message,phase,result)=done.context("reaction worker failed")?;
+                    active.remove(&message);
+                    match result {Ok(())=>self.store.reaction_delivered(&message,phase)?,Err(_)=>self.store.retry_reaction(&message)?,}
+                },
+                _=self.shutdown.cancelled()=>break,
+                _=tokio::time::sleep(Duration::from_millis(100))=>{},
+            }
+        }
+        workers.abort_all();
         Ok(())
     }
     async fn outbox_worker(&self) -> Result<()> {
@@ -2118,19 +2128,21 @@ mod tests {
         mock.started.notified().await;
         h.store
             .admit(&Input {
-                id: "second".into(),
+                id: "200".into(),
                 channel: 1,
                 user: 2,
                 text: "change the plan".into(),
             })
             .unwrap();
+        assert_eq!(h.store.next_reaction(&[]).unwrap().unwrap().2, 0);
         mock.release.notify_one();
         task.await.unwrap().unwrap();
+        assert_eq!(h.store.next_reaction(&[]).unwrap().unwrap().2, 1);
         let activity = drain(&h);
         assert!(
             activity
                 .iter()
-                .any(|item| item.text.contains("-> steering message received"))
+                .all(|item| !item.text.contains("steering message received"))
         );
         let out = activity
             .into_iter()
@@ -2201,7 +2213,7 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
-    async fn spawn_returns_before_children_finish_and_delivers_one_batch_report() {
+    async fn spawn_returns_before_children_finish_and_delivers_individual_reports() {
         let (_d, h, mut run, mock, server) = fixture(
             "openai",
             vec![
@@ -2224,8 +2236,8 @@ mod tests {
         assert_eq!(value["mode"], "background");
         assert_eq!(value["ids"].as_array().unwrap().len(), 2);
         mock.started.notified().await;
-        assert!(h.store.queued(1).unwrap().is_empty());
-        mock.release.notify_one();
+        // One child remains blocked while the other finishes. Its report must
+        // arrive immediately instead of waiting for the rest of the batch.
         tokio::time::timeout(Duration::from_secs(2), async {
             while h.store.queued(1).unwrap().is_empty() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2233,10 +2245,28 @@ mod tests {
         })
         .await
         .unwrap();
+        assert_eq!(h.store.queued(1).unwrap().len(), 1);
+        mock.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while h.store.queued(1).unwrap().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         let reports = h.store.queued(1).unwrap();
-        assert_eq!(reports.len(), 1);
-        assert!(reports[0].text.contains("first child report"));
-        assert!(reports[0].text.contains("second child report"));
+        assert_eq!(reports.len(), 2);
+        assert!(
+            reports
+                .iter()
+                .any(|r| r.text.contains("first child report"))
+        );
+        assert!(
+            reports
+                .iter()
+                .any(|r| r.text.contains("second child report"))
+        );
+        assert_ne!(reports[0].id, reports[1].id);
         assert!(
             !run.memory
                 .memory

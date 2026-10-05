@@ -34,6 +34,30 @@ pub(crate) fn initialize(db: &Connection) -> Result<()> {
     if !exists {
         db.execute("ALTER TABLE outbox ADD COLUMN reply_to TEXT", [])?;
     }
+    for (table, column, definition) in [
+        ("ui_sessions", "closed", "INTEGER NOT NULL DEFAULT 1"),
+        ("ui_events", "segment", "TEXT"),
+    ] {
+        let exists = db
+            .prepare(&format!("PRAGMA table_info({table})"))?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .iter()
+            .any(|name| name == column);
+        if !exists {
+            db.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
+    db.execute_batch("CREATE TABLE IF NOT EXISTS ui_segments(id TEXT PRIMARY KEY,channel TEXT NOT NULL,activity TEXT NOT NULL,open INTEGER NOT NULL DEFAULT 1);
+        CREATE INDEX IF NOT EXISTS ui_segments_open ON ui_segments(channel,open);
+        CREATE TABLE IF NOT EXISTS ui_reactions(message TEXT PRIMARY KEY,channel TEXT NOT NULL,activity TEXT NOT NULL,desired INTEGER NOT NULL DEFAULT 0,delivered INTEGER NOT NULL DEFAULT -1,next_try INTEGER NOT NULL DEFAULT 0);
+        CREATE INDEX IF NOT EXISTS ui_events_segment ON ui_events(segment,seq);
+        CREATE INDEX IF NOT EXISTS ui_contexts_activity ON ui_contexts(activity,source);
+        CREATE INDEX IF NOT EXISTS ui_sessions_channel_open ON ui_sessions(channel,closed);
+        CREATE INDEX IF NOT EXISTS ui_reactions_pending ON ui_reactions(next_try) WHERE desired!=delivered;")?;
     Ok(())
 }
 pub(crate) fn copy_context(db: &Connection, from: &str, to: &str) -> Result<()> {
@@ -60,7 +84,14 @@ impl Store {
             .unwrap_or_else(|| ReplyContext::request(source)))
     }
     pub fn bind_context(&self, source: &str, context: &ReplyContext) -> Result<()> {
-        self.db.lock().unwrap().execute("INSERT INTO ui_contexts(source,reply_to,activity) VALUES(?1,?2,?3) ON CONFLICT(source) DO UPDATE SET reply_to=excluded.reply_to,activity=excluded.activity",params![source,context.reply_to.map(|id|id.to_string()),context.activity])?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        tx.execute("INSERT INTO ui_contexts(source,reply_to,activity) VALUES(?1,?2,?3) ON CONFLICT(source) DO UPDATE SET reply_to=excluded.reply_to,activity=excluded.activity",params![source,context.reply_to.map(|id|id.to_string()),context.activity])?;
+        tx.execute(
+            "UPDATE ui_reactions SET activity=?2 WHERE message=?1",
+            params![source, context.activity],
+        )?;
+        tx.commit()?;
         Ok(())
     }
     pub fn is_prompt(&self, source: &str) -> Result<bool> {
@@ -103,7 +134,13 @@ impl Store {
     ) -> Result<()> {
         self.bind_context(owner, context)?;
         let db = self.db.lock().unwrap();
-        db.execute("INSERT INTO ui_sessions(activity,channel,reply_to) VALUES(?1,?2,?3) ON CONFLICT(activity) DO NOTHING",params![context.activity,channel.to_string(),context.reply_to.map(|id|id.to_string())])?;
+        if owner.starts_with("channel:") {
+            db.execute(
+                "UPDATE ui_sessions SET closed=0 WHERE activity=?1",
+                [&context.activity],
+            )?;
+        }
+        db.execute("INSERT INTO ui_sessions(activity,channel,reply_to,closed) VALUES(?1,?2,?3,0) ON CONFLICT(activity) DO NOTHING",params![context.activity,channel.to_string(),context.reply_to.map(|id|id.to_string())])?;
         db.execute("INSERT INTO ui_agents(owner,activity,channel,name,model) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(owner) DO UPDATE SET activity=excluded.activity,channel=excluded.channel,name=excluded.name,model=excluded.model",params![owner,context.activity,channel.to_string(),clean(name,48),model])?;
         Ok(())
     }
@@ -134,22 +171,16 @@ impl Store {
         status: &str,
         elapsed: Duration,
     ) -> Result<()> {
-        let db = self.db.lock().unwrap();
-        db.execute(
-            "INSERT OR IGNORE INTO ui_sessions(activity,channel,reply_to) VALUES(?1,?2,?3)",
-            params![
-                context.activity,
-                channel.to_string(),
-                context.reply_to.map(|id| id.to_string())
-            ],
-        )?;
-        db.execute("INSERT INTO ui_events(activity,event,label,status,started,elapsed) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(activity,event) DO UPDATE SET label=excluded.label,status=excluded.status,elapsed=excluded.elapsed",params![context.activity,id,clean(label,110),status,chrono::Utc::now().timestamp_millis(),elapsed.as_millis().min(i64::MAX as u128) as i64])?;
-        render_activity(&db, &context.activity)?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        activity_event_transaction(&tx, context, channel, id, label, status, elapsed)?;
+        tx.commit()?;
         Ok(())
     }
+
     pub fn refresh_activities(&self, channel: u64, settled: bool) -> Result<bool> {
         let db = self.db.lock().unwrap();
-        let mut stmt=db.prepare("SELECT s.activity FROM ui_sessions s WHERE channel=?1 AND (s.settled=0 OR s.activity=(SELECT activity FROM ui_contexts WHERE source=?2) OR EXISTS(SELECT 1 FROM ui_agents a WHERE a.activity=s.activity AND active=1) OR EXISTS(SELECT 1 FROM shell_runs r JOIN ui_contexts c ON c.source=r.id WHERE c.activity=s.activity AND r.state='running') OR EXISTS(SELECT 1 FROM agent_inbox i JOIN ui_contexts c ON c.source=i.id WHERE c.activity=s.activity AND i.state='queued'))")?;
+        let mut stmt=db.prepare("SELECT s.activity FROM ui_sessions s WHERE channel=?1 AND (s.settled=0 OR EXISTS(SELECT 1 FROM ui_reactions r WHERE r.activity=s.activity AND r.desired<2) OR s.activity=(SELECT activity FROM ui_contexts WHERE source=?2) OR EXISTS(SELECT 1 FROM ui_agents a WHERE a.activity=s.activity AND active=1) OR EXISTS(SELECT 1 FROM shell_runs r JOIN ui_contexts c ON c.source=r.id WHERE c.activity=s.activity AND r.state='running') OR EXISTS(SELECT 1 FROM agent_inbox i JOIN ui_contexts c ON c.source=i.id WHERE c.activity=s.activity AND i.state='queued'))")?;
         let activities = stmt
             .query_map(
                 params![channel.to_string(), format!("channel:{channel}")],
@@ -162,9 +193,24 @@ impl Store {
                 "UPDATE ui_sessions SET settled=?2 WHERE activity=?1",
                 params![activity, settled],
             )?;
-            busy |= render_activity(&db, &activity)?;
+            let working = render_activity(&db, &activity)?;
+            busy |= working;
+            let closed: bool = db.query_row(
+                "SELECT closed FROM ui_sessions WHERE activity=?1",
+                [&activity],
+                |r| r.get(0),
+            )?;
+            if closed && !working {
+                db.execute(
+                    "UPDATE ui_reactions SET desired=2,next_try=0 WHERE activity=?1 AND desired<2",
+                    [&activity],
+                )?;
+            }
         }
         Ok(busy)
+    }
+    pub fn break_activity(&self, channel: u64) -> Result<()> {
+        close_segments(&self.db.lock().unwrap(), channel)
     }
     pub fn enqueue_reply(
         &self,
@@ -174,44 +220,205 @@ impl Store {
         text: &str,
         reply_to: Option<u64>,
     ) -> Result<()> {
-        self.db.lock().unwrap().execute("INSERT INTO outbox(id,channel,user,text,nonce,reply_to) VALUES(?1,?2,?3,?4,?1,?5) ON CONFLICT(id) DO UPDATE SET text=excluded.text,state='queued' WHERE outbox.text!=excluded.text",params![id,channel.to_string(),user.map(|u|u.to_string()),text,reply_to.map(|id|id.to_string())])?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        close_segments(&tx, channel)?;
+        tx.execute("INSERT INTO outbox(id,channel,user,text,nonce,reply_to) VALUES(?1,?2,?3,?4,?1,?5) ON CONFLICT(id) DO UPDATE SET text=excluded.text,state='queued' WHERE outbox.text!=excluded.text",params![id,channel.to_string(),user.map(|u|u.to_string()),text,reply_to.map(|id|id.to_string())])?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn submitted_inputs(&self, inputs: &[String]) -> Result<()> {
+        self.db.lock().unwrap().execute("UPDATE ui_reactions SET desired=1,next_try=0 WHERE message IN (SELECT value FROM json_each(?1)) AND desired=0",[serde_json::to_string(inputs)?])?;
+        Ok(())
+    }
+    pub fn next_reaction(&self, active: &[String]) -> Result<Option<(String, u64, i64, i64)>> {
+        Ok(self.db.lock().unwrap().query_row("SELECT message,channel,desired,delivered FROM ui_reactions WHERE desired!=delivered AND next_try<=?1 AND message NOT IN (SELECT value FROM json_each(?2)) ORDER BY rowid LIMIT 1",params![crate::store::now(),serde_json::to_string(active)?],|r|Ok((r.get(0)?,r.get::<_,String>(1)?.parse().unwrap_or(0),r.get(2)?,r.get(3)?))).optional()?)
+    }
+    pub fn reaction_delivered(&self, message: &str, phase: i64) -> Result<()> {
+        self.db.lock().unwrap().execute(
+            "UPDATE ui_reactions SET delivered=?2,next_try=0 WHERE message=?1",
+            params![message, phase],
+        )?;
+        Ok(())
+    }
+    pub fn retry_reaction(&self, message: &str) -> Result<()> {
+        self.db.lock().unwrap().execute(
+            "UPDATE ui_reactions SET next_try=?2 WHERE message=?1",
+            params![message, crate::store::now() + 5],
+        )?;
+        Ok(())
+    }
+    pub fn enqueue_notice(
+        &self,
+        context: &ReplyContext,
+        id: &str,
+        channel: u64,
+        requester: Option<u64>,
+        text: &str,
+    ) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let queued: i64 = tx.query_row(
+            "SELECT count(*) FROM inbox WHERE channel=?1 AND state='queued'",
+            [channel.to_string()],
+            |r| r.get(0),
+        )?;
+        let terminal =
+            requester.is_some() && queued == 0 && background_count(&tx, &context.activity)? == 0;
+        let recipient = if terminal {
+            let original: Option<String> = match context.reply_to {
+                Some(id) => tx
+                    .query_row(
+                        "SELECT user FROM inbox WHERE id=?1",
+                        [id.to_string()],
+                        |r| r.get(0),
+                    )
+                    .optional()?,
+                None => None,
+            };
+            tx.execute(
+                "UPDATE ui_sessions SET closed=1 WHERE activity=?1",
+                [&context.activity],
+            )?;
+            original.and_then(|s| s.parse().ok()).or(requester)
+        } else {
+            None
+        };
+        close_segments(&tx, channel)?;
+        for (i, chunk) in crate::discord::split_message(
+            text,
+            if context.reply_to.is_none() {
+                recipient
+            } else {
+                None
+            },
+        )
+        .iter()
+        .enumerate()
+        {
+            let key = format!("{id}:{i}");
+            tx.execute("INSERT INTO outbox(id,channel,user,text,nonce,reply_to) VALUES(?1,?2,?3,?4,?1,?5) ON CONFLICT(id) DO UPDATE SET text=excluded.text,state='queued' WHERE outbox.text!=excluded.text",params![key,channel.to_string(),if i==0{recipient.map(|id|id.to_string())}else{None},chunk,if i==0 && terminal {context.reply_to.map(|id|id.to_string())}else{None}])?;
+        }
+        tx.commit()?;
         Ok(())
     }
 }
-fn render_activity(db: &Connection, activity: &str) -> Result<bool> {
-    let (channel, reply_to, settled): (String, Option<String>, bool) = db.query_row(
-        "SELECT channel,reply_to,settled FROM ui_sessions WHERE activity=?1",
-        [activity],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+pub(crate) fn activity_event_transaction(
+    db: &Connection,
+    context: &ReplyContext,
+    channel: u64,
+    id: &str,
+    label: &str,
+    status: &str,
+    elapsed: Duration,
+) -> Result<()> {
+    db.execute(
+        "INSERT OR IGNORE INTO ui_sessions(activity,channel,reply_to,closed) VALUES(?1,?2,?3,0)",
+        params![
+            context.activity,
+            channel.to_string(),
+            context.reply_to.map(|id| id.to_string())
+        ],
     )?;
-    let mut agents = db.prepare(
-        "SELECT name,phase FROM ui_agents WHERE activity=?1 AND active=1 ORDER BY rowid",
-    )?;
-    let active = agents
-        .query_map([activity], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let shells:i64=db.query_row("SELECT count(*) FROM shell_runs r JOIN ui_contexts c ON c.source=r.id WHERE c.activity=?1 AND r.state='running'",[activity],|r|r.get(0))?;
-    let pending:i64=db.query_row("SELECT (SELECT count(*) FROM inbox i JOIN ui_contexts c ON c.source=i.id WHERE c.activity=?1 AND i.state='queued')+(SELECT count(*) FROM agent_inbox i JOIN ui_contexts c ON c.source=i.id WHERE c.activity=?1 AND i.state='queued')",[activity],|r|r.get(0))?;
-    let busy = !active.is_empty() || shells > 0 || pending > 0 || !settled;
-    let status = if !active.is_empty() {
-        "Working"
-    } else if shells > 0 {
-        "Background work running"
-    } else if pending > 0 {
-        "Processing incoming reports"
-    } else if !settled {
-        "Updating context"
+    let existing: Option<String> = db
+        .query_row(
+            "SELECT segment FROM ui_events WHERE activity=?1 AND event=?2",
+            params![context.activity, id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let segment = if let Some(segment) = existing {
+        segment
     } else {
-        "Settled"
+        let open:Option<String>=db.query_row("SELECT id FROM ui_segments WHERE channel=?1 AND activity=?2 AND open=1 AND (SELECT count(*) FROM ui_events e WHERE e.segment=ui_segments.id)<12 ORDER BY rowid DESC LIMIT 1",params![channel.to_string(),context.activity],|r|r.get(0)).optional()?;
+        match open {
+            Some(segment) => segment,
+            None => {
+                close_segments(db, channel)?;
+                let segment = uuid::Uuid::new_v4().to_string();
+                db.execute(
+                    "INSERT INTO ui_segments(id,channel,activity) VALUES(?1,?2,?3)",
+                    params![segment, channel.to_string(), context.activity],
+                )?;
+                segment
+            }
+        }
     };
+    db.execute("INSERT INTO ui_events(activity,event,label,status,started,elapsed,segment) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(activity,event) DO UPDATE SET label=excluded.label,status=excluded.status,elapsed=excluded.elapsed,segment=excluded.segment",params![context.activity,id,clean(label,110),status,chrono::Utc::now().timestamp_millis(),elapsed.as_millis().min(i64::MAX as u128) as i64,segment])?;
+    render_segment(db, &segment)?;
+    Ok(())
+}
+
+pub(crate) fn worker_report(
+    db: &Connection,
+    owner: &str,
+    delivery: &str,
+    channel: u64,
+) -> Result<()> {
+    db.execute(
+        "UPDATE ui_agents SET active=0,phase='Idle' WHERE owner=?1",
+        [owner],
+    )?;
+    let presentation: Option<(ReplyContext,String)> = db.query_row("SELECT c.reply_to,c.activity,a.name FROM ui_contexts c JOIN ui_agents a ON a.owner=c.source WHERE c.source=?1",[owner],|r|Ok((ReplyContext{reply_to:r.get::<_,Option<String>>(0)?.and_then(|s|s.parse().ok()),activity:r.get(1)?},r.get(2)?))).optional()?;
+    if let Some((context, name)) = presentation {
+        activity_event_transaction(
+            db,
+            &context,
+            channel,
+            &format!("report:{delivery}"),
+            &format!("↙ incoming agent message from {name} [{}]", short_id(owner)),
+            "event",
+            Duration::ZERO,
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn close_segments(db: &Connection, channel: u64) -> Result<()> {
+    db.execute(
+        "UPDATE ui_segments SET open=0 WHERE channel=?1 AND open=1",
+        [channel.to_string()],
+    )?;
+    Ok(())
+}
+pub(crate) fn background_count(db: &Connection, activity: &str) -> Result<i64> {
+    Ok(db.query_row("SELECT (SELECT count(*) FROM tasks t JOIN ui_contexts c ON c.source=t.id WHERE c.activity=?1 AND t.state='running')+(SELECT count(*) FROM ui_agents a WHERE a.activity=?1 AND active=1 AND owner NOT LIKE 'channel:%')+(SELECT count(*) FROM shell_runs r JOIN ui_contexts c ON c.source=r.id WHERE c.activity=?1 AND r.state='running')+(SELECT count(*) FROM agent_runs r JOIN ui_contexts c ON c.source=r.owner WHERE c.activity=?1 AND r.state='running')+(SELECT count(*) FROM agent_inbox i JOIN ui_contexts c ON c.source=i.id WHERE c.activity=?1 AND i.state='queued')",[activity],|r|r.get(0))?)
+}
+fn render_activity(db: &Connection, activity: &str) -> Result<bool> {
+    let settled: bool = db.query_row(
+        "SELECT settled FROM ui_sessions WHERE activity=?1",
+        [activity],
+        |r| r.get(0),
+    )?;
+    let active: i64 = db.query_row(
+        "SELECT count(*) FROM ui_agents WHERE activity=?1 AND active=1",
+        [activity],
+        |r| r.get(0),
+    )?;
+    let pending:i64=db.query_row("SELECT count(*) FROM inbox i JOIN ui_contexts c ON c.source=i.id WHERE c.activity=?1 AND i.state='queued'",[activity],|r|r.get(0))?;
+    let busy = !settled || active > 0 || pending > 0 || background_count(db, activity)? > 0;
+    let mut stmt=db.prepare("SELECT id FROM ui_segments s WHERE activity=?1 AND (open=1 OR EXISTS(SELECT 1 FROM ui_events e WHERE e.segment=s.id AND e.status='running'))")?;
+    let segments = stmt
+        .query_map([activity], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for segment in segments {
+        render_segment(db, &segment)?;
+    }
+    Ok(busy)
+}
+fn render_segment(db: &Connection, segment: &str) -> Result<()> {
+    let channel: String = db.query_row(
+        "SELECT channel FROM ui_segments WHERE id=?1",
+        [segment],
+        |r| r.get(0),
+    )?;
     let mut events = db.prepare(
-        "SELECT label,status,started,elapsed FROM ui_events WHERE activity=?1 ORDER BY seq",
+        "SELECT label,status,started,elapsed FROM ui_events WHERE segment=?1 ORDER BY seq",
     )?;
     let now = chrono::Utc::now().timestamp_millis();
     let lines = events
-        .query_map([activity], |r| {
+        .query_map([segment], |r| {
             let label: String = r.get(0)?;
             let state: String = r.get(1)?;
             let elapsed = if state == "running" {
@@ -236,51 +443,15 @@ fn render_activity(db: &Connection, activity: &str) -> Result<bool> {
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let phases = active
-        .iter()
-        .map(|(name, phase)| format!("{name}: {phase}"))
-        .collect::<Vec<_>>()
-        .join(" · ");
-    let footer = clean(
-        &if phases.is_empty() {
-            if shells > 0 {
-                format!("{shells} background shell jobs running")
-            } else if pending > 0 {
-                "Processing incoming reports".into()
-            } else if !settled {
-                "Preparing context for the next turn".into()
-            } else {
-                "All work settled".into()
-            }
-        } else {
-            phases
-        },
-        240,
-    );
-    let lines = if lines.is_empty() {
-        vec!["◌ Preparing your request".into()]
-    } else {
-        lines
-    };
-    // Fixed row groups keep page boundaries stable when durations/statuses change.
-    let pages = lines.chunks(12).collect::<Vec<_>>();
-    for (index, page) in pages.iter().enumerate() {
-        let current = index + 1 == pages.len();
-        let heading = if current { status } else { "Activity" };
-        let footer = if current {
-            footer.as_str()
-        } else {
-            "Activity continues below"
-        };
-        let text = format!(
-            "**Pantheon · {heading}**\n```text\n{}\n```\n{footer}",
-            page.join("\n")
-        );
-        let id = format!("{activity}:activity:{index}");
-        db.execute("INSERT INTO outbox(id,channel,text,nonce,reply_to) VALUES(?1,?2,?3,?1,?4) ON CONFLICT(id) DO UPDATE SET text=excluded.text,state='queued' WHERE outbox.text!=excluded.text",params![id,channel,text,reply_to])?;
+    if lines.is_empty() {
+        return Ok(());
     }
-    Ok(busy)
+    let text = format!("```text\n{}\n```", lines.join("\n"));
+    let id = format!("segment:{segment}:activity:0");
+    db.execute("INSERT INTO outbox(id,channel,text,nonce) VALUES(?1,?2,?3,?1) ON CONFLICT(id) DO UPDATE SET text=excluded.text,state='queued' WHERE outbox.text!=excluded.text",params![id,channel,text])?;
+    Ok(())
 }
+
 pub fn short_id(id: &str) -> &str {
     &id[..id.char_indices().nth(8).map(|(i, _)| i).unwrap_or(id.len())]
 }
@@ -577,7 +748,7 @@ mod tests {
         assert!(field(&card, "Request breakdown").contains("Remaining  **0**"));
     }
     #[test]
-    fn activity_accumulates_updates_and_preserves_reply_and_receipt_after_restart() {
+    fn activity_accumulates_updates_without_replies_and_preserves_receipt_after_restart() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("runtime.sqlite");
         let context = ReplyContext::request("123456789012345678");
@@ -597,7 +768,7 @@ mod tests {
             )
             .unwrap();
         let first = store.next_outbound().unwrap().unwrap();
-        assert_eq!(first.reply_to, context.reply_to);
+        assert_eq!(first.reply_to, None);
         assert_eq!(first.user, None);
         assert!(first.text.contains("```text\n"));
         store.delivered(&first, "discord-receipt").unwrap();
@@ -616,7 +787,7 @@ mod tests {
                 &context,
                 1,
                 "report",
-                "-> incoming agent message from Docs Scout [scout]",
+                "↙ incoming agent message from Docs Scout [scout]",
                 "event",
                 Duration::ZERO,
             )
@@ -630,7 +801,7 @@ mod tests {
         assert!(
             revised
                 .text
-                .contains("-> incoming agent message from Docs Scout")
+                .contains("↙ incoming agent message from Docs Scout")
         );
         assert!(!revised.text.contains("◌ Docs Scout / web_search"));
     }
@@ -700,7 +871,10 @@ mod tests {
         store.bind_context("channel:1", &newer).unwrap();
         store.finish_task("scout", "source found").unwrap();
         assert_eq!(
-            store.reply_context("batch:batch").unwrap().reply_to,
+            store
+                .reply_context("report:scout:initial")
+                .unwrap()
+                .reply_to,
             Some(100)
         );
         let job = Job {
@@ -728,7 +902,7 @@ mod tests {
         assert!(
             !store
                 .complete_turn(
-                    &["batch:batch".into()],
+                    &["report:scout:initial".into()],
                     "old-final",
                     1,
                     2,
@@ -759,9 +933,7 @@ mod tests {
         store.bind_context("completion", &context).unwrap();
         store.db.lock().unwrap().execute("INSERT INTO agent_inbox(id,owner,channel,user,text,created) VALUES('completion','worker','1','2','shell complete',0)",[]).unwrap();
         assert!(store.refresh_activities(1, true).unwrap());
-        let activity = store.next_outbound().unwrap().unwrap();
-        assert!(activity.text.contains("Processing incoming reports"));
-        store.sent(&activity.id, "receipt").unwrap();
+        assert!(store.next_outbound().unwrap().is_none());
         assert!(
             store
                 .complete_turn(
@@ -774,7 +946,7 @@ mod tests {
                 .unwrap()
         );
         let ack = store.next_outbound().unwrap().unwrap();
-        assert_eq!(ack.reply_to, Some(99));
+        assert_eq!(ack.reply_to, None);
         assert_eq!(ack.user, None);
     }
 
@@ -804,7 +976,7 @@ mod tests {
             )
             .unwrap();
         let activity = store.next_outbound().unwrap().unwrap();
-        store.retry_outbound(&activity.id).unwrap();
+        store.delivered(&activity, "activity-receipt").unwrap();
         store
             .activity_event(
                 &context,
@@ -815,6 +987,7 @@ mod tests {
                 Duration::from_secs(1),
             )
             .unwrap();
+        store.retry_outbound(&activity.id).unwrap();
         assert!(
             store
                 .complete_turn(&["99".into()], "final", 1, 2, &["Finished".into()])
@@ -828,5 +1001,324 @@ mod tests {
         assert_eq!(final_reply.reply_to, Some(99));
         store.sent(&final_reply.id, "reply").unwrap();
         assert!(store.next_outbound().unwrap().is_none());
+    }
+    #[test]
+    fn conversation_timeline_breaks_fences_and_only_the_final_message_replies() {
+        use crate::store::Input;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut store = Store::open(&path).unwrap();
+        let context = ReplyContext::request("100");
+        store
+            .admit(&Input {
+                id: "100".into(),
+                channel: 1,
+                user: 2,
+                text: "call three greeters".into(),
+            })
+            .unwrap();
+        store.input_state("100", "running").unwrap();
+        let mut messages = Vec::new();
+        let take = |store: &Store, messages: &mut Vec<crate::store::Outbound>| {
+            while let Some(out) = store.next_outbound_with_ui_budget(&[], &[1]).unwrap() {
+                store
+                    .delivered(&out, &format!("receipt-{}", messages.len()))
+                    .unwrap();
+                messages.push(out);
+            }
+        };
+        store
+            .enqueue_reply("intent", 1, None, "I'll call three greeters.", None)
+            .unwrap();
+        take(&store, &mut messages);
+        for id in ["greeter1", "greeter2", "greeter3"] {
+            store.add_task(id, "batch", 1, 2, "say hi").unwrap();
+            store
+                .present_agent(id, 1, &context, id, "codex/test")
+                .unwrap();
+            store
+                .activity_event(
+                    &context,
+                    1,
+                    &format!("spawn:{id}"),
+                    &format!("↗ spawned {id} [{id}] · codex/test · low"),
+                    "event",
+                    Duration::ZERO,
+                )
+                .unwrap();
+        }
+        take(&store, &mut messages);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].text.matches("↗ spawned").count(), 3);
+        assert!(
+            store
+                .complete_turn(
+                    &["100".into()],
+                    "ack",
+                    1,
+                    2,
+                    &["The three greeters are working.".into()]
+                )
+                .unwrap()
+        );
+        take(&store, &mut messages);
+        drop(store);
+        store = Store::open(&path).unwrap();
+        for (index, id) in ["greeter1", "greeter3", "greeter2"].into_iter().enumerate() {
+            store.finish_task(id, "hi").unwrap();
+            // The report row and named incoming fence commit together.
+            let report = store.queued(1).unwrap();
+            assert_eq!(report.len(), 1);
+            take(&store, &mut messages);
+            assert!(
+                messages
+                    .last()
+                    .unwrap()
+                    .text
+                    .contains(&format!("↙ incoming agent message from {id}"))
+            );
+            store.input_state(&report[0].id, "running").unwrap();
+            let text = if index == 2 {
+                "All greeters said hi.".into()
+            } else {
+                format!("{id} said hi.")
+            };
+            assert!(
+                store
+                    .complete_turn(
+                        &[report[0].id.clone()],
+                        &format!("reply-{id}"),
+                        1,
+                        3, // The terminal recipient is still the original author.
+                        &[text]
+                    )
+                    .unwrap()
+            );
+            take(&store, &mut messages);
+        }
+        assert_eq!(messages.len(), 9);
+        for message in &messages[..8] {
+            assert_eq!(message.reply_to, None);
+            assert_eq!(message.user, None);
+        }
+        assert_eq!(messages[8].reply_to, Some(100));
+        assert_eq!(messages[8].user, Some(2));
+        let fences = messages
+            .iter()
+            .filter(|m| m.id.contains(":activity:"))
+            .collect::<Vec<_>>();
+        assert_eq!(fences.len(), 4);
+        for fence in fences {
+            assert!(fence.text.starts_with("```text\n"));
+            assert!(fence.text.ends_with("\n```"));
+        }
+    }
+
+    #[test]
+    fn idle_parent_steers_keep_loop_anchor_and_reactions_follow_actual_submission() {
+        use crate::store::Input;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let store = Store::open(&path).unwrap();
+        store
+            .admit(&Input {
+                id: "100".into(),
+                channel: 1,
+                user: 2,
+                text: "work".into(),
+            })
+            .unwrap();
+        store.input_state("100", "running").unwrap();
+        let context = store.reply_context("100").unwrap();
+        store.add_task("worker", "batch", 1, 2, "work").unwrap();
+        store.bind_context("worker", &context).unwrap();
+        assert_eq!(store.next_reaction(&[]).unwrap().unwrap().2, 0);
+        store.reaction_delivered("100", 0).unwrap();
+        store.submitted_inputs(&["100".into()]).unwrap();
+        assert_eq!(store.next_reaction(&[]).unwrap().unwrap().2, 1);
+        store.reaction_delivered("100", 1).unwrap();
+        store
+            .complete_turn(&["100".into()], "ack", 1, 2, &["worker is working".into()])
+            .unwrap();
+        store
+            .admit(&Input {
+                id: "200".into(),
+                channel: 1,
+                user: 3,
+                text: "steer".into(),
+            })
+            .unwrap();
+        assert_eq!(store.reply_context("200").unwrap().reply_to, Some(100));
+        assert_eq!(store.next_reaction(&[]).unwrap().unwrap().2, 0);
+        store.reaction_delivered("200", 0).unwrap();
+        // Repeating a callback for the older request must not digest the steer.
+        store.submitted_inputs(&["100".into()]).unwrap();
+        assert!(store.next_reaction(&[]).unwrap().is_none());
+        store.input_state("200", "running").unwrap();
+        store
+            .submitted_inputs(&["100".into(), "200".into()])
+            .unwrap();
+        assert_eq!(store.next_reaction(&[]).unwrap().unwrap().2, 1);
+        store
+            .complete_turn(
+                &["200".into()],
+                "steer-ack",
+                1,
+                3,
+                &["steering the worker".into()],
+            )
+            .unwrap();
+        assert!(store.refresh_activities(1, true).unwrap());
+        store.finish_task("worker", "done").unwrap();
+        let report = store.queued(1).unwrap();
+        store.input_state(&report[0].id, "running").unwrap();
+        store
+            .complete_turn(&[report[0].id.clone()], "final", 1, 2, &["done".into()])
+            .unwrap();
+        assert!(store.refresh_activities(1, false).unwrap());
+        assert_eq!(store.next_reaction(&[]).unwrap().unwrap().2, 1);
+        assert!(!store.refresh_activities(1, true).unwrap());
+        // A delayed acknowledgement of brain cannot overwrite a newer settled desire.
+        store.reaction_delivered("200", 1).unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        for id in ["100", "200"] {
+            let reaction = store.next_reaction(&[]).unwrap().unwrap();
+            assert_eq!(reaction.0, id);
+            assert_eq!(reaction.2, 2);
+            store.reaction_delivered(id, 2).unwrap();
+        }
+        store
+            .admit(&Input {
+                id: "300".into(),
+                channel: 1,
+                user: 2,
+                text: "new task".into(),
+            })
+            .unwrap();
+        assert_eq!(store.reply_context("300").unwrap().reply_to, Some(300));
+    }
+
+    #[test]
+    fn unsent_activity_keeps_timeline_order_even_when_edits_are_throttled() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db")).unwrap();
+        let context = ReplyContext::request("100");
+        store
+            .activity_event(
+                &context,
+                1,
+                "spawn",
+                "↗ spawned greeter",
+                "event",
+                Duration::ZERO,
+            )
+            .unwrap();
+        store
+            .enqueue_reply("prose", 1, None, "Greeter is working", None)
+            .unwrap();
+        let first = store
+            .next_outbound_with_ui_budget(&[], &[1])
+            .unwrap()
+            .unwrap();
+        assert!(first.id.contains(":activity:"));
+        store.retry_outbound(&first.id).unwrap();
+        assert!(
+            store
+                .next_outbound_with_ui_budget(&[], &[1])
+                .unwrap()
+                .is_none()
+        );
+        store.delivered(&first, "receipt").unwrap();
+        assert_eq!(
+            store
+                .next_outbound_with_ui_budget(&[], &[1])
+                .unwrap()
+                .unwrap()
+                .id,
+            "prose"
+        );
+    }
+    #[test]
+    fn report_visibility_and_admission_rollback_together_and_duplicate_finishes_are_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db")).unwrap();
+        let context = ReplyContext::request("100");
+        store.add_task("worker", "batch", 1, 2, "work").unwrap();
+        store
+            .present_agent("worker", 1, &context, "Greeter", "codex/test")
+            .unwrap();
+        store.agent_phase("worker", true, "Thinking").unwrap();
+        store.agent_run_start("delivery", "worker").unwrap();
+        store.db.lock().unwrap().execute_batch("CREATE TRIGGER fail_report BEFORE INSERT ON outbox BEGIN SELECT RAISE(FAIL,'simulated presentation failure'); END;").unwrap();
+        assert!(store.finish_agent("worker", "hi", "delivery").is_err());
+        assert!(store.queued(1).unwrap().is_empty());
+        assert_eq!(
+            store
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT state FROM tasks WHERE id='worker'", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            "running"
+        );
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_report")
+            .unwrap();
+        store.finish_agent("worker", "hi", "delivery").unwrap();
+        store
+            .finish_agent("worker", "duplicate", "delivery")
+            .unwrap();
+        assert_eq!(store.queued(1).unwrap().len(), 1);
+        let out = store.next_outbound().unwrap().unwrap();
+        assert!(
+            out.text
+                .contains("↙ incoming agent message from Greeter [worker]")
+        );
+        assert_eq!(out.reply_to, None);
+        assert!(!out.text.contains("duplicate"));
+    }
+
+    #[test]
+    fn terminal_errors_stay_plain_when_a_steer_is_queued() {
+        use crate::store::Input;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db")).unwrap();
+        store
+            .admit(&Input {
+                id: "100".into(),
+                channel: 1,
+                user: 2,
+                text: "work".into(),
+            })
+            .unwrap();
+        store.input_state("100", "failed").unwrap();
+        let context = store.reply_context("100").unwrap();
+        store
+            .admit(&Input {
+                id: "200".into(),
+                channel: 1,
+                user: 3,
+                text: "steer".into(),
+            })
+            .unwrap();
+        store
+            .enqueue_notice(&context, "error", 1, Some(2), "Turn stopped")
+            .unwrap();
+        let out = store.next_outbound().unwrap().unwrap();
+        assert_eq!(out.reply_to, None);
+        assert_eq!(out.user, None);
+        store.input_state("200", "failed").unwrap();
+        store
+            .enqueue_notice(&context, "terminal", 1, Some(3), "Turn stopped")
+            .unwrap();
+        store.delivered(&out, "receipt").unwrap();
+        let out = store.next_outbound().unwrap().unwrap();
+        assert_eq!(out.reply_to, Some(100));
+        assert_eq!(out.user, Some(2));
     }
 }
