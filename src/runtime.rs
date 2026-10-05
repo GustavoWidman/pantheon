@@ -90,8 +90,18 @@ impl Harness {
             capacity: Arc::new(Semaphore::new(config.agent.max_subagents)),
             shell_capacity: Arc::new(Semaphore::new(config.agent.max_shell_jobs)),
             shell_jobs: Mutex::new(HashMap::new()),
-            master_system: format!("{}\n{}", include_str!("master.txt"), instructions),
-            child_system: format!("{}\n{}", include_str!("child.txt"), instructions),
+            master_system: format!(
+                "{}\n{}\n{}",
+                include_str!("master.txt"),
+                include_str!("behavior.txt"),
+                instructions
+            ),
+            child_system: format!(
+                "{}\n{}\n{}",
+                include_str!("child.txt"),
+                include_str!("behavior.txt"),
+                instructions
+            ),
             config,
             store,
             discord,
