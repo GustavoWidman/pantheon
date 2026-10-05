@@ -255,7 +255,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn coordinator_and_worker_tools_preserve_shared_scheduling() {
+    fn default_root_and_strict_coordinator_preserve_worker_tools() {
         let names = |child| {
             definitions(child, true)
                 .into_iter()
@@ -293,6 +293,24 @@ mod tests {
         }
         assert!(!worker.contains(&"spawn".to_owned()));
         assert!(!worker.contains(&"revive_agent".to_owned()));
+        let default: crate::config::AgentConfig = toml::from_str("").unwrap();
+        let root = definitions(false, default.coordinator_root)
+            .into_iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        let mut expected = worker.clone();
+        expected.push("spawn".into());
+        expected.sort();
+        assert_eq!(root, expected);
+        let strict: crate::config::AgentConfig = toml::from_str("coordinator_root = true").unwrap();
+        assert_eq!(
+            definitions(false, strict.coordinator_root),
+            definitions(false, true)
+        );
+        assert_eq!(
+            definitions(true, default.coordinator_root),
+            definitions(true, strict.coordinator_root)
+        );
     }
     #[test]
     fn symlink_escape_is_denied() {

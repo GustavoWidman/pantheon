@@ -70,7 +70,7 @@ impl Default for AgentConfig {
             request_timeout_seconds: 300,
             tool_timeout_seconds: 120,
             show_reasoning: false,
-            coordinator_root: true,
+            coordinator_root: false,
             shell_background_after_seconds: 5,
             max_shell_jobs: 16,
             shell_timeout_seconds: 3600,

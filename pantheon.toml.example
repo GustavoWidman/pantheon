@@ -17,7 +17,9 @@ max_subagents = 8
 agent_idle_seconds = 3600
 request_timeout_seconds = 300
 tool_timeout_seconds = 120
-coordinator_root = true
+# Full root tools with selective background delegation. Set true for a
+# strict coordinator that delegates all execution to workers.
+coordinator_root = false
 shell_background_after_seconds = 5
 max_shell_jobs = 16
 shell_timeout_seconds = 3600
@@ -35,8 +37,8 @@ show_reasoning = false
 # codex_cli = "/absolute/path/to/codex" # Bundled by Nix; normally omit.
 
 [web]
-# Omit to use the worker's provider/model for hosted search. An explicit Codex
-# model also lets Anthropic workers search using a ChatGPT subscription.
+# Omit to use the calling agent's provider/model for hosted search. An explicit
+# Codex model also lets Anthropic agents search using a ChatGPT subscription.
 # search_model = "codex/gpt-5.6-sol"
 request_timeout_seconds = 45
 search_timeout_seconds = 120

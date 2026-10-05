@@ -1863,7 +1863,6 @@ mod tests {
             workspace: directory.path().into(),
             ..Default::default()
         };
-        config.agent.coordinator_root = false;
         config.agent.model = format!("{vendor}/test");
         let discord = Arc::new(Discord::new("mock-token".into(), 1, vec![2]).unwrap());
         let mut h = Harness::new(config, discord, CancellationToken::new()).unwrap();
@@ -1916,6 +1915,66 @@ mod tests {
             out.push(item);
         }
         out
+    }
+
+    #[tokio::test]
+    async fn default_root_reads_directly_with_a_stable_tool_prefix() {
+        let read = json!({"status":"completed","output":[{"type":"function_call","call_id":"read-source","name":"read","arguments":"{\"path\":\"source.txt\"}"}],"usage":{}});
+        let (directory, h, run, mock, server) = fixture(
+            "openai",
+            vec![
+                read,
+                final_response("openai", "Verified the source directly"),
+            ],
+        )
+        .await;
+        std::fs::write(
+            directory.path().join("source.txt"),
+            "verified-source-evidence",
+        )
+        .unwrap();
+        let memory = run.memory.clone();
+        let task = tokio::spawn(h.clone().run_agent(run));
+        mock.started.notified().await;
+        mock.release.notify_one();
+        task.await.unwrap().unwrap();
+
+        let requests = mock.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["tools"], requests[1]["tools"]);
+        assert_eq!(requests[0]["input"][0], requests[1]["input"][0]);
+        for name in [
+            "read",
+            "write",
+            "shell",
+            "browser",
+            "web_search",
+            "web_fetch",
+            "spawn",
+        ] {
+            assert!(
+                requests[0]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"] == name)
+            );
+        }
+        assert!(requests[1]["input"].as_array().unwrap().iter().any(|item| {
+            item["type"] == "function_call_output"
+                && item["call_id"] == "read-source"
+                && item["output"] == "verified-source-evidence"
+        }));
+        assert!(
+            memory
+                .memory
+                .lock()
+                .await
+                .export_html()
+                .contains("verified-source-evidence")
+        );
+        assert!(h.children.lock().await.is_empty());
+        server.abort();
     }
 
     #[tokio::test]
