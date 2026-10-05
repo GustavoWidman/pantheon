@@ -525,7 +525,8 @@ impl Harness {
                     .agent_phase(&run.owner, true, &format!("Running {}", call.name))?;
                 let control = matches!(call.name.as_str(), "spawn" | "tell");
                 if !control {
-                    self.store.activity_event(
+                    self.store.agent_activity_event(
+                        &run.owner,
                         &run.context,
                         run.channel,
                         &tool_id,
@@ -576,7 +577,8 @@ impl Harness {
                     && serde_json::from_str::<Value>(&output)
                         .is_ok_and(|v| v["state"] == "background");
                 if !control || error || steered {
-                    self.store.activity_event(
+                    self.store.agent_activity_event(
+                        &run.owner,
                         &run.context,
                         run.channel,
                         &tool_id,
@@ -614,26 +616,6 @@ impl Harness {
                 }
                 self.store.agent_event_done(&input.id)?;
                 run.steering.push(input.text);
-                self.store.activity_event(
-                    &run.context,
-                    run.channel,
-                    &format!("incoming:{}", input.id),
-                    &format!(
-                        "-> {} for {}",
-                        if input.id.starts_with("shell:") {
-                            "shell completion"
-                        } else if input.id.starts_with("wake:") {
-                            "wakeup"
-                        } else if input.id.starts_with("monitor:") {
-                            "monitor change"
-                        } else {
-                            "incoming message"
-                        },
-                        self.store.agent_label(&run.owner)?
-                    ),
-                    "event",
-                    Duration::ZERO,
-                )?;
                 received = true;
             }
         } else {
@@ -936,14 +918,16 @@ impl Harness {
             };
             let _ = h.store.agent_phase(&id, true, "Preparing context");
             let outcome=async {
+                let resumed=view.is_none();
                 let view=match view {Some(view)=>view,None=>h.settle(&memory,&cancel).await?};
                 let mut trace=Memory::open(h.config.state_dir.join("subagents").join(&id),h.config.agent.view_bytes)?;
-                let prompt=if previous.is_empty() {task.clone()} else {format!("Original task: {task}\nYour previous report: {previous}\nContinue on the new inbox notifications. Inspect saved tool effects before repeating work.")};
+                let prompt=if !resumed {task.clone()} else {format!("Continue the existing task: {task}\nYour previous private turn ended with: {previous}\nThe new inbox notifications contain results of work already started. Use those results to continue; do not start the task over or repeat completed commands or delays. Inspect saved effects if a result is unclear.")};
                 trace.append(Kind::User,&prompt)?;
                 let (vendor,_)=model_parts(&settings.0)?;
                 let run=Run {channel,user,owner:id.clone(),child:true,memory:memory.clone(),cancel,settings:settings.clone(),history:Provider::start(vendor,&view,&prompt),inputs:vec![],trace:Some(trace),steering:vec![],context:context.clone()};
                 h.clone().run_agent(run).await
             }.await;
+            let successful = outcome.is_ok();
             let mut report = match outcome {
                 Ok(text) => text,
                 Err(error) => format!("Task stopped: {error}"),
@@ -956,7 +940,10 @@ impl Harness {
                 report.push_str(&format!("\nBrowser ownership transfer failed: {error}"));
                 h.shutdown.cancel();
             }
-            if let Err(error) = h.store.finish_agent(&id, &report, &delivery_id) {
+            if let Err(error) = h
+                .store
+                .finish_agent_turn(&id, &report, &delivery_id, successful)
+            {
                 tracing::error!(error=%error,"persist agent report failed");
                 h.shutdown.cancel();
             }
@@ -1112,7 +1099,7 @@ impl Harness {
                 let context=if administrative {crate::ui::ReplyContext{reply_to:None,activity:format!("schedule:{id}")}}else{self.store.reply_context(&owner)?};
                 self.store.bind_context(&id,&context)?;
                 self.store.add_job(&Job{id:id.clone(),channel,user,kind:kind.into(),payload,due,interval})?;
-                self.store.activity_event(&context,channel,&format!("job:{id}:queued"),&format!("◷ {} / {kind} saved [{}]",self.store.agent_label(&owner)?,crate::ui::short_id(&id)),"event",Duration::ZERO)?;
+                self.store.agent_activity_event(&owner,&context,channel,&format!("job:{id}:queued"),&format!("◷ {} / {kind} saved [{}]",self.store.agent_label(&owner)?,crate::ui::short_id(&id)),"event",Duration::ZERO)?;
                 Ok(json!({"id":id,"due":due,"interval_seconds":interval}))
             }
             _=>bail!("unknown job action"),
@@ -1626,7 +1613,10 @@ impl Harness {
                             return Ok(());
                         }
                         let context = h.store.reply_context(&job.id)?;
-                        h.store.activity_event(
+                        h.store.agent_activity_event(
+                            job.payload["_owner"]
+                                .as_str()
+                                .unwrap_or(&format!("channel:{}", job.channel)),
                             &context,
                             job.channel,
                             &format!("job:{}:{}:fired", job.id, job.due),
@@ -2006,6 +1996,7 @@ mod tests {
         };
         let reply: Value =
             serde_json::from_str(&h.execute_tool(&mut run, &add).await.unwrap()).unwrap();
+        assert!(drain(&h).is_empty());
         let cancel = ToolCall {
             id: "cancel".into(),
             name: "wakeup".into(),
@@ -2291,6 +2282,132 @@ mod tests {
             );
         }
         h.shutdown.cancel();
+        server.abort();
+    }
+    #[tokio::test]
+    async fn worker_tools_and_notifications_stay_private_until_detached_work_finishes() {
+        let calls = json!({"status":"completed","output":[
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"Private worker progress"}]},
+            {"type":"function_call","call_id":"delay","name":"shell","arguments":"{\"command\":\"sleep 0.4; printf Hi\"}"},
+            {"type":"function_call","call_id":"error","name":"write","arguments":"{\"path\":\"../escape\",\"text\":\"bad\"}"}
+        ]});
+        let (_dir, mut h, mut run, mock, server) = fixture(
+            "openai",
+            vec![
+                calls,
+                final_response("openai", "Hi too early"),
+                final_response("openai", "Hi"),
+            ],
+        )
+        .await;
+        Arc::get_mut(&mut h)
+            .unwrap()
+            .config
+            .agent
+            .shell_background_after_seconds = 0;
+        let spawn = ToolCall {
+            id: "spawn".into(),
+            name: "spawn".into(),
+            arguments: json!({"tasks":[{"name":"Delayed Greeter","task":"Wait, then say hi"}]}),
+        };
+        let response: Value =
+            serde_json::from_str(&h.execute_tool(&mut run, &spawn).await.unwrap()).unwrap();
+        let id = response["ids"][0].as_str().unwrap();
+        mock.started.notified().await;
+        mock.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while h.children.lock().await.contains_key(id) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(h.store.queued(1).unwrap().is_empty());
+        assert_eq!(h.store.agent(id).unwrap().unwrap().report, "Hi too early");
+        assert!(h.store.refresh_activities(1, true).unwrap());
+        let mut timeline = drain(&h);
+        assert_eq!(timeline.len(), 1);
+        assert!(timeline[0].text.contains("↗ spawned Delayed Greeter"));
+        assert!(!timeline[0].text.contains(" / shell"));
+        assert!(!timeline[0].text.contains(" / write"));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while h.store.agent_events(id).unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        h.ensure_agent(id).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while h.store.queued(1).unwrap().is_empty() || h.children.lock().await.contains_key(id)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let reports = h.store.queued(1).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].text, format!("[{id}] Hi"));
+        timeline.extend(drain(&h));
+        let visible = timeline
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            visible
+                .matches("↙ incoming agent message from Delayed Greeter")
+                .count(),
+            1
+        );
+        assert!(!visible.contains(" / shell"));
+        assert!(!visible.contains(" / write"));
+        assert!(!visible.contains("shell completion"));
+        assert!(!visible.contains("Private worker progress"));
+        let trace = Memory::open(
+            h.config.state_dir.join("subagents").join(id),
+            h.config.agent.view_bytes,
+        )
+        .unwrap();
+        let private = trace.export_html();
+        assert!(private.contains("sleep 0.4"));
+        assert!(private.contains("../escape"));
+        assert!(private.contains("background"));
+        assert!(private.contains("Error:"));
+        assert!(
+            !run.memory
+                .memory
+                .lock()
+                .await
+                .export_html()
+                .contains("sleep 0.4")
+        );
+        let requests = mock.requests.lock().await;
+        assert!(
+            requests[2]
+                .to_string()
+                .contains("Continue the existing task")
+        );
+        assert!(requests[2].to_string().contains("stdout"));
+        h.shutdown.cancel();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn coordinator_tool_calls_remain_visible() {
+        let calls = json!({"status":"completed","output":[{"type":"function_call","call_id":"write","name":"write","arguments":"{\"path\":\"root-file\",\"text\":\"ok\"}"}]});
+        let (_dir, h, run, mock, server) =
+            fixture("openai", vec![calls, final_response("openai", "Done")]).await;
+        mock.release.notify_one();
+        h.clone().run_agent(run).await.unwrap();
+        let timeline = drain(&h);
+        assert!(
+            timeline
+                .iter()
+                .any(|m| m.text.contains("✓ Coordinator / write"))
+        );
+        assert!(timeline.iter().any(|m| m.text.contains("Done")));
         server.abort();
     }
 }

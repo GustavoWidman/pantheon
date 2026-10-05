@@ -162,6 +162,24 @@ impl Store {
         }
         Ok(())
     }
+    /// Only coordinator activity belongs in the user's conversation timeline.
+    /// Worker tool effects remain in their private trace and operational state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn agent_activity_event(
+        &self,
+        owner: &str,
+        context: &ReplyContext,
+        channel: u64,
+        id: &str,
+        label: &str,
+        status: &str,
+        elapsed: Duration,
+    ) -> Result<()> {
+        if owner.starts_with("channel:") {
+            self.activity_event(context, channel, id, label, status, elapsed)?;
+        }
+        Ok(())
+    }
     pub fn activity_event(
         &self,
         context: &ReplyContext,

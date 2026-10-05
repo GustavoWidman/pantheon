@@ -547,6 +547,15 @@ impl Store {
         Ok(())
     }
     pub fn finish_agent(&self, id: &str, report: &str, delivery_id: &str) -> Result<()> {
+        self.finish_agent_turn(id, report, delivery_id, true)
+    }
+    pub fn finish_agent_turn(
+        &self,
+        id: &str,
+        report: &str,
+        delivery_id: &str,
+        successful: bool,
+    ) -> Result<()> {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
         let finished: bool = tx
@@ -565,6 +574,26 @@ impl Store {
             [id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
+        let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM shell_runs WHERE owner=?1 AND state='running') OR EXISTS(SELECT 1 FROM agent_inbox WHERE owner=?1 AND state='queued')",[id],|r|r.get(0))?;
+        if successful && pending {
+            // A model turn ending does not complete an agent with detached work.
+            // Persist its private continuation, release its permit, and let its
+            // durable inbox resume it. The coordinator receives no early report.
+            tx.execute(
+                "UPDATE tasks SET report=?2 WHERE id=?1",
+                params![id, report],
+            )?;
+            tx.execute(
+                "UPDATE ui_agents SET active=0,phase='Waiting for background work' WHERE owner=?1",
+                [id],
+            )?;
+            tx.execute(
+                "UPDATE agent_runs SET state='done' WHERE id=?1",
+                [delivery_id],
+            )?;
+            tx.commit()?;
+            return Ok(());
+        }
         if state == "running" {
             finish_task_transaction(&tx, id, report)?;
         } else {
@@ -1063,5 +1092,95 @@ mod tests {
         assert_eq!(unlogged[0].text, "exact user input");
         s.mark_logged("gap").unwrap();
         assert!(s.unlogged(1).unwrap().is_empty());
+    }
+    #[test]
+    fn worker_report_waits_for_owned_shells_and_inbox_and_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let store = Store::open(&path).unwrap();
+        let context = crate::ui::ReplyContext::request("100");
+        store
+            .add_task("worker", "batch", 1, 2, "say hi after waiting")
+            .unwrap();
+        store
+            .present_agent("worker", 1, &context, "Greeter", "codex/test")
+            .unwrap();
+        store.agent_run_start("first", "worker").unwrap();
+        store.bind_context("shell", &context).unwrap();
+        store
+            .shell_start("shell", "worker", 1, 2, "sleep then hi")
+            .unwrap();
+        store.shell_detach("shell").unwrap();
+        store
+            .finish_agent_turn("worker", "Hi too early", "first", true)
+            .unwrap();
+        assert!(store.queued(1).unwrap().is_empty());
+        assert!(store.next_outbound().unwrap().is_none());
+        assert_eq!(
+            store
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT state FROM tasks WHERE id='worker'", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            "running"
+        );
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        store.shell_finish("shell", "Hi", false).unwrap();
+        assert_eq!(store.agent_events("worker").unwrap().len(), 1);
+        store.agent_run_start("second", "worker").unwrap();
+        store
+            .finish_agent_turn("worker", "Hi before inbox digestion", "second", true)
+            .unwrap();
+        assert!(store.queued(1).unwrap().is_empty());
+        for event in store.agent_events("worker").unwrap() {
+            store.agent_event_done(&event.id).unwrap();
+        }
+        // A future monitor is not current work and must not hold the report forever.
+        store
+            .add_job(&Job {
+                id: "future".into(),
+                channel: 1,
+                user: 2,
+                kind: "monitor".into(),
+                payload: serde_json::json!({"_owner":"worker","command":"true"}),
+                due: now() + 600,
+                interval: Some(600),
+            })
+            .unwrap();
+        store.agent_run_start("third", "worker").unwrap();
+        store
+            .finish_agent_turn("worker", "Hi", "third", true)
+            .unwrap();
+        store
+            .finish_agent_turn("worker", "duplicate", "third", true)
+            .unwrap();
+        let reports = store.queued(1).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].text, "[worker] Hi");
+        let out = store.next_outbound().unwrap().unwrap();
+        assert_eq!(
+            out.text
+                .matches("↙ incoming agent message from Greeter")
+                .count(),
+            1
+        );
+        assert!(!out.text.contains("shell"));
+    }
+    #[test]
+    fn failed_worker_reports_are_not_held_by_detached_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db")).unwrap();
+        store.add_task("worker", "batch", 1, 2, "work").unwrap();
+        store.agent_run_start("failed", "worker").unwrap();
+        store.shell_start("shell", "worker", 1, 2, "work").unwrap();
+        store
+            .finish_agent_turn("worker", "Task stopped: provider failure", "failed", false)
+            .unwrap();
+        let reports = store.queued(1).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].text.contains("provider failure"));
     }
 }
