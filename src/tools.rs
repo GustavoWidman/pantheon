@@ -63,7 +63,7 @@ pub fn definitions(child: bool, coordinator: bool) -> Vec<Value> {
     ];
     if !child {
         tools.extend([
-            tool("spawn","Start one background subagent per task and return their IDs immediately. Reports arrive together between tool calls or start a fresh turn. Never wait or poll for them. Children cannot spawn.",json!({"tasks":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":8}}),&["tasks"]),
+            tool("spawn","Start named background agents and return their names, IDs, models and reasoning immediately. Give each worker a short descriptive name. Omitted model/reasoning inherit yours. Reports arrive together between tool calls or start a fresh turn. Never wait or poll for them. Children cannot spawn.",json!({"tasks":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":48},"task":{"type":"string"},"model":{"type":"string"},"reasoning":{"type":"string","enum":["none","minimal","low","medium","high","xhigh"]}},"required":["name","task"],"additionalProperties":false},"minItems":1,"maxItems":8}}),&["tasks"]),
             tool("tell","Send a durable message to a subagent. It arrives between tool calls or resumes the same agent ID in a fresh background turn if idle.",json!({"id":{"type":"string"},"message":{"type":"string"}}),&["id","message"]),
         ]);
     }
