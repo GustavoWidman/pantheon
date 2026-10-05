@@ -150,6 +150,9 @@ impl Store {
             "UPDATE ui_agents SET active=?2,phase=?3 WHERE owner=?1",
             params![owner, active, phase],
         )?;
+        if let Some(channel) = owner.strip_prefix("channel:") {
+            crate::store::touch_coordinator(&db, channel.parse()?)?;
+        }
         if let Some(activity) = db
             .query_row(
                 "SELECT activity FROM ui_agents WHERE owner=?1",
@@ -302,6 +305,7 @@ impl Store {
         } else {
             None
         };
+        let recipient = recipient.filter(|_| !context.activity.starts_with("peer:"));
         close_segments(&tx, channel)?;
         for (i, chunk) in crate::discord::split_message(
             text,
@@ -471,6 +475,9 @@ fn render_segment(db: &Connection, segment: &str) -> Result<()> {
 }
 
 pub fn short_id(id: &str) -> &str {
+    if id.starts_with("channel:") {
+        return id;
+    }
     &id[..id.char_indices().nth(8).map(|(i, _)| i).unwrap_or(id.len())]
 }
 pub fn truncate(text: &str, max: usize) -> String {

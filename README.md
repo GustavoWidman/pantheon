@@ -4,7 +4,7 @@
 
 An always-on Discord agent harness in Rust, packaged as a NixOS service. Memory follows [OptChat](https://gist.githubusercontent.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449/raw/f51fe5c910427fd6f384d22823140b1693c76207/optchat.md): an immutable chat log, durable binary summary tree, incremental cache-friendly view, and fresh provider session each turn.
 
-Pantheon includes OpenAI Responses and Anthropic Messages adapters, background-only subagents, prompt steering, durable wakeups and change monitors, and bundled Camoufox browsers with separate displays and permanent authenticated noVNC viewers. It runs its own agent loop; Prime Agent is not required.
+Pantheon includes OpenAI Responses and Anthropic Messages adapters, background-only subagents, prompt steering, durable wakeups and change monitors, and bundled Camoufox windows with a shared profile and separate authenticated noVNC viewers. It runs its own agent loop; Prime Agent is not required.
 
 ## NixOS
 
@@ -52,7 +52,7 @@ cargo run -- --config pantheon.toml run
 | `/model id:provider/model` | Persist model selection for the next turn |
 | `/reasoning level:medium` | Persist reasoning effort for the next turn |
 | `/stop` | Cancel active master and its background agents |
-| `/subagents` | List task IDs and states |
+| `/subagents` | Named workers, settings and state; idle archived workers are hidden |
 | `/browser` | List owned live browser links; manage handoff/resume |
 | `/wakeup action:add schedule:in 10m prompt:…` | Durable one-shot or repeating wake |
 | `/monitor action:add command:… interval_seconds:30` | Wake when a bounded command's output changes |
@@ -60,6 +60,8 @@ cargo run -- --config pantheon.toml run
 Slash replies are private. Ordinary prompts and agent output use the originating channel. Progress prose and activity are plain messages; only the completion after all current work has finished replies to the loop's original prompt and notifies its author. Further input steers that loop without replacing its reply target. Fenced activity accumulates consecutive tool events; prose closes the fence, and subsequent events open a new one at the bottom of the conversation. Full fences roll over without dropping events. Named spawns show IDs, model/effort and incoming reports arrive individually as workers finish. Worker tool calls and owned shell/scheduler notifications remain private; the main timeline shows coordinator actions and delivered worker reports. Input reactions show 📥 received, 🧠 submitted to the model, and ✅ settled; steers share the loop's final settlement. Typing covers inference, context settling and background work. Slash commands use branded embeds with structured fields. Activity exposes names and status rather than arguments/output. Long replies split on Discord's UTF-16 budget with code fences preserved. Provider reasoning can be shown with `agent.show_reasoning=true`, without persisting it locally.
 
 Every subagent runs in the background and reports to the master. There are no foreground children or wait/poll tools. The root coordinates background workers by default. Workers have [web search and fetch](docs/web.md): hosted search with cited source URLs, and credential-free HTTP fetching with a durable, revalidating cache. Browser windows share one durable `pantheon-shared` profile and X display; each window group gets its own loopback VNC and noVNC listener on `0.0.0.0`. Browser handoff pauses automation until explicit resume. Returned LAN/Tailscale URLs are candidates; routing and remote firewall access cannot be established by enumerating local interfaces.
+
+Idle workers and coordinators leave default agent listings after one hour (`agent.agent_idle_seconds = 3600`). Their identities, histories and schedules remain durable. All agents can discover and message same-channel workers; coordinators can also find and message known neighboring coordinators using `list_agents(kind="coordinators")` and `tell(id="channel:<id>", message="...")`. `include_archived=true` finds hidden identities, `revive_agent` restores visibility, and a message or scheduled notification wakes them automatically. Memory stays channel-owned; coordinator messages explicitly carry information across channels.
 
 ## State and checks
 

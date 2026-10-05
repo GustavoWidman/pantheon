@@ -33,6 +33,7 @@ pub struct AgentConfig {
     pub context_windows: BTreeMap<String, u64>,
     pub max_steps: usize,
     pub max_subagents: usize,
+    pub agent_idle_seconds: u64,
     pub request_timeout_seconds: u64,
     pub tool_timeout_seconds: u64,
     pub show_reasoning: bool,
@@ -65,6 +66,7 @@ impl Default for AgentConfig {
             context_windows: BTreeMap::new(),
             max_steps: 128,
             max_subagents: 8,
+            agent_idle_seconds: 3600,
             request_timeout_seconds: 300,
             tool_timeout_seconds: 120,
             show_reasoning: false,
@@ -100,7 +102,9 @@ impl Config {
         ensure!(
             config.agent.tool_timeout_seconds > 0
                 && config.agent.request_timeout_seconds > 0
-                && config.agent.shell_timeout_seconds > 0,
+                && config.agent.shell_timeout_seconds > 0
+                && config.agent.agent_idle_seconds > 0
+                && config.agent.agent_idle_seconds <= i64::MAX as u64,
             "timeouts must be positive"
         );
         crate::provider::model_parts(&config.agent.model)?;

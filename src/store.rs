@@ -67,6 +67,24 @@ impl Store {
         CREATE TABLE IF NOT EXISTS shell_runs(id TEXT PRIMARY KEY,owner TEXT NOT NULL,channel TEXT NOT NULL,user TEXT NOT NULL,command TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'running',background INTEGER NOT NULL DEFAULT 0,output TEXT);
         PRAGMA user_version=2;")?;
         crate::ui::initialize(&db)?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS agent_lifecycle(id TEXT PRIMARY KEY REFERENCES tasks(id),channel TEXT NOT NULL,last_active INTEGER NOT NULL,archived INTEGER NOT NULL DEFAULT 0);
+        CREATE INDEX IF NOT EXISTS agents_idle ON agent_lifecycle(last_active,id) WHERE archived=0;
+        CREATE INDEX IF NOT EXISTS agents_visible ON agent_lifecycle(channel,id) WHERE archived=0;
+        CREATE INDEX IF NOT EXISTS agent_runs_owner_active ON agent_runs(owner) WHERE state='running';
+        CREATE INDEX IF NOT EXISTS shell_runs_owner_active ON shell_runs(owner) WHERE state='running';")?;
+        db.execute_batch("CREATE INDEX IF NOT EXISTS tasks_channel ON tasks(channel);
+        CREATE INDEX IF NOT EXISTS inbox_live_channel ON inbox(channel) WHERE state IN ('queued','running');
+        CREATE INDEX IF NOT EXISTS agent_inbox_live_channel ON agent_inbox(channel) WHERE state='queued';
+        CREATE INDEX IF NOT EXISTS shell_runs_live_channel ON shell_runs(channel) WHERE state='running';")?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS coordinator_lifecycle(channel TEXT PRIMARY KEY,last_active INTEGER NOT NULL,archived INTEGER NOT NULL DEFAULT 0);
+        CREATE INDEX IF NOT EXISTS coordinators_idle ON coordinator_lifecycle(last_active) WHERE archived=0;")?;
+        // Legacy agents have no reliable last-activity timestamp. Give them one
+        // grace period at migration, rather than guessing and hiding them early.
+        db.execute(
+            "INSERT OR IGNORE INTO agent_lifecycle(id,channel,last_active) SELECT id,channel,?1 FROM tasks",
+            [now()],
+        )?;
+        db.execute("INSERT OR IGNORE INTO coordinator_lifecycle(channel,last_active) SELECT channel,?1 FROM ui_agents WHERE owner LIKE 'channel:%'",[now()])?;
         Ok(Self { db: Mutex::new(db) })
     }
     pub fn admit(&self, input: &Input) -> Result<bool> {
@@ -83,6 +101,7 @@ impl Store {
             ],
         )? == 1;
         if admitted {
+            touch_coordinator(&tx, input.channel)?;
             let context = tx.query_row("SELECT reply_to,activity FROM ui_contexts WHERE source=?1",[&input.id],|r|Ok(crate::ui::ReplyContext{reply_to:r.get::<_,Option<String>>(0)?.and_then(|s|s.parse().ok()),activity:r.get(1)?})).optional()?.or(tx.query_row("SELECT reply_to,activity FROM ui_sessions WHERE channel=?1 AND closed=0 ORDER BY rowid DESC LIMIT 1",[input.channel.to_string()],|r|Ok(crate::ui::ReplyContext{reply_to:r.get::<_,Option<String>>(0)?.and_then(|s|s.parse().ok()),activity:r.get(1)?})).optional()?).unwrap_or_else(||crate::ui::ReplyContext::request(&input.id));
             tx.execute("INSERT OR IGNORE INTO ui_contexts(source,reply_to,activity,is_prompt) VALUES(?1,?2,?3,1)",params![input.id,context.reply_to.map(|id|id.to_string()),context.activity])?;
             tx.execute(
@@ -203,7 +222,7 @@ impl Store {
                 params![
                     id,
                     channel.to_string(),
-                    if i == 0 && background==0 { Some(recipient.clone()) } else { None },
+                    if i == 0 && background==0 && !activity.starts_with("peer:") { Some(recipient.clone()) } else { None },
                     text,
                     nonce,
                     if i==0 && background==0 {context.as_ref().and_then(|(reply,_)|reply.as_deref())} else {None}
@@ -452,10 +471,17 @@ impl Store {
         user: u64,
         task: &str,
     ) -> Result<()> {
-        self.db.lock().unwrap().execute(
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        tx.execute(
             "INSERT INTO tasks(id,batch,channel,user,task,state) VALUES(?1,?2,?3,?4,?5,'running')",
             params![id, batch, channel.to_string(), user.to_string(), task],
         )?;
+        tx.execute(
+            "INSERT INTO agent_lifecycle(id,channel,last_active) VALUES(?1,?2,?3)",
+            params![id, channel.to_string(), now()],
+        )?;
+        tx.commit()?;
         Ok(())
     }
     pub fn finish_task(&self, id: &str, report: &str) -> Result<()> {
@@ -466,11 +492,201 @@ impl Store {
         Ok(())
     }
     pub fn tasks(&self, channel: u64) -> Result<Value> {
+        Ok(self.list_agents(channel, false, 100, None)?["agents"].clone())
+    }
+    pub fn list_agents(
+        &self,
+        channel: u64,
+        include_archived: bool,
+        limit: usize,
+        before: Option<i64>,
+    ) -> Result<Value> {
+        ensure!(
+            (1..=100).contains(&limit),
+            "limit must be between 1 and 100"
+        );
+        ensure!(
+            before.is_none_or(|cursor| cursor > 0),
+            "before must be a positive cursor"
+        );
         let db = self.db.lock().unwrap();
-        let mut s = db.prepare(
-            "SELECT t.id,CASE WHEN u.active=1 THEN 'working' WHEN EXISTS(SELECT 1 FROM shell_runs r WHERE r.owner=t.id AND r.state='running') THEN 'background shell' ELSE t.state END,t.task,COALESCE(u.name,'Worker'),COALESCE(a.model,'Unknown'),COALESCE(a.reasoning,'Unknown') FROM tasks t LEFT JOIN ui_agents u ON u.owner=t.id LEFT JOIN agent_settings a ON a.id=t.id WHERE t.channel=?1 ORDER BY t.rowid DESC LIMIT 100",
+        let visibility = if include_archived {
+            ""
+        } else {
+            "AND l.archived=0"
+        };
+        let mut s = db.prepare(&format!(
+            "SELECT t.id,CASE WHEN u.active=1 THEN 'working' WHEN EXISTS(SELECT 1 FROM shell_runs r WHERE r.owner=t.id AND r.state='running') THEN 'background shell' WHEN EXISTS(SELECT 1 FROM agent_inbox i WHERE i.owner=t.id AND i.state='queued') THEN 'queued' ELSE t.state END,t.task,COALESCE(u.name,'Worker'),COALESCE(a.model,'Unknown'),COALESCE(a.reasoning,'Unknown'),l.archived,l.last_active,t.rowid FROM agent_lifecycle l JOIN tasks t ON l.id=t.id LEFT JOIN ui_agents u ON u.owner=t.id LEFT JOIN agent_settings a ON a.id=t.id WHERE l.channel=?1 {visibility} AND (?2 IS NULL OR t.rowid<?2) ORDER BY t.rowid DESC LIMIT ?3",
+        ))?;
+        let rows=s.query_map(params![channel.to_string(),before,(limit+1) as i64],|r|Ok((serde_json::json!({"id":r.get::<_,String>(0)?,"state":r.get::<_,String>(1)?,"task":crate::ui::clean(&r.get::<_,String>(2)?,180),"name":r.get::<_,String>(3)?,"model":crate::ui::clean(&r.get::<_,String>(4)?,128),"reasoning":r.get::<_,String>(5)?,"archived":r.get::<_,bool>(6)?,"last_active":r.get::<_,i64>(7)?}),r.get::<_,i64>(8)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
+        agent_page(rows, limit, "channel")
+    }
+    pub fn archive_idle_agents(&self, idle_seconds: u64) -> Result<usize> {
+        ensure!(
+            idle_seconds > 0 && idle_seconds <= i64::MAX as u64,
+            "invalid idle timeout"
+        );
+        let cutoff = now().saturating_sub(idle_seconds as i64);
+        Ok(self.archive_agents_before(cutoff)? + self.archive_coordinators_before(cutoff)?)
+    }
+    fn archive_agents_before(&self, cutoff: i64) -> Result<usize> {
+        Ok(self.db.lock().unwrap().execute("UPDATE agent_lifecycle SET archived=1 WHERE archived=0 AND last_active<=?1
+            AND EXISTS(SELECT 1 FROM tasks t WHERE t.id=agent_lifecycle.id AND t.state!='running')
+            AND NOT EXISTS(SELECT 1 FROM agent_runs r WHERE r.owner=agent_lifecycle.id AND r.state='running')
+            AND NOT EXISTS(SELECT 1 FROM ui_agents u WHERE u.owner=agent_lifecycle.id AND u.active=1)
+            AND NOT EXISTS(SELECT 1 FROM shell_runs r WHERE r.owner=agent_lifecycle.id AND r.state='running')
+            AND NOT EXISTS(SELECT 1 FROM agent_inbox i WHERE i.owner=agent_lifecycle.id AND i.state='queued')",[cutoff])?)
+    }
+    pub fn revive_agent(&self, channel: u64, id: &str) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        ensure!(db.execute("UPDATE agent_lifecycle SET archived=0,last_active=?3 WHERE id=?1 AND EXISTS(SELECT 1 FROM tasks t WHERE t.id=?1 AND t.channel=?2)",params![id,channel.to_string(),now()])?==1,"unknown agent in this channel");
+        Ok(())
+    }
+    fn archive_coordinators_before(&self, cutoff: i64) -> Result<usize> {
+        Ok(self.db.lock().unwrap().execute("UPDATE coordinator_lifecycle SET archived=1 WHERE archived=0 AND last_active<=?1
+            AND NOT EXISTS(SELECT 1 FROM ui_agents a WHERE a.owner='channel:'||coordinator_lifecycle.channel AND a.active=1)
+            AND NOT EXISTS(SELECT 1 FROM inbox i WHERE i.channel=coordinator_lifecycle.channel AND i.state IN ('queued','running'))
+            AND NOT EXISTS(SELECT 1 FROM tasks t JOIN agent_lifecycle l ON l.id=t.id WHERE t.channel=coordinator_lifecycle.channel AND (t.state='running' OR EXISTS(SELECT 1 FROM agent_runs r WHERE r.owner=t.id AND r.state='running')))
+            AND NOT EXISTS(SELECT 1 FROM shell_runs r WHERE r.channel=coordinator_lifecycle.channel AND r.state='running')
+            AND NOT EXISTS(SELECT 1 FROM agent_inbox i WHERE i.channel=coordinator_lifecycle.channel AND i.state='queued')",[cutoff])?)
+    }
+    pub fn list_coordinators(
+        &self,
+        include_archived: bool,
+        limit: usize,
+        before: Option<i64>,
+    ) -> Result<Value> {
+        ensure!(
+            (1..=100).contains(&limit),
+            "limit must be between 1 and 100"
+        );
+        ensure!(
+            before.is_none_or(|cursor| cursor > 0),
+            "before must be a positive cursor"
+        );
+        let db = self.db.lock().unwrap();
+        let mut s=db.prepare("SELECT l.channel,COALESCE(a.model,s.model,'Unknown'),COALESCE(s.reasoning,'Unknown'),CASE WHEN a.active=1 THEN a.phase WHEN EXISTS(SELECT 1 FROM inbox i WHERE i.channel=l.channel AND i.state='queued') THEN 'queued' ELSE 'idle' END,l.archived,l.last_active,l.rowid FROM coordinator_lifecycle l LEFT JOIN ui_agents a ON a.owner='channel:'||l.channel LEFT JOIN settings s ON s.channel=l.channel WHERE (?1 OR l.archived=0) AND (?2 IS NULL OR l.rowid<?2) ORDER BY l.rowid DESC LIMIT ?3")?;
+        let rows=s.query_map(params![include_archived,before,(limit+1) as i64],|r|{
+            let channel:String=r.get(0)?;
+            Ok((serde_json::json!({"id":format!("channel:{channel}"),"name":format!("Coordinator {channel}"),"channel":channel,"model":crate::ui::clean(&r.get::<_,String>(1)?,128),"reasoning":r.get::<_,String>(2)?,"state":r.get::<_,String>(3)?,"archived":r.get::<_,bool>(4)?,"last_active":r.get::<_,i64>(5)?}),r.get::<_,i64>(6)?))
+        })?.collect::<std::result::Result<Vec<_>,_>>()?;
+        agent_page(rows, limit, "coordinators")
+    }
+    pub fn revive_coordinator(&self, channel: u64) -> Result<()> {
+        ensure!(
+            self.db.lock().unwrap().execute(
+                "UPDATE coordinator_lifecycle SET archived=0,last_active=?2 WHERE channel=?1",
+                params![channel.to_string(), now()]
+            )? == 1,
+            "unknown coordinator"
+        );
+        Ok(())
+    }
+    pub fn send_agent_message(
+        &self,
+        channel: u64,
+        user: u64,
+        sender: &str,
+        target: &str,
+        message: &str,
+    ) -> Result<String> {
+        ensure!(
+            !message.trim().is_empty() && message.len() <= 64_000,
+            "message must contain 1–64000 bytes"
+        );
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let coordinator = sender == format!("channel:{channel}");
+        let destination = if let Some(target_channel) = target.strip_prefix("channel:") {
+            ensure!(
+                coordinator,
+                "workers can only message workers in their own channel"
+            );
+            let destination: u64 = target_channel.parse()?;
+            ensure!(
+                target == format!("channel:{destination}"),
+                "invalid coordinator ID"
+            );
+            let known: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM coordinator_lifecycle WHERE channel=?1)",
+                [destination.to_string()],
+                |r| r.get(0),
+            )?;
+            ensure!(known, "unknown coordinator");
+            destination
+        } else {
+            let target_channel: Option<String> = tx
+                .query_row("SELECT channel FROM tasks WHERE id=?1", [target], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            ensure!(
+                target_channel.as_deref() == Some(channel.to_string().as_str()),
+                "unknown agent in this channel"
+            );
+            channel
+        };
+        let source = if coordinator {
+            format!("channel:{channel}")
+        } else {
+            let source_channel: Option<String> = tx
+                .query_row("SELECT channel FROM tasks WHERE id=?1", [sender], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            ensure!(
+                source_channel.as_deref() == Some(channel.to_string().as_str()),
+                "sender belongs to another channel"
+            );
+            let name: String = tx
+                .query_row("SELECT name FROM ui_agents WHERE owner=?1", [sender], |r| {
+                    r.get(0)
+                })
+                .optional()?
+                .unwrap_or_else(|| "Worker".into());
+            format!("{name} [{sender}]")
+        };
+        let id = format!("peer:{}", uuid::Uuid::new_v4());
+        if !target.starts_with("channel:") && coordinator {
+            // An idle identity reused by a new user loop reports into that
+            // loop, rather than reviving an old Discord reply reference.
+            let busy:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM agent_runs WHERE owner=?1 AND state='running') OR EXISTS(SELECT 1 FROM shell_runs WHERE owner=?1 AND state='running') OR EXISTS(SELECT 1 FROM agent_inbox WHERE owner=?1 AND state='queued')",[target],|r|r.get(0))?;
+            if !busy {
+                tx.execute("INSERT INTO ui_contexts(source,reply_to,activity) SELECT ?2,reply_to,activity FROM ui_contexts WHERE source=?1 ON CONFLICT(source) DO UPDATE SET reply_to=excluded.reply_to,activity=excluded.activity",params![sender,target])?;
+            }
+        }
+        if target.starts_with("channel:") {
+            // A sleeping neighbor starts its own activity, without replying to
+            // an old user message. A running neighbor receives ordinary steer.
+            let context=tx.query_row("SELECT reply_to,activity FROM ui_sessions WHERE channel=?1 AND closed=0 ORDER BY rowid DESC LIMIT 1",[destination.to_string()],|r|Ok(crate::ui::ReplyContext{reply_to:r.get::<_,Option<String>>(0)?.and_then(|s|s.parse().ok()),activity:r.get(1)?})).optional()?.unwrap_or_else(||crate::ui::ReplyContext{reply_to:None,activity:id.clone()});
+            tx.execute(
+                "INSERT INTO ui_contexts(source,reply_to,activity) VALUES(?1,?2,?3)",
+                params![
+                    id,
+                    context.reply_to.map(|id| id.to_string()),
+                    context.activity
+                ],
+            )?;
+            crate::ui::activity_event_transaction(
+                &tx,
+                &context,
+                destination,
+                &format!("incoming:{id}"),
+                &format!("↙ incoming coordinator message from {source}"),
+                "event",
+                std::time::Duration::ZERO,
+            )?;
+        }
+        deliver_event(
+            &tx,
+            &id,
+            target,
+            destination,
+            user,
+            &format!("[{source}] {message}"),
         )?;
-        Ok(Value::Array(s.query_map([channel.to_string()],|r|Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"state":r.get::<_,String>(1)?,"task":r.get::<_,String>(2)?,"name":r.get::<_,String>(3)?,"model":r.get::<_,String>(4)?,"reasoning":r.get::<_,String>(5)?})))?.collect::<std::result::Result<_,_>>()?))
+        tx.commit()?;
+        Ok(id)
     }
     pub fn tool_start(&self, id: &str, channel: u64, name: &str) -> Result<()> {
         self.db.lock().unwrap().execute(
@@ -540,10 +756,14 @@ impl Store {
             .collect::<std::result::Result<_, _>>()?)
     }
     pub fn agent_run_start(&self, id: &str, owner: &str) -> Result<()> {
-        self.db.lock().unwrap().execute(
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        tx.execute(
             "INSERT INTO agent_runs(id,owner,state) VALUES(?1,?2,'running')",
             params![id, owner],
         )?;
+        touch_agent(&tx, owner)?;
+        tx.commit()?;
         Ok(())
     }
     pub fn finish_agent(&self, id: &str, report: &str, delivery_id: &str) -> Result<()> {
@@ -569,6 +789,7 @@ impl Store {
         if finished {
             return Ok(());
         }
+        touch_agent(&tx, id)?;
         let (state, channel, user): (String, String, String) = tx.query_row(
             "SELECT state,channel,user FROM tasks WHERE id=?1",
             [id],
@@ -758,6 +979,7 @@ fn finish_task_transaction(tx: &rusqlite::Transaction<'_>, id: &str, report: &st
     if changed == 0 {
         return Ok(());
     }
+    touch_agent(tx, id)?;
     let (channel, user): (String, String) =
         tx.query_row("SELECT channel,user FROM tasks WHERE id=?1", [id], |r| {
             Ok((r.get(0)?, r.get(1)?))
@@ -777,6 +999,37 @@ fn finish_task_transaction(tx: &rusqlite::Transaction<'_>, id: &str, report: &st
     Ok(())
 }
 
+fn agent_page(mut rows: Vec<(Value, i64)>, limit: usize, scope: &str) -> Result<Value> {
+    let mut more = rows.len() > limit;
+    rows.truncate(limit);
+    // Keep the cursor in a complete JSON tool result instead of letting the
+    // generic head/tail cap cut a large directory page into invalid JSON.
+    let mut bytes = 0;
+    let mut count = 0;
+    for (agent, _) in &rows {
+        let size = serde_json::to_vec(agent)?.len() + 1;
+        if bytes + size > 24_000 {
+            break;
+        }
+        bytes += size;
+        count += 1;
+    }
+    ensure!(
+        rows.is_empty() || count > 0,
+        "agent record exceeds directory page budget"
+    );
+    more |= count < rows.len();
+    rows.truncate(count);
+    let next = if more {
+        rows.last().map(|(_, cursor)| *cursor)
+    } else {
+        None
+    };
+    Ok(
+        serde_json::json!({"agents":rows.into_iter().map(|(agent,_)|agent).collect::<Vec<_>>(),"next_before":next,"scope":scope}),
+    )
+}
+
 fn job_active(tx: &rusqlite::Transaction<'_>, job: &Job) -> Result<bool> {
     Ok(tx.query_row(
         "SELECT state='active' AND due=?2 FROM jobs WHERE id=?1",
@@ -794,13 +1047,29 @@ fn deliver_event(
 ) -> Result<()> {
     crate::ui::copy_context(tx, owner, id)?;
     if owner == format!("channel:{channel}") {
-        tx.execute(
+        if tx.execute(
             "INSERT OR IGNORE INTO inbox(id,channel,user,text,created) VALUES(?1,?2,?3,?4,?5)",
             params![id, channel.to_string(), user.to_string(), text, now()],
-        )?;
+        )? == 1
+        {
+            touch_coordinator(tx, channel)?;
+        }
     } else {
-        tx.execute("INSERT OR IGNORE INTO agent_inbox(id,owner,channel,user,text,created) VALUES(?1,?2,?3,?4,?5,?6)",params![id,owner,channel.to_string(),user.to_string(),text,now()])?;
+        if tx.execute("INSERT OR IGNORE INTO agent_inbox(id,owner,channel,user,text,created) VALUES(?1,?2,?3,?4,?5,?6)",params![id,owner,channel.to_string(),user.to_string(),text,now()])?==1 {
+            touch_agent(tx,owner)?;
+        }
     }
+    Ok(())
+}
+fn touch_agent(db: &Connection, id: &str) -> Result<()> {
+    db.execute(
+        "UPDATE agent_lifecycle SET last_active=?2,archived=0 WHERE id=?1",
+        params![id, now()],
+    )?;
+    Ok(())
+}
+pub(crate) fn touch_coordinator(db: &Connection, channel: u64) -> Result<()> {
+    db.execute("INSERT INTO coordinator_lifecycle(channel,last_active) VALUES(?1,?2) ON CONFLICT(channel) DO UPDATE SET last_active=excluded.last_active,archived=0",params![channel.to_string(),now()])?;
     Ok(())
 }
 fn shell_delivery(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<()> {
@@ -837,6 +1106,349 @@ pub fn now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archived_workers_survive_restart_and_revive_with_their_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("db");
+        let store = Store::open(&path).unwrap();
+        store
+            .add_task("worker", "batch", 1, 2, "original task")
+            .unwrap();
+        store
+            .register_agent("worker", "openai/test", "low")
+            .unwrap();
+        store.finish_task("worker", "saved findings").unwrap();
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE agent_lifecycle SET last_active=100", [])
+            .unwrap();
+        assert_eq!(store.archive_agents_before(99).unwrap(), 0);
+        assert_eq!(store.archive_agents_before(100).unwrap(), 1);
+        assert_eq!(store.archive_agents_before(100).unwrap(), 0);
+        assert!(store.tasks(1).unwrap().as_array().unwrap().is_empty());
+        assert_eq!(
+            store.list_agents(1, true, 10, None).unwrap()["agents"][0]["archived"],
+            true
+        );
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert!(store.tasks(1).unwrap().as_array().unwrap().is_empty());
+        let record = store.agent("worker").unwrap().unwrap();
+        assert_eq!(record.task, "original task");
+        assert_eq!(record.report, "saved findings");
+        assert_eq!(record.model, "openai/test");
+        assert!(store.revive_agent(3, "worker").is_err());
+        store.revive_agent(1, "worker").unwrap();
+        assert_eq!(store.tasks(1).unwrap()[0]["id"], "worker");
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE agent_lifecycle SET archived=1", [])
+            .unwrap();
+        let message = store
+            .send_agent_message(1, 2, "channel:1", "worker", "continue")
+            .unwrap();
+        assert_eq!(store.tasks(1).unwrap()[0]["archived"], false);
+        assert_eq!(store.agent_events("worker").unwrap()[0].id, message);
+        assert_eq!(
+            store.agent_events("worker").unwrap()[0].text,
+            "[channel:1] continue"
+        );
+        store.agent_event_done(&message).unwrap();
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE agent_lifecycle SET archived=1", [])
+            .unwrap();
+        let job = Job {
+            id: "wake".into(),
+            channel: 1,
+            user: 2,
+            kind: "wakeup".into(),
+            payload: serde_json::json!({"_owner":"worker"}),
+            due: 0,
+            interval: None,
+        };
+        store.add_job(&job).unwrap();
+        store.fire_wakeup(&job, "scheduled work").unwrap();
+        assert_eq!(store.tasks(1).unwrap()[0]["archived"], false);
+        assert!(
+            store.agent_events("worker").unwrap()[0]
+                .text
+                .contains("scheduled work")
+        );
+    }
+
+    #[test]
+    fn archival_never_hides_agents_with_unfinished_work() {
+        let d = tempfile::tempdir().unwrap();
+        let store = Store::open(&d.path().join("db")).unwrap();
+        for id in ["initial", "run", "ui", "shell", "inbox", "idle"] {
+            store.add_task(id, "batch", 1, 2, "work").unwrap();
+            if id != "initial" {
+                store.finish_task(id, "done").unwrap();
+            }
+        }
+        store.agent_run_start("active-run", "run").unwrap();
+        store
+            .present_agent(
+                "ui",
+                1,
+                &crate::ui::ReplyContext::request("request"),
+                "Busy",
+                "test",
+            )
+            .unwrap();
+        store.agent_phase("ui", true, "Thinking").unwrap();
+        store
+            .shell_start("command", "shell", 1, 2, "slow command")
+            .unwrap();
+        store
+            .admit_event(
+                &Input {
+                    id: "event".into(),
+                    channel: 1,
+                    user: 2,
+                    text: "continue".into(),
+                },
+                "inbox",
+            )
+            .unwrap();
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE agent_lifecycle SET last_active=0", [])
+            .unwrap();
+        assert_eq!(store.archive_agents_before(1).unwrap(), 1);
+        let ids = store
+            .tasks(1)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        for id in ["initial", "run", "ui", "shell", "inbox"] {
+            assert!(ids.contains(&id.to_owned()));
+        }
+        assert!(!ids.contains(&"idle".into()));
+    }
+
+    #[test]
+    fn worker_peer_messages_are_private_attributed_and_channel_scoped() {
+        let d = tempfile::tempdir().unwrap();
+        let store = Store::open(&d.path().join("db")).unwrap();
+        for (id, channel) in [("scout", 1), ("builder", 1), ("elsewhere", 3)] {
+            store.add_task(id, "batch", channel, 2, "work").unwrap();
+            store
+                .present_agent(
+                    id,
+                    channel,
+                    &crate::ui::ReplyContext::request(id),
+                    id,
+                    "test",
+                )
+                .unwrap();
+        }
+        assert!(
+            store
+                .send_agent_message(1, 2, "scout", "elsewhere", "private")
+                .is_err()
+        );
+        assert!(
+            store
+                .send_agent_message(1, 2, "scout", "channel:3", "private")
+                .is_err()
+        );
+        assert!(
+            store
+                .send_agent_message(1, 2, "channel:1", "elsewhere", "private")
+                .is_err()
+        );
+        assert!(
+            store
+                .send_agent_message(1, 2, "elsewhere", "builder", "private")
+                .is_err()
+        );
+        store
+            .send_agent_message(1, 2, "scout", "builder", "found the answer")
+            .unwrap();
+        let messages = store.agent_events("builder").unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text, "[scout [scout]] found the answer");
+        assert!(store.queued(1).unwrap().is_empty());
+        assert!(store.next_outbound().unwrap().is_none());
+        store
+            .send_agent_message(1, 2, "scout", "scout", "remember this")
+            .unwrap();
+        assert_eq!(store.agent_events("scout").unwrap().len(), 1);
+        assert_eq!(
+            store.list_agents(1, false, 10, None).unwrap()["agents"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn coordinator_messages_revive_neighbors_without_reusing_old_replies() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("db");
+        let store = Store::open(&path).unwrap();
+        store
+            .admit(&Input {
+                id: "123".into(),
+                channel: 3,
+                user: 2,
+                text: "earlier discussion".into(),
+            })
+            .unwrap();
+        store.input_state("123", "done").unwrap();
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE ui_sessions SET closed=1", [])
+            .unwrap();
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE coordinator_lifecycle SET last_active=100", [])
+            .unwrap();
+        assert_eq!(store.archive_coordinators_before(100).unwrap(), 1);
+        assert!(
+            store.list_coordinators(false, 10, None).unwrap()["agents"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.list_coordinators(true, 10, None).unwrap()["agents"][0]["id"],
+            "channel:3"
+        );
+        let id = store
+            .send_agent_message(1, 2, "channel:1", "channel:3", "need your findings")
+            .unwrap();
+        assert_eq!(
+            store.list_coordinators(false, 10, None).unwrap()["agents"][0]["id"],
+            "channel:3"
+        );
+        let input = &store.queued(3).unwrap()[0];
+        assert_eq!(input.text, "[channel:1] need your findings");
+        let ctx = store.reply_context(&id).unwrap();
+        assert!(ctx.reply_to.is_none());
+        assert!(ctx.activity.starts_with("peer:"));
+        assert!(
+            store
+                .send_agent_message(1, 2, "channel:1", "channel:03", "invalid ID")
+                .is_err()
+        );
+        assert!(
+            store
+                .send_agent_message(1, 2, "channel:1", "channel:99", "unknown")
+                .is_err()
+        );
+        // A queued message prevents re-archival even with an old timestamp.
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE coordinator_lifecycle SET last_active=0", [])
+            .unwrap();
+        assert_eq!(store.archive_coordinators_before(100).unwrap(), 0);
+        store.input_state(&id, "running").unwrap();
+        store
+            .complete_turn(&[id], "reply", 3, 2, &["answer".into()])
+            .unwrap();
+        let mut out = vec![];
+        while let Some(message) = store.next_outbound().unwrap() {
+            store.sent(&message.id, "receipt").unwrap();
+            out.push(message);
+        }
+        let answer = out.iter().find(|m| m.text == "answer").unwrap();
+        assert!(answer.reply_to.is_none());
+        assert!(answer.user.is_none());
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE coordinator_lifecycle SET archived=1", [])
+            .unwrap();
+        store
+            .admit(&Input {
+                id: "124".into(),
+                channel: 3,
+                user: 2,
+                text: "user wakes you".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            store.list_coordinators(false, 10, None).unwrap()["agents"][0]["archived"],
+            false
+        );
+    }
+
+    #[test]
+    fn coordinator_reuses_idle_worker_in_its_current_conversation_activity() {
+        let d = tempfile::tempdir().unwrap();
+        let store = Store::open(&d.path().join("db")).unwrap();
+        store.add_task("worker", "batch", 1, 2, "work").unwrap();
+        store.finish_task("worker", "saved result").unwrap();
+        store
+            .bind_context("worker", &crate::ui::ReplyContext::request("123"))
+            .unwrap();
+        let current = crate::ui::ReplyContext::request("456");
+        store.bind_context("channel:1", &current).unwrap();
+        let message = store
+            .send_agent_message(1, 2, "channel:1", "worker", "new work")
+            .unwrap();
+        assert_eq!(
+            store.reply_context("worker").unwrap().activity,
+            current.activity
+        );
+        assert_eq!(store.reply_context(&message).unwrap().reply_to, Some(456));
+    }
+
+    #[test]
+    fn directory_pagination_returns_all_visible_agents_with_complete_json() {
+        let d = tempfile::tempdir().unwrap();
+        let store = Store::open(&d.path().join("db")).unwrap();
+        for i in 0..105 {
+            store
+                .add_task(&format!("agent-{i}"), "batch", 1, 2, &"長".repeat(500))
+                .unwrap();
+        }
+        let mut before = None;
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let page = store.list_agents(1, false, 100, before).unwrap();
+            assert!(serde_json::to_vec(&page).unwrap().len() < 25_000);
+            for agent in page["agents"].as_array().unwrap() {
+                assert!(seen.insert(agent["id"].as_str().unwrap().to_owned()));
+            }
+            before = page["next_before"].as_i64();
+            if before.is_none() {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 105);
+        assert!(
+            store.list_agents(3, false, 100, None).unwrap()["agents"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn resumed_agent_interruption_is_reported_once_after_consuming_its_event() {
