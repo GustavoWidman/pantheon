@@ -522,7 +522,7 @@ impl Harness {
                 let tool_id = format!("{run_id}:{step}:tool:{index}");
                 self.store.tool_start(&tool_id, run.channel, &call.name)?;
                 let start = Instant::now();
-                let label = format!("{} / {}", self.store.agent_label(&run.owner)?, call.name);
+                let label = &call.name;
                 self.store
                     .agent_phase(&run.owner, true, &format!("Running {}", call.name))?;
                 let control = matches!(call.name.as_str(), "spawn" | "tell");
@@ -532,7 +532,7 @@ impl Harness {
                         &run.context,
                         run.channel,
                         &tool_id,
-                        &label,
+                        label,
                         "running",
                         Duration::ZERO,
                     )?;
@@ -584,7 +584,7 @@ impl Harness {
                         &run.context,
                         run.channel,
                         &tool_id,
-                        &label,
+                        label,
                         if steered {
                             "skipped"
                         } else if error {
@@ -1136,7 +1136,7 @@ impl Harness {
                 let context=if administrative {crate::ui::ReplyContext{reply_to:None,activity:format!("schedule:{id}")}}else{self.store.reply_context(&owner)?};
                 self.store.bind_context(&id,&context)?;
                 self.store.add_job(&Job{id:id.clone(),channel,user,kind:kind.into(),payload,due,interval})?;
-                self.store.agent_activity_event(&owner,&context,channel,&format!("job:{id}:queued"),&format!("◷ {} / {kind} saved [{}]",self.store.agent_label(&owner)?,crate::ui::short_id(&id)),"event",Duration::ZERO)?;
+                self.store.agent_activity_event(&owner,&context,channel,&format!("job:{id}:queued"),&format!("◷ {kind} saved [{}]",crate::ui::short_id(&id)),"event",Duration::ZERO)?;
                 Ok(json!({"id":id,"due":due,"interval_seconds":interval}))
             }
             _=>bail!("unknown job action"),
@@ -2573,8 +2573,8 @@ mod tests {
         let mut timeline = drain(&h);
         assert_eq!(timeline.len(), 1);
         assert!(timeline[0].text.contains("↗ spawned Delayed Greeter"));
-        assert!(!timeline[0].text.contains(" / shell"));
-        assert!(!timeline[0].text.contains(" / write"));
+        assert!(!timeline[0].text.contains("shell ·"));
+        assert!(!timeline[0].text.contains("write ·"));
         tokio::time::timeout(Duration::from_secs(2), async {
             while h.store.agent_events(id).unwrap().is_empty() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -2606,8 +2606,8 @@ mod tests {
                 .count(),
             1
         );
-        assert!(!visible.contains(" / shell"));
-        assert!(!visible.contains(" / write"));
+        assert!(!visible.contains("shell ·"));
+        assert!(!visible.contains("write ·"));
         assert!(!visible.contains("shell completion"));
         assert!(!visible.contains("Private worker progress"));
         let trace = Memory::open(
@@ -2647,11 +2647,8 @@ mod tests {
         mock.release.notify_one();
         h.clone().run_agent(run).await.unwrap();
         let timeline = drain(&h);
-        assert!(
-            timeline
-                .iter()
-                .any(|m| m.text.contains("✓ Coordinator / write"))
-        );
+        assert!(timeline.iter().any(|m| m.text.contains("✓ write ·")));
+        assert!(timeline.iter().all(|m| !m.text.contains("Coordinator /")));
         assert!(timeline.iter().any(|m| m.text.contains("Done")));
         server.abort();
     }

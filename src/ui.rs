@@ -783,14 +783,7 @@ mod tests {
             .unwrap();
         store.agent_phase("scout", true, "Thinking").unwrap();
         store
-            .activity_event(
-                &context,
-                1,
-                "call",
-                "Docs Scout / web_search",
-                "running",
-                Duration::ZERO,
-            )
+            .activity_event(&context, 1, "call", "web_search", "running", Duration::ZERO)
             .unwrap();
         let first = store.next_outbound().unwrap().unwrap();
         assert_eq!(first.reply_to, None);
@@ -802,7 +795,7 @@ mod tests {
                 &context,
                 1,
                 "call",
-                "Docs Scout / web_search",
+                "web_search",
                 "done",
                 Duration::from_millis(1500),
             )
@@ -822,13 +815,13 @@ mod tests {
         let revised = store.next_outbound().unwrap().unwrap();
         assert_eq!(first.id, revised.id);
         assert_eq!(revised.receipt.as_deref(), Some("discord-receipt"));
-        assert!(revised.text.contains("✓ Docs Scout / web_search · 1.5s"));
+        assert!(revised.text.contains("✓ web_search · 1.5s"));
         assert!(
             revised
                 .text
                 .contains("↙ incoming agent message from Docs Scout")
         );
-        assert!(!revised.text.contains("◌ Docs Scout / web_search"));
+        assert!(!revised.text.contains("◌ web_search"));
     }
     #[test]
     fn unicode_fenced_pages_and_embeds_stay_within_discord_limits() {
@@ -991,26 +984,12 @@ mod tests {
             .unwrap();
         store.input_state("99", "running").unwrap();
         store
-            .activity_event(
-                &context,
-                1,
-                "call",
-                "Coordinator / spawn",
-                "running",
-                Duration::ZERO,
-            )
+            .activity_event(&context, 1, "call", "spawn", "running", Duration::ZERO)
             .unwrap();
         let activity = store.next_outbound().unwrap().unwrap();
         store.delivered(&activity, "activity-receipt").unwrap();
         store
-            .activity_event(
-                &context,
-                1,
-                "call",
-                "Coordinator / spawn",
-                "done",
-                Duration::from_secs(1),
-            )
+            .activity_event(&context, 1, "call", "spawn", "done", Duration::from_secs(1))
             .unwrap();
         store.retry_outbound(&activity.id).unwrap();
         assert!(
