@@ -437,6 +437,42 @@ impl Discord {
         Ok(())
     }
 
+    pub async fn delivery_reaction(
+        &self,
+        channel: u64,
+        message: u64,
+        phase: i64,
+        _previous: i64,
+    ) -> Result<()> {
+        let emoji = |phase| match phase {
+            0 => Some("📥"),
+            1 => Some("🧠"),
+            2 => Some("✅"),
+            _ => None,
+        };
+        let next = emoji(phase).context("invalid reaction phase")?;
+        self.request(
+            Method::PUT,
+            &format!("/channels/{channel}/messages/{message}/reactions/{next}/@me"),
+            None,
+        )
+        .await?;
+        // Reconcile earlier phases too: a crash after PUT but before the
+        // receipt commit must not leave a stale brain beside the final tick.
+        for prior in 0..phase {
+            self.request(
+                Method::DELETE,
+                &format!(
+                    "/channels/{channel}/messages/{message}/reactions/{}/@me",
+                    emoji(prior).unwrap()
+                ),
+                None,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     pub async fn typing(&self, channel: u64) -> Result<()> {
         let response = self
             .client
@@ -1466,13 +1502,7 @@ mod tests {
             .await
             .unwrap();
         discord
-            .activity(
-                1,
-                "```text\n✓ shell · 7.0s\n```",
-                "activity",
-                Some(99),
-                None,
-            )
+            .activity(1, "```text\n✓ shell · 7.0s\n```", "activity", None, None)
             .await
             .unwrap();
         discord
@@ -1493,10 +1523,55 @@ mod tests {
         assert_eq!(bodies[0]["message_reference"]["fail_if_not_exists"], false);
         assert_eq!(bodies[0]["allowed_mentions"]["replied_user"], true);
         assert_eq!(bodies[0]["content"], "Finished");
+        assert!(bodies[1].get("message_reference").is_none());
         assert_eq!(bodies[1]["allowed_mentions"]["replied_user"], false);
         assert_eq!(bodies[2]["content"], "");
         assert_eq!(bodies[2]["embeds"][0]["title"], "Context");
         assert_eq!(bodies[2]["allowed_mentions"]["parse"], json!([]));
+        server.abort();
+    }
+    #[tokio::test]
+    async fn input_reactions_replace_only_our_prior_phases_and_reconcile_partial_delivery() {
+        use axum::{
+            Router,
+            extract::{OriginalUri, State},
+            http::{Method, StatusCode},
+            routing::any,
+        };
+        type Captured = Arc<tokio::sync::Mutex<Vec<(Method, String)>>>;
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::<(Method, String)>::new()));
+        let app = Router::new()
+            .route(
+                "/channels/1/messages/100/reactions/{emoji}/@me",
+                any(
+                    |State(captured): State<Captured>,
+                     method: Method,
+                     OriginalUri(uri): OriginalUri| async move {
+                        captured.lock().await.push((method, uri.to_string()));
+                        StatusCode::NO_CONTENT
+                    },
+                ),
+            )
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut discord = Discord::new("private".into(), 1, vec![2]).unwrap();
+        discord.api = format!("http://{address}");
+        discord.delivery_reaction(1, 100, 0, -1).await.unwrap();
+        discord.delivery_reaction(1, 100, 1, 0).await.unwrap();
+        // Stored previous=0 simulates an unacknowledged brain PUT at a crash.
+        discord.delivery_reaction(1, 100, 2, 0).await.unwrap();
+        let requests = captured.lock().await;
+        assert_eq!(requests.len(), 6);
+        assert_eq!(requests[0].0, Method::PUT);
+        assert!(requests[0].1.contains("%F0%9F%93%A5"));
+        assert!(requests[1].1.contains("%F0%9F%A7%A0"));
+        assert_eq!(requests[2].0, Method::DELETE);
+        assert!(requests[3].1.contains("%E2%9C%85"));
+        assert_eq!(requests[4].0, Method::DELETE);
+        assert_eq!(requests[5].0, Method::DELETE);
+        assert!(requests.iter().all(|r| r.1.ends_with("/@me")));
         server.abort();
     }
     #[tokio::test]

@@ -24,6 +24,59 @@ impl AuthConfig {
             .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".codex")))
             .context("set auth.codex_home or CODEX_HOME for a Codex login")
     }
+    pub fn reasoning_for_model(&self, model: &str, requested: &str) -> Result<String> {
+        crate::config::validate_reasoning(requested)?;
+        let Some(slug) = model.strip_prefix("codex/") else {
+            return Ok(requested.into());
+        };
+        let metadata = (|| -> Option<Value> {
+            let file = std::fs::File::open(self.home().ok()?.join("models_cache.json")).ok()?;
+            let mut bytes = Vec::new();
+            file.take(4_194_305).read_to_end(&mut bytes).ok()?;
+            if bytes.len() > 4_194_304 {
+                return None;
+            }
+            let value: Value = serde_json::from_slice(&bytes).ok()?;
+            value["models"]
+                .as_array()?
+                .iter()
+                .find(|m| m["slug"] == slug)
+                .cloned()
+        })();
+        let levels = metadata
+            .as_ref()
+            .and_then(|m| m["supported_reasoning_levels"].as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v["effort"].as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if levels.is_empty() {
+            return Ok(if requested == "minimal" {
+                "low"
+            } else {
+                requested
+            }
+            .into());
+        }
+        if levels.contains(&requested) {
+            return Ok(requested.into());
+        }
+        if requested == "minimal" {
+            return Ok(levels
+                .iter()
+                .find(|v| **v == "low")
+                .copied()
+                .unwrap_or(levels[0])
+                .into());
+        }
+        bail!(
+            "unsupported reasoning effort for {model}; supported: {}",
+            levels.join(", ")
+        )
+    }
     pub fn cli(&self) -> PathBuf {
         self.codex_cli
             .clone()
@@ -138,6 +191,9 @@ pub(crate) struct CodexAuth {
     refresh: Arc<Mutex<()>>,
 }
 impl CodexAuth {
+    pub fn reasoning_for_model(&self, model: &str, requested: &str) -> Result<String> {
+        self.config.reasoning_for_model(model, requested)
+    }
     pub fn new(config: AuthConfig) -> Self {
         Self {
             config,
@@ -216,6 +272,40 @@ async fn rpc_result(output: &mut BufReader<tokio::process::ChildStdout>, id: u64
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn resolves_reasoning_against_local_model_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = AuthConfig {
+            codex_home: Some(dir.path().into()),
+            codex_cli: None,
+        };
+        // Missing metadata still avoids the unsupported Codex minimal effort.
+        assert_eq!(
+            auth.reasoning_for_model("codex/test", "minimal").unwrap(),
+            "low"
+        );
+        std::fs::write(dir.path().join("models_cache.json"),json!({"models":[{"slug":"test","supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"}]}]}).to_string()).unwrap();
+        assert_eq!(
+            auth.reasoning_for_model("codex/test", "minimal").unwrap(),
+            "low"
+        );
+        assert_eq!(
+            auth.reasoning_for_model("codex/test", "high").unwrap(),
+            "high"
+        );
+        assert!(
+            auth.reasoning_for_model("codex/test", "ultra")
+                .unwrap_err()
+                .to_string()
+                .contains("low, medium, high")
+        );
+        assert_eq!(
+            auth.reasoning_for_model("anthropic/test", "minimal")
+                .unwrap(),
+            "minimal"
+        );
+        assert!(auth.reasoning_for_model("codex/test", "invented").is_err());
+    }
     #[test]
     fn reads_canonical_cache_and_jwt_account_without_exposing_refresh_token() {
         let directory = tempfile::tempdir().unwrap();
