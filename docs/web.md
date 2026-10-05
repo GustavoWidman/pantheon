@@ -1,6 +1,6 @@
 # Web search and fetch
 
-Workers have `web_search` and `web_fetch`; the coordinator root delegates research through `spawn`/`tell`. Setting `agent.coordinator_root=false` also exposes these tools on the root. Calls use the usual durable tool intents/results and cancellation path. Sources are untrusted data; workers are instructed to cite clickable URLs and ignore instructions embedded in search results or pages.
+Root and workers have `web_search` and `web_fetch` by default. The root can look up sources directly or delegate substantial independent research through `spawn`/`tell`. Setting `agent.coordinator_root=true` restricts the root to coordination and removes its execution tools, including search/fetch. Calls use the usual durable tool intents/results and cancellation path. Sources are untrusted data; all agents are instructed to cite clickable URLs and ignore instructions embedded in search results or pages.
 
 ```json
 {"query":"Rust Instant monotonic clock documentation","max_results":5,"domains":["doc.rust-lang.org"]}
@@ -8,9 +8,9 @@ Workers have `web_search` and `web_fetch`; the coordinator root delegates resear
 
 `web_search` runs an isolated request containing only the provider's hosted search tool. It returns a concise answer, deduplicated source URLs and provider usage, without persisting reasoning or the helper's native transcript. `max_results` defaults to 5 and accepts 1–10; optional `domains` restricts search to host names. Calls that do not actually search, return an unexpected client tool, fail, or exceed the continuation budget produce an error rather than an offline guess.
 
-By default the search model is the worker's current model. `web.search_model` can instead select a dedicated model, such as `codex/gpt-5.6-sol`. This lets Claude workers use Codex subscription-backed search. `codex/` uses a ChatGPT login; `openai/` uses an API key; `anthropic/` uses its API key and native Messages web search, including bounded `pause_turn` continuation. This configuration determines the billing source. A subscription login is not a Platform API key, and quotas/model/tool availability remain account-specific. Search has no local result cache: freshness-sensitive queries really reach the selected backend.
+By default the search model is the calling agent's current model. `web.search_model` can instead select a dedicated model, such as `codex/gpt-5.6-sol`. This lets Claude agents use Codex subscription-backed search. `codex/` uses a ChatGPT login; `openai/` uses an API key; `anthropic/` uses its API key and native Messages web search, including bounded `pause_turn` continuation. This configuration determines the billing source. A subscription login is not a Platform API key, and quotas/model/tool availability remain account-specific. Search has no local result cache: freshness-sensitive queries really reach the selected backend.
 
-Pantheon's `web_search` remains a local tool in the worker loop, so it has a durable result and normal delivery behavior. On the Codex wire it is named `pantheon_web_search` to avoid collision with OpenAI's native hosted tool; the harness translates the call name for execution while retaining the native output item for replay.
+Pantheon's `web_search` remains a local tool in the calling agent's loop, so it has a durable result and normal delivery behavior. On the Codex wire it is named `pantheon_web_search` to avoid collision with OpenAI's native hosted tool; the harness translates the call name for execution while retaining the native output item for replay.
 
 ```json
 {"url":"https://doc.rust-lang.org/std/time/struct.Instant.html","max_chars":20000,"refresh":true}
