@@ -10,6 +10,8 @@ pub struct Config {
     pub instructions_file: Option<PathBuf>,
     pub discord: DiscordConfig,
     pub agent: AgentConfig,
+    pub auth: crate::auth::AuthConfig,
+    pub web: crate::web::WebConfig,
     pub browser: crate::browser::BrowserConfig,
 }
 #[derive(Clone, Deserialize, Serialize, Default)]
@@ -43,6 +45,8 @@ impl Default for Config {
             instructions_file: None,
             discord: DiscordConfig::default(),
             agent: AgentConfig::default(),
+            auth: Default::default(),
+            web: Default::default(),
             browser: Default::default(),
         }
     }
@@ -97,6 +101,8 @@ impl Config {
         crate::provider::model_parts(&config.agent.model)?;
         crate::provider::model_parts(&config.agent.compactor_model)?;
         validate_reasoning(&config.agent.reasoning)?;
+        config.auth.validate()?;
+        config.web.validate()?;
         Ok(config)
     }
     pub fn instructions(&self) -> Result<String> {

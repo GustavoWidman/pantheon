@@ -24,6 +24,7 @@ pub struct Harness {
     pub store: Store,
     pub discord: Arc<Discord>,
     provider: Provider,
+    web: crate::web::Web,
     browser: BrowserManager,
     channels: Mutex<HashMap<u64, Arc<Channel>>>,
     children: Mutex<HashMap<String, Child>>,
@@ -81,7 +82,9 @@ impl Harness {
         store.recover()?;
         let instructions = config.instructions()?;
         let h = Self {
-            provider: Provider::new(config.agent.request_timeout_seconds)?,
+            provider: Provider::new(config.agent.request_timeout_seconds)?
+                .with_auth(config.auth.clone()),
+            web: crate::web::Web::new(config.state_dir.join("web/cache"), config.web.clone())?,
             browser: BrowserManager::new(config.state_dir.join("browsers"), config.browser.clone()),
             capacity: Arc::new(Semaphore::new(config.agent.max_subagents)),
             shell_capacity: Arc::new(Semaphore::new(config.agent.max_shell_jobs)),
@@ -597,6 +600,56 @@ impl Harness {
             }
             "shell" => {
                 return self.shell_tool(run, tools::string(a, "command")?).await;
+            }
+            "web_fetch" => {
+                let max_chars = a
+                    .get("max_chars")
+                    .map(|_| tools::number(a, "max_chars"))
+                    .transpose()?
+                    .unwrap_or(20_000) as usize;
+                let refresh = a
+                    .get("refresh")
+                    .map(|v| v.as_bool().context("refresh must be boolean"))
+                    .transpose()?
+                    .unwrap_or(false);
+                tokio::select! {
+                    value = self.web.fetch(tools::string(a, "url")?, max_chars, refresh) => value?,
+                    _ = run.cancel.cancelled() => bail!("web fetch cancelled"),
+                }
+            }
+            "web_search" => {
+                let model = self
+                    .config
+                    .web
+                    .search_model
+                    .as_deref()
+                    .unwrap_or(&run.settings.0);
+                let limit = a
+                    .get("max_results")
+                    .map(|_| tools::number(a, "max_results"))
+                    .transpose()?
+                    .unwrap_or(5) as usize;
+                let domains = a
+                    .get("domains")
+                    .map(|v| {
+                        v.as_array()
+                            .context("domains must be an array")?
+                            .iter()
+                            .map(|v| {
+                                v.as_str()
+                                    .map(str::to_owned)
+                                    .context("domain must be a string")
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let value = tokio::select! {
+                    value = tokio::time::timeout(Duration::from_secs(self.config.web.search_timeout_seconds), self.provider.search(model, tools::string(a, "query")?, limit, &domains)) => value.context("web search timed out")??,
+                    _ = run.cancel.cancelled() => bail!("web search cancelled"),
+                };
+                self.store.usage(run.channel, &value["usage"])?;
+                value
             }
             "browser" => {
                 let parent = format!("channel:{}", run.channel);

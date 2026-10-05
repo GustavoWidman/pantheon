@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod browser;
 pub mod config;
 pub mod discord;
@@ -6,3 +7,4 @@ pub mod provider;
 pub mod runtime;
 pub mod store;
 pub mod tools;
+pub mod web;
