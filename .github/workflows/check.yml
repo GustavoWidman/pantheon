@@ -1,20 +1,37 @@
 name: checks
-on: [push, pull_request]
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]
+  workflow_call:
+permissions:
+  contents: read
 jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
+      - run: python3 -m unittest discover -s tests -p 'test_*.py'
+      - name: Validate metadata and conventional commits
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: python3 .github/scripts/version.py commits --base "$BASE_SHA" --head "$HEAD_SHA"
   nix:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v19
       - run: nix flake check --print-build-logs
+      - name: Exercise packaged browser sharing and private viewers
+        run: nix develop --command python3 tests/browser_smoke.py
