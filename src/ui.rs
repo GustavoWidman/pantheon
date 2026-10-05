@@ -149,7 +149,7 @@ impl Store {
     }
     pub fn refresh_activities(&self, channel: u64, settled: bool) -> Result<bool> {
         let db = self.db.lock().unwrap();
-        let mut stmt=db.prepare("SELECT s.activity FROM ui_sessions s WHERE channel=?1 AND (s.settled=0 OR s.activity=(SELECT activity FROM ui_contexts WHERE source=?2) OR EXISTS(SELECT 1 FROM ui_agents a WHERE a.activity=s.activity AND active=1) OR EXISTS(SELECT 1 FROM shell_runs r JOIN ui_contexts c ON c.source=r.id WHERE c.activity=s.activity AND r.state='running'))")?;
+        let mut stmt=db.prepare("SELECT s.activity FROM ui_sessions s WHERE channel=?1 AND (s.settled=0 OR s.activity=(SELECT activity FROM ui_contexts WHERE source=?2) OR EXISTS(SELECT 1 FROM ui_agents a WHERE a.activity=s.activity AND active=1) OR EXISTS(SELECT 1 FROM shell_runs r JOIN ui_contexts c ON c.source=r.id WHERE c.activity=s.activity AND r.state='running') OR EXISTS(SELECT 1 FROM agent_inbox i JOIN ui_contexts c ON c.source=i.id WHERE c.activity=s.activity AND i.state='queued'))")?;
         let activities = stmt
             .query_map(
                 params![channel.to_string(), format!("channel:{channel}")],
@@ -193,7 +193,7 @@ fn render_activity(db: &Connection, activity: &str) -> Result<bool> {
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let shells:i64=db.query_row("SELECT count(*) FROM shell_runs r JOIN ui_contexts c ON c.source=r.id WHERE c.activity=?1 AND r.state='running'",[activity],|r|r.get(0))?;
-    let pending:i64=db.query_row("SELECT count(*) FROM inbox i JOIN ui_contexts c ON c.source=i.id WHERE c.activity=?1 AND i.state='queued'",[activity],|r|r.get(0))?;
+    let pending:i64=db.query_row("SELECT (SELECT count(*) FROM inbox i JOIN ui_contexts c ON c.source=i.id WHERE c.activity=?1 AND i.state='queued')+(SELECT count(*) FROM agent_inbox i JOIN ui_contexts c ON c.source=i.id WHERE c.activity=?1 AND i.state='queued')",[activity],|r|r.get(0))?;
     let busy = !active.is_empty() || shells > 0 || pending > 0 || !settled;
     let status = if !active.is_empty() {
         "Working"
@@ -491,6 +491,46 @@ mod tests {
                 )
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn queued_worker_events_keep_status_busy_and_completion_quiet() {
+        use crate::store::Input;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db")).unwrap();
+        let context = ReplyContext::request("99");
+        store
+            .admit(&Input {
+                id: "99".into(),
+                channel: 1,
+                user: 2,
+                text: "work".into(),
+            })
+            .unwrap();
+        store.input_state("99", "running").unwrap();
+        store
+            .present_agent("worker", 1, &context, "Shell Runner", "codex/test")
+            .unwrap();
+        store.bind_context("completion", &context).unwrap();
+        store.db.lock().unwrap().execute("INSERT INTO agent_inbox(id,owner,channel,user,text,created) VALUES('completion','worker','1','2','shell complete',0)",[]).unwrap();
+        assert!(store.refresh_activities(1, true).unwrap());
+        let activity = store.next_outbound().unwrap().unwrap();
+        assert!(activity.text.contains("Processing incoming reports"));
+        store.sent(&activity.id, "receipt").unwrap();
+        assert!(
+            store
+                .complete_turn(
+                    &["99".into()],
+                    "ack",
+                    1,
+                    2,
+                    &["Waiting for worker report".into()]
+                )
+                .unwrap()
+        );
+        let ack = store.next_outbound().unwrap().unwrap();
+        assert_eq!(ack.reply_to, Some(99));
+        assert_eq!(ack.user, None);
     }
 
     #[test]

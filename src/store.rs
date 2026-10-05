@@ -162,7 +162,7 @@ impl Store {
         if queued != 0 {
             return Ok(false);
         }
-        let background:i64=tx.query_row("SELECT (SELECT count(*) FROM tasks t JOIN ui_contexts c ON c.source=t.id WHERE c.activity=?1 AND t.state='running')+(SELECT count(*) FROM ui_agents a WHERE a.activity=?1 AND active=1 AND owner NOT LIKE 'channel:%')+(SELECT count(*) FROM shell_runs r JOIN ui_contexts c ON c.source=r.id WHERE c.activity=?1 AND r.state='running')",[context.as_ref().map(|(_,activity)|activity)],|row|row.get(0))?;
+        let background:i64=tx.query_row("SELECT (SELECT count(*) FROM tasks t JOIN ui_contexts c ON c.source=t.id WHERE c.activity=?1 AND t.state='running')+(SELECT count(*) FROM ui_agents a WHERE a.activity=?1 AND active=1 AND owner NOT LIKE 'channel:%')+(SELECT count(*) FROM shell_runs r JOIN ui_contexts c ON c.source=r.id WHERE c.activity=?1 AND r.state='running')+(SELECT count(*) FROM agent_inbox i JOIN ui_contexts c ON c.source=i.id WHERE c.activity=?1 AND i.state='queued')",[context.as_ref().map(|(_,activity)|activity)],|row|row.get(0))?;
         for (i, text) in chunks.iter().enumerate() {
             let id = format!("{id}:{i}");
             let hash = Sha256::digest(id.as_bytes());
