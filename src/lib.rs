@@ -6,6 +6,7 @@ pub mod config;
 pub mod discord;
 pub mod mcp;
 pub mod memory;
+pub mod models;
 pub mod provider;
 pub mod runtime;
 pub mod skills;

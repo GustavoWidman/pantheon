@@ -82,6 +82,7 @@ pub struct Discord {
     client: Client,
     api: String,
     ingress: Option<Ingress>,
+    pub models: Arc<crate::models::Catalog>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -214,6 +215,7 @@ impl Discord {
                 .build()?,
             api: API.into(),
             ingress: None,
+            models: Arc::default(),
         })
     }
 
@@ -718,7 +720,7 @@ impl Discord {
                             Some("MESSAGE_CREATE") => {
                                 prompt = self.prompt(&event["d"]);
                             }
-                            Some("INTERACTION_CREATE") if event["d"]["type"] == 2 => {
+                            Some("INTERACTION_CREATE") if event["d"]["type"] == 2 || event["d"]["type"] == 4 => {
                                     let discord = self.clone(); let data = event["d"].clone(); let tx = tx.clone(); let cancel = shutdown.clone();
                                     interactions.spawn(async move {
                                         tokio::select! {
@@ -797,6 +799,30 @@ impl Discord {
         let user =
             snowflake(&event["member"]["user"]["id"]).or_else(|| snowflake(&event["user"]["id"]));
         let authorized = user.is_some_and(|user| self.allowed_users.contains(&user));
+        if event["type"] == 4 {
+            let choices = if authorized {
+                match event["data"]["name"].as_str() {
+                    Some("model") => self.models.choices(&event["data"]["options"]),
+                    Some("reasoning") => snowflake(&event["channel_id"])
+                        .map(|c| self.models.effort_choices(c, &event["data"]["options"]))
+                        .unwrap_or_default(),
+                    _ => vec![],
+                }
+            } else {
+                vec![]
+            };
+            let result = self
+                .client
+                .post(format!("{}/interactions/{id}/{token}/callback", self.api))
+                .timeout(Duration::from_secs(2))
+                .json(&json!({"type":8,"data":{"choices":choices}}))
+                .send()
+                .await;
+            if !result.is_ok_and(|r| r.status().is_success()) {
+                tracing::warn!("Discord autocomplete callback failed");
+            }
+            return;
+        }
         if self
             .acknowledge_interaction(id, token, authorized)
             .await
@@ -869,6 +895,11 @@ fn truncate_utf16(text: &str, limit: usize) -> &str {
 fn string_option(name: &str, description: &str, required: bool) -> Value {
     json!({"type": 3, "name": name, "description": description, "required": required})
 }
+fn autocomplete_option(name: &str, description: &str) -> Value {
+    let mut option = string_option(name, description, false);
+    option["autocomplete"] = json!(true);
+    option
+}
 pub fn command_definitions() -> Value {
     let command = |name: &str, description: &str, options: Vec<Value>| json!({"type": 1, "name": name, "description": description, "options": options, "integration_types": [0], "contexts": [0,1]});
     let action = |choices: &[&str]| {
@@ -892,12 +923,22 @@ pub fn command_definitions() -> Value {
         command(
             "model",
             "Show or change this channel's model",
-            vec![string_option("id", "Model identifier", false)]
+            vec![
+                autocomplete_option("kind", "Chat agent or memory compactor (default: chat)"),
+                autocomplete_option("provider", "Available authenticated provider"),
+                autocomplete_option(
+                    "model",
+                    "Model ID, or default to clear this chat's override"
+                )
+            ]
         ),
         command(
             "reasoning",
             "Show or change reasoning effort",
-            vec![string_option("level", "Reasoning effort", false)]
+            vec![autocomplete_option(
+                "level",
+                "Efforts supported by this chat's model"
+            )]
         ),
         command(
             "stop",
@@ -1358,6 +1399,84 @@ mod tests {
         assert_eq!(captured.lock().await[1]["type"], 4);
         assert_eq!(captured.lock().await[1]["data"]["flags"], 64);
         server.abort();
+    }
+    #[tokio::test]
+    async fn autocomplete_uses_type_eight_and_never_executes_a_command() {
+        use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let app = Router::new()
+            .route(
+                "/interactions/123/token/callback",
+                post(
+                    |State(c): State<Arc<tokio::sync::Mutex<Vec<Value>>>>,
+                     Json(body): Json<Value>| async move {
+                        c.lock().await.push(body);
+                        StatusCode::NO_CONTENT
+                    },
+                ),
+            )
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut discord = Discord::new("test".into(), 1, vec![42]).unwrap();
+        discord.api = format!("http://{address}");
+        let mut model = crate::models::Model::plain("gpt-test");
+        model.efforts = vec!["low".into(), "high".into()];
+        discord.models.replace("codex", vec![model]);
+        discord.models.set_chat_model(1, "codex/gpt-test");
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut event = json!({"type":4,"id":"123","token":"token","channel_id":"1","user":{"id":"42"},"data":{"name":"model","options":[{"name":"provider","value":"codex"},{"name":"model","value":"gpt","focused":true}]}});
+        discord.interaction(event.clone(), tx.clone()).await;
+        assert_eq!(
+            captured.lock().await[0],
+            json!({"type":8,"data":{"choices":[{"name":"gpt-test · codex","value":"codex/gpt-test"}]}})
+        );
+        event["data"] =
+            json!({"name":"reasoning","options":[{"name":"level","value":"","focused":true}]});
+        discord.interaction(event.clone(), tx.clone()).await;
+        assert_eq!(
+            captured.lock().await[1]["data"]["choices"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        event["user"]["id"] = json!("666");
+        discord.interaction(event, tx).await;
+        assert_eq!(
+            captured.lock().await[2],
+            json!({"type":8,"data":{"choices":[]}})
+        );
+        assert!(rx.try_recv().is_err());
+        server.abort();
+    }
+    #[test]
+    fn model_and_reasoning_options_use_autocomplete_without_static_choices() {
+        let commands = command_definitions();
+        for name in ["model", "reasoning"] {
+            let command = commands
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"] == name)
+                .unwrap();
+            for option in command["options"].as_array().unwrap() {
+                assert_eq!(option["autocomplete"], true);
+                assert!(option.get("choices").is_none());
+            }
+            if name == "model" {
+                assert_eq!(
+                    command["options"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|o| o["name"].as_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    vec!["kind", "provider", "model"]
+                );
+            }
+        }
     }
     #[tokio::test]
     async fn rate_limits_retry_and_permanent_errors_hide_bodies() {

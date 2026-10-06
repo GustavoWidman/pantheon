@@ -9,6 +9,7 @@ use std::time::Duration;
 pub struct Provider {
     http: reqwest::Client,
     codex: CodexAuth,
+    catalog: std::sync::Arc<crate::models::Catalog>,
     #[cfg(test)]
     endpoint: Option<String>,
 }
@@ -44,6 +45,7 @@ impl Provider {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             codex: CodexAuth::new(AuthConfig::default()),
+            catalog: std::sync::Arc::default(),
             #[cfg(test)]
             endpoint: None,
         })
@@ -53,12 +55,192 @@ impl Provider {
         Self {
             http: reqwest::Client::new(),
             codex: CodexAuth::new(AuthConfig::default()),
+            catalog: std::sync::Arc::default(),
             endpoint: Some(endpoint),
         }
     }
     pub fn with_auth(mut self, config: AuthConfig) -> Self {
         self.codex = CodexAuth::new(config);
         self
+    }
+    pub fn with_catalog(mut self, catalog: std::sync::Arc<crate::models::Catalog>) -> Self {
+        self.catalog = catalog;
+        self
+    }
+    pub(crate) async fn list_models(&self, vendor: &str) -> Result<Vec<crate::models::Model>> {
+        use crate::models::Model;
+        if vendor == "codex" {
+            let mut credentials = self.codex.credentials(None).await?;
+            for attempt in 0..2 {
+                #[cfg(test)]
+                let endpoint = self
+                    .endpoint
+                    .as_deref()
+                    .unwrap_or("https://chatgpt.com/backend-api/codex/models");
+                #[cfg(not(test))]
+                let endpoint = "https://chatgpt.com/backend-api/codex/models";
+                // Native catalog compatibility is independent of the bundled auth helper.
+                let mut request = self
+                    .http
+                    .get(endpoint)
+                    .query(&[("client_version", "0.160.0")])
+                    .timeout(Duration::from_secs(10))
+                    .bearer_auth(&credentials.access)
+                    .header("ChatGPT-Account-ID", &credentials.account)
+                    .header("originator", "pantheon");
+                if let Some(residency) = &credentials.residency {
+                    request = request.header("x-openai-internal-codex-residency", residency);
+                }
+                let response = request
+                    .send()
+                    .await
+                    .context("Codex model listing transport failed")?;
+                if response.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+                    credentials = self.codex.credentials(Some(&credentials.access)).await?;
+                    continue;
+                }
+                ensure!(
+                    response.status().is_success(),
+                    "Codex model listing returned HTTP {}",
+                    response.status()
+                );
+                let value = read_response(response, false).await?;
+                return Ok(value["models"]
+                    .as_array()
+                    .context("Codex catalog has no model list")?
+                    .iter()
+                    .filter(|m| m["visibility"] == "list")
+                    .filter_map(|m| {
+                        Some(Model {
+                            id: m["slug"].as_str()?.into(),
+                            name: m["display_name"]
+                                .as_str()
+                                .unwrap_or(m["slug"].as_str()?)
+                                .into(),
+                            efforts: m["supported_reasoning_levels"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|e| e["effort"].as_str().map(str::to_owned))
+                                .collect(),
+                            default_effort: m["default_reasoning_level"]
+                                .as_str()
+                                .map(str::to_owned),
+                            adaptive_thinking: false,
+                            source: "Codex /models".into(),
+                            observed_at: Some(crate::store::now()),
+                        })
+                    })
+                    .collect());
+            }
+            unreachable!();
+        }
+        ensure!(
+            ["openai", "anthropic"].contains(&vendor),
+            "Unsupported model catalog provider"
+        );
+        #[cfg(test)]
+        let key = if self.endpoint.is_some() {
+            "mock-key".into()
+        } else {
+            std::env::var(if vendor == "openai" {
+                "OPENAI_API_KEY"
+            } else {
+                "ANTHROPIC_API_KEY"
+            })?
+        };
+        #[cfg(not(test))]
+        let key = std::env::var(if vendor == "openai" {
+            "OPENAI_API_KEY"
+        } else {
+            "ANTHROPIC_API_KEY"
+        })?;
+        #[cfg(test)]
+        let endpoint = self.endpoint.as_deref().unwrap_or(if vendor == "openai" {
+            "https://api.openai.com/v1/models"
+        } else {
+            "https://api.anthropic.com/v1/models"
+        });
+        #[cfg(not(test))]
+        let endpoint = if vendor == "openai" {
+            "https://api.openai.com/v1/models"
+        } else {
+            "https://api.anthropic.com/v1/models"
+        };
+        let mut models = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..20 {
+            let request = self.http.get(endpoint).timeout(Duration::from_secs(10));
+            let mut request = if vendor == "openai" {
+                request.bearer_auth(&key)
+            } else {
+                request
+                    .header("x-api-key", &key)
+                    .header("anthropic-version", "2023-06-01")
+                    .query(&[("limit", "1000")])
+            };
+            if let Some(cursor) = &cursor {
+                request = request.query(&[("after_id", cursor)]);
+            }
+            let response = request
+                .send()
+                .await
+                .context("model listing transport failed")?;
+            ensure!(
+                response.status().is_success(),
+                "{vendor} model listing returned HTTP {}",
+                response.status()
+            );
+            let value = read_response(response, false).await?;
+            let data = value["data"]
+                .as_array()
+                .context("Provider catalog has no model list")?;
+            for m in data {
+                if let Some(id) = m["id"].as_str() {
+                    // The OpenAI listing includes image, audio and embedding-only endpoints.
+                    if vendor == "openai" && !text_model(id) {
+                        continue;
+                    }
+                    let mut efforts: Vec<String> = m["capabilities"]["effort"]
+                        .as_object()
+                        .map(|e| {
+                            e.iter()
+                                .filter(|(_, cap)| cap["supported"] == true)
+                                .map(|(name, _)| name.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let adaptive_thinking =
+                        m["capabilities"]["thinking"]["types"]["adaptive"]["supported"] == true;
+                    if !efforts.is_empty() {
+                        efforts.insert(0, "none".into());
+                    }
+                    models.push(Model {
+                        id: id.into(),
+                        name: m["display_name"].as_str().unwrap_or(id).into(),
+                        efforts,
+                        default_effort: None,
+                        adaptive_thinking,
+                        source: format!("{vendor} /v1/models"),
+                        observed_at: Some(crate::store::now()),
+                    });
+                }
+            }
+            if value["has_more"] != true {
+                return Ok(models);
+            }
+            let next = value["last_id"]
+                .as_str()
+                .context("Provider model pagination has no cursor")?
+                .to_owned();
+            ensure!(
+                seen.insert(next.clone()),
+                "Provider model pagination repeated a cursor"
+            );
+            cursor = Some(next);
+        }
+        bail!("Provider model catalog exceeded pagination limit")
     }
     pub fn start(vendor: &str, view: &str, text: &str) -> Vec<Value> {
         let pieces = cache_chunks(view);
@@ -231,8 +413,31 @@ impl Provider {
         submitted: Option<&(dyn Fn() -> Result<()> + Sync)>,
     ) -> Result<Response> {
         let (vendor, _) = model_parts(model)?;
-        let effective = self.codex.reasoning_for_model(model, reasoning)?;
-        let body = Self::request_body(model, &effective, system, history, tools)?;
+        let effective = match self.catalog.advertised_effort(model, reasoning)? {
+            Some(level) => level,
+            None => self.codex.reasoning_for_model(model, reasoning)?,
+        };
+        self.catalog.validate_effort(model, &effective)?;
+        if vendor == "anthropic" && ["max", "ultra"].contains(&effective.as_str()) {
+            ensure!(
+                self.catalog
+                    .metadata(model)
+                    .is_some_and(|m| m.efforts.contains(&effective)),
+                "Native effort support is not advertised for {model}; select a known supported level"
+            );
+        }
+        let mut body = Self::request_body(model, &effective, system, history, tools)?;
+        if model.starts_with("anthropic/")
+            && effective != "none"
+            && let Some(metadata) = self.catalog.metadata(model)
+        {
+            if metadata.adaptive_thinking {
+                body["thinking"] = json!({"type":"adaptive"});
+            }
+            if !metadata.efforts.is_empty() {
+                body["output_config"] = json!({"effort":effective});
+            }
+        }
         let value = self.send_body_observed(model, &body, submitted).await?;
         let mut response = Self::parse(vendor, value)?;
         if model.starts_with("codex/") {
@@ -560,6 +765,29 @@ impl Provider {
         })
     }
 }
+
+fn text_model(id: &str) -> bool {
+    let name = id.to_lowercase();
+    (name.starts_with("gpt-")
+        || name.starts_with("chatgpt-")
+        || name.starts_with("codex-")
+        || name.starts_with("ft:gpt-")
+        || name.starts_with("o1")
+        || name.starts_with("o3")
+        || name.starts_with("o4"))
+        && ![
+            "audio",
+            "realtime",
+            "transcribe",
+            "tts",
+            "image",
+            "embedding",
+            "moderation",
+            "search-api",
+        ]
+        .iter()
+        .any(|s| name.contains(s))
+}
 fn collect_sources(
     value: &Value,
     out: &mut Vec<Value>,
@@ -750,6 +978,101 @@ impl SseDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn native_codex_catalog_uses_account_auth_and_preserves_the_cli_cache() {
+        use axum::{Json, Router, extract::Query, http::HeaderMap, routing::get};
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("auth.json"),
+            json!({"tokens":{"access_token":"private-test-token","account_id":"test-account"}})
+                .to_string(),
+        )
+        .unwrap();
+        let cache =
+            json!({"models":[{"slug":"visible","supported_reasoning_levels":[{"effort":"low"}]}]})
+                .to_string();
+        std::fs::write(d.path().join("models_cache.json"), &cache).unwrap();
+        let app=Router::new().route("/models",get(|headers:HeaderMap,Query(query):Query<std::collections::HashMap<String,String>>|async move {
+            assert_eq!(headers["authorization"],"Bearer private-test-token");assert_eq!(headers["chatgpt-account-id"],"test-account");assert_eq!(query["client_version"],"0.160.0");
+            Json(json!({"models":[{"slug":"visible","visibility":"list","supported_reasoning_levels":[{"effort":"low"},{"effort":"max"}],"default_reasoning_level":"low"},{"slug":"hidden","visibility":"hide"}]}))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let auth = AuthConfig {
+            codex_home: Some(d.path().into()),
+            codex_cli: None,
+        };
+        let models = Provider::mock(format!("http://{address}/models"))
+            .with_auth(auth.clone())
+            .list_models("codex")
+            .await
+            .unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].efforts, vec!["low", "max"]);
+        let catalog = crate::models::Catalog::default();
+        catalog.replace("codex", models);
+        assert_eq!(
+            catalog.advertised_effort("codex/visible", "max").unwrap(),
+            Some("max".into())
+        );
+        assert!(auth.reasoning_for_model("codex/visible", "max").is_err());
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("models_cache.json")).unwrap(),
+            cache
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn api_catalogs_filter_non_text_models_paginate_and_apply_advertised_efforts() {
+        use axum::{
+            Json, Router,
+            extract::Query,
+            http::{HeaderMap, StatusCode},
+            routing::get,
+        };
+        let app=Router::new().route("/models",get(|headers:HeaderMap,Query(query):Query<std::collections::HashMap<String,String>>|async move {
+            if headers.contains_key("x-api-key") {
+                assert_eq!(headers["anthropic-version"],"2023-06-01");
+                if query.contains_key("after_id") { assert_eq!(query["after_id"],"first");return Json(json!({"data":[{"id":"second"}],"has_more":false})); }
+                Json(json!({"data":[{"id":"first","capabilities":{"effort":{"low":{"supported":true},"medium":{"supported":true},"max":{"supported":false}},"thinking":{"types":{"adaptive":{"supported":true}}}}}],"last_id":"first","has_more":true}))
+            } else {
+                assert_eq!(headers["authorization"],"Bearer mock-key");
+                Json(json!({"data":[{"id":"gpt-test"},{"id":"gpt-image-test"},{"id":"text-embedding-test"},{"id":"gpt-audio-test"}]}))
+            }
+        }).post(|Json(body):Json<Value>|async move {
+            assert_eq!(body["thinking"],json!({"type":"adaptive"}));
+            assert_eq!(body["output_config"]["effort"],"medium");
+            Json(json!({"stop_reason":"end_turn","content":[{"type":"text","text":"ok"}]}))
+        })).route("/error",get(||async {(StatusCode::UNAUTHORIZED,"private-key-echo")}));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = Provider::mock(format!("http://{address}/models"));
+        let openai = provider.list_models("openai").await.unwrap();
+        assert_eq!(openai.len(), 1);
+        assert_eq!(openai[0].id, "gpt-test");
+        assert!(openai[0].efforts.is_empty());
+        let anthropic = provider.list_models("anthropic").await.unwrap();
+        assert_eq!(anthropic.len(), 2);
+        assert_eq!(anthropic[0].efforts, vec!["none", "low", "medium"]);
+        assert!(anthropic[0].adaptive_thinking);
+        let catalog = std::sync::Arc::new(crate::models::Catalog::default());
+        catalog.replace("anthropic", anthropic);
+        provider
+            .with_catalog(catalog)
+            .step("anthropic/first", "medium", "fixed", &[], &[])
+            .await
+            .unwrap();
+        let error = Provider::mock(format!("http://{address}/error"))
+            .list_models("openai")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("401"));
+        assert!(!error.contains("private-key-echo"));
+        server.abort();
+    }
     #[test]
     fn codex_preserves_transcript_but_uses_subscription_wire_contract() {
         let history = vec![

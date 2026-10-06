@@ -86,6 +86,7 @@ impl Store {
             [now()],
         )?;
         db.execute("INSERT OR IGNORE INTO coordinator_lifecycle(channel,last_active) SELECT channel,?1 FROM ui_agents WHERE owner LIKE 'channel:%'",[now()])?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS compactor_settings(channel TEXT PRIMARY KEY,model TEXT NOT NULL);")?;
         Ok(Self { db: Mutex::new(db) })
     }
     pub fn admit(&self, input: &Input) -> Result<bool> {
@@ -308,6 +309,42 @@ impl Store {
     }
     pub fn set_settings(&self, channel: u64, model: &str, reasoning: &str) -> Result<()> {
         self.db.lock().unwrap().execute("INSERT INTO settings(channel,model,reasoning) VALUES(?1,?2,?3) ON CONFLICT(channel) DO UPDATE SET model=excluded.model,reasoning=excluded.reasoning",params![channel.to_string(),model,reasoning])?;
+        Ok(())
+    }
+    pub fn chat_models(&self) -> Result<Vec<(u64, String)>> {
+        Ok(self
+            .db
+            .lock()
+            .unwrap()
+            .prepare("SELECT channel,model FROM settings")?
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?.parse().unwrap_or(0), r.get(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+    pub fn compactor_model(&self, channel: u64, default: &str) -> Result<String> {
+        Ok(self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT model FROM compactor_settings WHERE channel=?1",
+                [channel.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| default.into()))
+    }
+    pub fn set_compactor_model(&self, channel: u64, model: Option<&str>) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        if let Some(model) = model {
+            db.execute("INSERT INTO compactor_settings(channel,model) VALUES(?1,?2) ON CONFLICT(channel) DO UPDATE SET model=excluded.model",params![channel.to_string(),model])?;
+        } else {
+            db.execute(
+                "DELETE FROM compactor_settings WHERE channel=?1",
+                [channel.to_string()],
+            )?;
+        }
         Ok(())
     }
     pub fn usage(&self, channel: u64, model: &str, usage: &Value) -> Result<()> {

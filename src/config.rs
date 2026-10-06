@@ -134,8 +134,11 @@ impl Config {
 }
 pub fn validate_reasoning(s: &str) -> Result<()> {
     ensure!(
-        ["none", "minimal", "low", "medium", "high", "xhigh"].contains(&s),
-        "reasoning must be none, minimal, low, medium, high or xhigh"
+        [
+            "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"
+        ]
+        .contains(&s),
+        "reasoning must be none, minimal, low, medium, high, xhigh, max or ultra"
     );
     Ok(())
 }

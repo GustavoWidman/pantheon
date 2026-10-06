@@ -38,6 +38,7 @@ pub struct Harness {
     child_system: String,
 }
 struct Channel {
+    settings_lock: Mutex<()>,
     memory: Mutex<Memory>,
     changed: Notify,
     incoming: Notify,
@@ -103,6 +104,12 @@ pub fn system_prompt(
     )
 }
 impl Harness {
+    fn reasoning_for_model(&self, model: &str, requested: &str) -> Result<String> {
+        match self.discord.models.advertised_effort(model, requested)? {
+            Some(level) => Ok(level),
+            None => self.config.auth.reasoning_for_model(model, requested),
+        }
+    }
     pub fn new(
         config: Config,
         discord: Arc<Discord>,
@@ -112,12 +119,17 @@ impl Harness {
         std::fs::create_dir_all(&config.workspace)?;
         let store = Store::open(&config.state_dir.join("runtime.sqlite"))?;
         store.recover()?;
+        discord.models.initialize(&config);
+        for (channel, model) in store.chat_models()? {
+            discord.models.set_chat_model(channel, &model);
+        }
         let instructions = config.instructions()?;
         let skills = crate::skills::Skills::load(&config.skills)?;
         let skill_index = skills.index();
         let h = Self {
             provider: Provider::new(config.agent.request_timeout_seconds)?
-                .with_auth(config.auth.clone()),
+                .with_auth(config.auth.clone())
+                .with_catalog(discord.models.clone()),
             web: crate::web::Web::new(config.state_dir.join("web/cache"), config.web.clone())?,
             browser: BrowserManager::new(config.state_dir.join("browsers"), config.browser.clone()),
             mcp: crate::mcp::Mcp::new(&config.mcp, &config.workspace, &config.state_dir)?,
@@ -147,6 +159,7 @@ impl Harness {
             return Ok(c.clone());
         }
         let c = Arc::new(Channel {
+            settings_lock: Mutex::new(()),
             memory: Mutex::new(Memory::open(
                 self.config.state_dir.join("chats").join(id.to_string()),
                 self.config.agent.view_bytes,
@@ -166,7 +179,7 @@ impl Harness {
         let h = self.clone();
         let cc = c.clone();
         tokio::spawn(async move {
-            if let Err(e) = h.clone().compactor(cc).await {
+            if let Err(e) = h.clone().compactor(id, cc).await {
                 tracing::error!(channel=id,error=%e,"compactor stopped");
                 h.shutdown.cancel();
             }
@@ -182,6 +195,13 @@ impl Harness {
         Ok(c)
     }
     pub async fn run(self: Arc<Self>, mut inbound: mpsc::Receiver<Inbound>) -> Result<()> {
+        let h = self.clone();
+        let discovery = tokio::spawn(async move {
+            loop {
+                tokio::select! {_=h.shutdown.cancelled()=>break,_=h.discord.models.refresh(&h.config,&h.provider)=>{}}
+                tokio::select! {_=h.shutdown.cancelled()=>break,_=tokio::time::sleep(Duration::from_secs(300))=>{}}
+            }
+        });
         let h = self.clone();
         let out = tokio::spawn(async move {
             let result = h.outbox_worker().await;
@@ -232,6 +252,7 @@ impl Harness {
             }
         }
         self.shutdown.cancel();
+        discovery.abort();
         let channels = self.channels.lock().await;
         for c in channels.values() {
             if let Some(cancel) = c.cancel.lock().await.as_ref() {
@@ -301,19 +322,19 @@ impl Harness {
                 })
                 .collect::<Vec<_>>();
             let owner = format!("channel:{channel}");
+            let settings_guard = c.settings_lock.lock().await;
             let mut settings = self.store.settings(
                 channel,
                 &self.config.agent.model,
                 &self.config.agent.reasoning,
             )?;
             settings.1 = self
-                .config
-                .auth
                 .reasoning_for_model(&settings.0, &settings.1)
                 // Invalid saved settings become a visible turn error in Provider,
                 // rather than killing the channel actor before it admits inputs.
                 .unwrap_or(settings.1);
             self.store.set_settings(channel, &settings.0, &settings.1)?;
+            drop(settings_guard);
             self.store
                 .present_agent(&owner, channel, &context, "Coordinator", &settings.0)?;
             self.store.agent_phase(&owner, true, "Preparing context")?;
@@ -338,14 +359,6 @@ impl Harness {
                 continue;
             }
             let view = view.unwrap();
-            self.store.cache_turn(
-                channel,
-                &settings.0,
-                &settings.1,
-                &self.master_system,
-                &tools::definitions(false, self.config.agent.coordinator_root),
-                &view,
-            )?;
             let mut ids = vec![];
             let mut texts = vec![];
             for input in &queued {
@@ -359,6 +372,14 @@ impl Harness {
                 channel,
                 &self.config.agent.model,
                 &self.config.agent.reasoning,
+            )?;
+            self.store.cache_turn(
+                channel,
+                &settings.0,
+                &settings.1,
+                &self.master_system,
+                &tools::definitions(false, self.config.agent.coordinator_root),
+                &view,
             )?;
             let (vendor, _) = model_parts(&settings.0)?;
             let run = Run {
@@ -711,6 +732,12 @@ impl Harness {
         );
         let a = &call.arguments;
         let value = match call.name.as_str() {
+            "models" => self.discord.models.report(
+                a["provider"].as_str(),
+                a["query"].as_str().unwrap_or(""),
+                a["offset"].as_u64().unwrap_or(0) as usize,
+                a["limit"].as_u64().unwrap_or(25) as usize,
+            ),
             "skill" => self.skills.execute(a)?,
             "mcp" => {
                 self.mcp
@@ -851,8 +878,10 @@ impl Harness {
                     ensure!(!name.trim().is_empty() && name.encode_utf16().count()<=48 && name.chars().all(|c|c.is_alphanumeric() || matches!(c,' '|'-'|'_')),"agent names must be short words without formatting or control characters");
                     ensure!(names.insert(name.to_lowercase()),"agent names must be unique within a spawn batch");
                     let model=value["model"].as_str().unwrap_or(&run.settings.0).to_owned();
-                    let requested=value["reasoning"].as_str().unwrap_or(&run.settings.1);
-                    let reasoning=self.config.auth.reasoning_for_model(&model,requested)?;
+                    let preferred=self.discord.models.reasoning(&model,&run.settings.1);
+                    let requested=value["reasoning"].as_str().unwrap_or(&preferred);
+                    let reasoning=self.reasoning_for_model(&model,requested)?;
+                    self.discord.models.validate_effort(&model,&reasoning)?;
                     model_parts(&model)?; crate::config::validate_reasoning(&reasoning)?;
                     Ok((task,name,(model,reasoning)))
                 }).collect::<Result<Vec<_>>>()?;
@@ -1260,6 +1289,11 @@ impl Harness {
         }
         let args = Value::Object(args);
         let c = self.channel(channel).await?;
+        let _settings_guard = if matches!(name, "model" | "reasoning") {
+            Some(c.settings_lock.lock().await)
+        } else {
+            None
+        };
         let (mut model, mut reasoning) = self.store.settings(
             channel,
             &self.config.agent.model,
@@ -1348,31 +1382,62 @@ impl Harness {
                 ));
             }
             "model" => {
-                if let Some(id) = args["id"].as_str() {
-                    model_parts(id)?;
-                    model = id.into();
-                    reasoning = self.config.auth.reasoning_for_model(&model, &reasoning)?;
-                    self.store.set_settings(channel, &model, &reasoning)?;
+                let kind = args["kind"].as_str().unwrap_or("chat");
+                ensure!(
+                    ["chat", "compact"].contains(&kind),
+                    "Model kind must be chat or compact"
+                );
+                let provider = args["provider"].as_str();
+                let selected = args["model"].as_str().or_else(|| args["id"].as_str());
+                if let Some(id) = selected {
+                    let target = if id == "default" {
+                        if kind == "chat" {
+                            self.config.agent.model.clone()
+                        } else {
+                            self.config.agent.compactor_model.clone()
+                        }
+                    } else {
+                        self.discord.models.resolve(provider, id)?
+                    };
+                    let effort = self
+                        .discord
+                        .models
+                        .reasoning(&target, if kind == "chat" { &reasoning } else { "medium" });
+                    let effort = self.reasoning_for_model(&target, &effort)?;
+                    if kind == "compact" {
+                        self.store.set_compactor_model(
+                            channel,
+                            if id == "default" { None } else { Some(&target) },
+                        )?;
+                        c.changed.notify_one();
+                    } else {
+                        model = target;
+                        reasoning = effort;
+                        self.store.set_settings(channel, &model, &reasoning)?;
+                        self.discord.models.set_chat_model(channel, &model);
+                    }
+                } else {
+                    ensure!(provider.is_none(), "Select a model to change providers");
                 }
+                let compact = self
+                    .store
+                    .compactor_model(channel, &self.config.agent.compactor_model)?;
                 return Ok(crate::ui::card(
                     "Model",
-                    "Changes apply to the next fresh turn.",
+                    "Overrides apply only to this chat and survive restart. Chat changes apply next turn; compactor changes apply to newly started jobs. Use model:default to return to config defaults.",
                     vec![
-                        ("Active model", format!("`{model}`"), false),
+                        ("Selected kind", format!("`{kind}`"), true),
+                        ("Chat model", format!("`{model}`"), false),
                         ("Reasoning", format!("`{reasoning}`"), true),
-                        (
-                            "Compaction model",
-                            format!("`{}`", self.config.agent.compactor_model),
-                            false,
-                        ),
+                        ("Compaction model", format!("`{compact}`"), false),
                     ],
                     false,
                 ));
             }
             "reasoning" => {
                 if let Some(level) = args["level"].as_str() {
-                    crate::config::validate_reasoning(level)?;
-                    reasoning = self.config.auth.reasoning_for_model(&model, level)?;
+                    self.discord.models.validate_effort(&model, level)?;
+                    reasoning = self.reasoning_for_model(&model, level)?;
                     self.store.set_settings(channel, &model, &reasoning)?;
                 }
                 return Ok(crate::ui::card(
@@ -1381,6 +1446,24 @@ impl Harness {
                     vec![
                         ("Current effort", format!("`{reasoning}`"), true),
                         ("Active model", format!("`{model}`"), false),
+                        (
+                            "Available efforts",
+                            self.discord
+                                .models
+                                .metadata(&model)
+                                .filter(|m| !m.efforts.is_empty())
+                                .map(|m| {
+                                    m.efforts
+                                        .iter()
+                                        .map(|e| format!("`{e}`"))
+                                        .collect::<Vec<_>>()
+                                        .join(" · ")
+                                })
+                                .unwrap_or_else(|| {
+                                    "Not advertised by this provider; no levels are guessed.".into()
+                                }),
+                            false,
+                        ),
                     ],
                     false,
                 ));
@@ -1886,7 +1969,7 @@ impl Harness {
         workers.abort_all();
         Ok(())
     }
-    async fn compactor(self: Arc<Self>, c: Arc<Channel>) -> Result<()> {
+    async fn compactor(self: Arc<Self>, channel: u64, c: Arc<Channel>) -> Result<()> {
         let mut workers = tokio::task::JoinSet::new();
         let mut busy = HashSet::new();
         let mut retry: HashMap<NodeKey, Instant> = HashMap::new();
@@ -1912,7 +1995,11 @@ impl Harness {
                 };
                 busy.insert(key);
                 let h = self.clone();
-                workers.spawn(async move { (key, h.compress(key, &context, &source).await) });
+                let model = self
+                    .store
+                    .compactor_model(channel, &self.config.agent.compactor_model)?;
+                workers
+                    .spawn(async move { (key, h.compress(&model, key, &context, &source).await) });
             }
             tokio::select! {
                 Some(done)=workers.join_next(),if !workers.is_empty()=>{
@@ -1928,8 +2015,15 @@ impl Harness {
         workers.abort_all();
         Ok(())
     }
-    async fn compress(&self, key: NodeKey, context: &str, source: &str) -> Result<String> {
-        let (vendor, _) = model_parts(&self.config.agent.compactor_model)?;
+    async fn compress(
+        &self,
+        model: &str,
+        key: NodeKey,
+        context: &str,
+        source: &str,
+    ) -> Result<String> {
+        let (vendor, _) = model_parts(model)?;
+        let reasoning = self.discord.models.reasoning(model, "medium");
         let example = "user: Build Pantheon in Rust as an always-on NixOS Discord agent; preserve every message durably and start each turn with a stable binary summary view. Background workers summarize in order; zoom retrieves exact history. echo: inspected Thoth's gateway and found steering, mention and delivery races. work: browser implementation assigns separate displays and permanent noVNC URLs, with explicit handoff leases. talk: chosen append-only daily files and a durable inbox/outbox; live deployment still needs credentials.";
         let mut scale = example.to_string();
         while scale.len() > 512 {
@@ -1951,13 +2045,7 @@ impl Harness {
         for _ in 0..5 {
             let response = self
                 .provider
-                .step(
-                    &self.config.agent.compactor_model,
-                    "medium",
-                    COMPACT,
-                    &history,
-                    &[],
-                )
+                .step(model, &reasoning, COMPACT, &history, &[])
                 .await?;
             let line = response
                 .texts
@@ -2055,6 +2143,7 @@ mod tests {
         let mut h = Harness::new(config, discord, CancellationToken::new()).unwrap();
         Arc::get_mut(&mut h).unwrap().provider = Provider::mock(format!("http://{address}/"));
         let c = Arc::new(Channel {
+            settings_lock: Mutex::new(()),
             memory: Mutex::new(Memory::open(directory.path().join("memory"), 128000).unwrap()),
             changed: Notify::new(),
             incoming: Notify::new(),
@@ -2207,6 +2296,160 @@ mod tests {
                 .iter()
                 .any(|m| m.text.contains("incoming agent message from Docs Scout"))
         );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn model_overrides_and_efforts_are_chat_local_and_survive_restart() {
+        let (dir, h, _run, _mock, server) = fixture("openai", vec![]).await;
+        let mut alpha = crate::models::Model::plain("alpha");
+        alpha.efforts = vec!["low".into(), "high".into()];
+        alpha.default_effort = Some("low".into());
+        h.discord
+            .models
+            .replace("openai", vec![alpha, crate::models::Model::plain("beta")]);
+        h.store
+            .usage(1, "openai/test", &json!({"input_tokens":42}))
+            .unwrap();
+        h.command(1,2,"model",&json!([{"name":"kind","value":"chat"},{"name":"provider","value":"openai"},{"name":"model","value":"alpha"}])).await.unwrap();
+        assert_eq!(
+            h.store.settings(1, "ignored", "ignored").unwrap(),
+            ("openai/alpha".into(), "low".into())
+        );
+        assert_eq!(
+            h.store
+                .settings(2, &h.config.agent.model, &h.config.agent.reasoning)
+                .unwrap()
+                .0,
+            h.config.agent.model
+        );
+        h.command(
+            1,
+            2,
+            "model",
+            &json!([{"name":"kind","value":"compact"},{"name":"model","value":"openai/beta"}]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            h.store.compactor_model(1, "fallback").unwrap(),
+            "openai/beta"
+        );
+        assert_eq!(
+            h.store
+                .compactor_model(2, &h.config.agent.compactor_model)
+                .unwrap(),
+            h.config.agent.compactor_model
+        );
+        assert_eq!(
+            h.store.stats(1).unwrap()["last_request_usage"]["input_tokens"],
+            42
+        );
+        let reopened = Store::open(&dir.path().join("state/runtime.sqlite")).unwrap();
+        assert_eq!(
+            reopened.compactor_model(1, "fallback").unwrap(),
+            "openai/beta"
+        );
+        assert_eq!(
+            reopened.settings(1, "ignored", "ignored").unwrap().0,
+            "openai/alpha"
+        );
+        assert!(
+            h.command(
+                1,
+                2,
+                "reasoning",
+                &json!([{"name":"level","value":"minimal"}])
+            )
+            .await
+            .is_err()
+        );
+        h.command(1, 2, "reasoning", &json!([{"name":"level","value":"high"}]))
+            .await
+            .unwrap();
+        assert!(
+            h.command(
+                1,
+                2,
+                "model",
+                &json!([{"name":"kind","value":"wrong"},{"name":"model","value":"openai/beta"}])
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            h.command(
+                1,
+                2,
+                "model",
+                &json!([{"name":"provider","value":"openai"},{"name":"model","value":"codex/beta"}])
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            h.store.settings(1, "ignored", "ignored").unwrap(),
+            ("openai/alpha".into(), "high".into())
+        );
+        h.command(
+            1,
+            2,
+            "model",
+            &json!([{"name":"kind","value":"compact"},{"name":"model","value":"default"}]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            h.store.compactor_model(1, "new-config-default").unwrap(),
+            "new-config-default"
+        );
+        assert_eq!(h.config.agent.model, "openai/test");
+        h.shutdown.cancel();
+        server.abort();
+    }
+    #[tokio::test]
+    async fn compactor_pins_running_jobs_and_picks_up_channel_overrides_for_new_jobs() {
+        let (_dir, h, run, mock, server) = fixture(
+            "openai",
+            vec![
+                final_response("openai", &"x".repeat(512)),
+                final_response("openai", "merged"),
+            ],
+        )
+        .await;
+        h.store
+            .set_compactor_model(1, Some("openai/first"))
+            .unwrap();
+        run.memory
+            .memory
+            .lock()
+            .await
+            .append(Kind::Talk, &"long source ".repeat(100))
+            .unwrap();
+        let worker = tokio::spawn(h.clone().compactor(1, run.memory.clone()));
+        mock.started.notified().await;
+        assert_eq!(mock.requests.lock().await[0]["model"], "first");
+        h.store
+            .set_compactor_model(1, Some("openai/second"))
+            .unwrap();
+        run.memory.changed.notify_one();
+        mock.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while mock.requests.lock().await.len() < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(mock.requests.lock().await[1]["model"], "second");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !run.memory.memory.lock().await.is_settled() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        h.shutdown.cancel();
+        worker.await.unwrap().unwrap();
         server.abort();
     }
     #[tokio::test]

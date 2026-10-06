@@ -87,6 +87,7 @@ impl Presentation {
                 // External arguments and prompt text may contain credentials or personal data.
                 "mcp" => string(a, "action").into(),
                 "zoom" | "date" => format!("{}+{}", a["id"], a["n"].as_u64().unwrap_or(0)),
+                "models" => format!("{} {}", string(a, "provider"), string(a, "query")),
                 "monitor" | "wakeup" | "list_agents" => string(a, "action").into(),
                 _ => String::new(),
             },
