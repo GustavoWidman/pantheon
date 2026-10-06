@@ -1523,6 +1523,7 @@ impl Harness {
                     "Work status",
                     state,
                     vec![
+                        ("Version", format!("`{}`", env!("CARGO_PKG_VERSION")), true),
                         ("Active work", phases, false),
                         (
                             "Shell jobs",
@@ -2471,6 +2472,35 @@ mod tests {
                 );
             }
         }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn status_reports_compiled_harness_version_when_idle_and_busy() {
+        let (_dir, h, run, mock, server) = fixture("openai", vec![]).await;
+        h.store
+            .present_agent("channel:1", 1, &run.context, "Pantheon", "openai/test")
+            .unwrap();
+        for busy in [false, true] {
+            h.store.agent_phase("channel:1", busy, "Thinking").unwrap();
+            let result = h.command(1, 2, "status", &json!([])).await.unwrap();
+            let fields = result["embeds"][0]["fields"].as_array().unwrap();
+            let versions = fields
+                .iter()
+                .filter(|field| field["name"] == "Version")
+                .collect::<Vec<_>>();
+            assert_eq!(versions.len(), 1);
+            assert_eq!(
+                versions[0]["value"],
+                format!("`{}`", env!("CARGO_PKG_VERSION"))
+            );
+            assert_eq!(versions[0]["inline"], true);
+            assert_eq!(
+                result["embeds"][0]["color"],
+                if busy { 0xFEE75C } else { 0x57F287 }
+            );
+        }
+        assert!(mock.requests.lock().await.is_empty());
         server.abort();
     }
 

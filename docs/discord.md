@@ -38,7 +38,7 @@ Model capacities come from exact per-model `agent.context_windows` overrides or 
 "anthropic/YOUR_MODEL" = 200000 # Replace with your model and its verified token limit.
 ```
 
-`/status` focuses on execution: active agent names/phases, shell jobs, prompt and worker-message queues, pending deliveries, active wakeups/monitors, and whether memory is settling. Its color changes from amber during work to green when ready; `/context` uses blue.
+`/status` includes a **Version** field with the running binary’s compiled-in package version (from `Cargo.toml`), followed by execution details: active agent names/phases, shell jobs, prompt and worker-message queues, pending deliveries, active wakeups/monitors, and whether memory is settling. Its color changes from amber during work to green when ready; `/context` uses blue.
 
 ## Final messages and tool activity
 
