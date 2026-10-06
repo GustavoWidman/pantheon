@@ -7,6 +7,7 @@ pub mod discord;
 pub mod mcp;
 pub mod memory;
 pub mod models;
+mod pricing;
 pub mod provider;
 pub mod runtime;
 pub mod skills;
