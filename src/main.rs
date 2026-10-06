@@ -135,11 +135,32 @@ async fn main() -> Result<()> {
 }
 fn doctor(config: &Config) -> Result<()> {
     config.instructions()?;
+    pantheon::skills::Skills::load(&config.skills)?;
+    config.mcp.validate()?;
     ensure!(
         config.workspace.is_dir(),
         "workspace directory does not exist"
     );
     let mut missing = vec![];
+    for server in config.mcp.servers.values() {
+        for key in server.env.values().chain(server.bearer_env.iter()) {
+            if std::env::var_os(key).is_none() && !missing.contains(key) {
+                missing.push(key.clone());
+            }
+        }
+        if let Some(command) = &server.command {
+            let exists = if command.components().count() > 1 {
+                command.is_file()
+            } else {
+                std::env::var_os("PATH").is_some_and(|path| {
+                    std::env::split_paths(&path).any(|dir| dir.join(command).is_file())
+                })
+            };
+            if !exists {
+                missing.push(format!("MCP command {}", command.display()));
+            }
+        }
+    }
     if std::env::var("DISCORD_TOKEN").is_err() {
         missing.push("DISCORD_TOKEN".to_string());
     }

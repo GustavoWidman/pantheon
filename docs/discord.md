@@ -16,6 +16,8 @@ Registered commands:
 | `/stop` | Cancel the current run and its background agents |
 | `/status` | Inspect active agent phases, shell jobs, message queues, schedules and delivery |
 | `/subagents` | List background agents |
+| `/skills [id]` | Browse task guides or preview a selected guide |
+| `/mcp` | Show integrations configured for this channel |
 | `/browser [action] [browser_id] [resume_token] [url]` | List/open desktops, hand off, explicitly resume, or close |
 | `/wakeup action [schedule] [prompt] [id]` | Add, list, or cancel durable prompts |
 | `/monitor action [command] [interval_seconds] [prompt] [id]` | Add, list, or cancel command monitors; interval minimum five seconds |

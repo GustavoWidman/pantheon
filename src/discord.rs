@@ -906,6 +906,16 @@ pub fn command_definitions() -> Value {
         ),
         command("status", "Show active work and delivery status", vec![]),
         command(
+            "skills",
+            "Browse available task guides",
+            vec![string_option("id", "Skill ID to inspect", false)]
+        ),
+        command(
+            "mcp",
+            "Show configured integrations available in this channel",
+            vec![]
+        ),
+        command(
             "subagents",
             "List background agents and their state",
             vec![]

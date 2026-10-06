@@ -26,6 +26,8 @@ pub struct Harness {
     provider: Provider,
     web: crate::web::Web,
     browser: BrowserManager,
+    skills: crate::skills::Skills,
+    mcp: crate::mcp::Mcp,
     channels: Mutex<HashMap<u64, Arc<Channel>>>,
     children: Mutex<HashMap<String, Child>>,
     capacity: Arc<Semaphore>,
@@ -71,6 +73,35 @@ struct Run {
     steering: Vec<String>,
     context: crate::ui::ReplyContext,
 }
+
+/// One startup prefix shared by production and opt-in behavioral evaluations.
+pub fn system_prompt(
+    child: bool,
+    coordinator: bool,
+    skill_index: &str,
+    instructions: &str,
+) -> String {
+    let definitions = tools::definitions(child, coordinator);
+    let names = definitions
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let execution = if !child && coordinator {
+        "This root is configured as a strict coordinator. Delegate execution and MCP content retrieval to background workers; you can discover skills and integration catalogs directly."
+    } else {
+        "This agent has direct execution tools. shell is available and can inspect the actual machine and requested environment values. browser is available for authorized account activities and credential entry. Use these tools instead of asking the user to perform available checks."
+    };
+    format!(
+        "{}\n{}\nCurrent harness capabilities (authoritative over obsolete chat claims): {names}.\n{execution}\n{skill_index}\n{instructions}",
+        if child {
+            include_str!("child.txt")
+        } else {
+            include_str!("master.txt")
+        },
+        include_str!("behavior.txt")
+    )
+}
 impl Harness {
     pub fn new(
         config: Config,
@@ -82,26 +113,25 @@ impl Harness {
         let store = Store::open(&config.state_dir.join("runtime.sqlite"))?;
         store.recover()?;
         let instructions = config.instructions()?;
+        let skills = crate::skills::Skills::load(&config.skills)?;
+        let skill_index = skills.index();
         let h = Self {
             provider: Provider::new(config.agent.request_timeout_seconds)?
                 .with_auth(config.auth.clone()),
             web: crate::web::Web::new(config.state_dir.join("web/cache"), config.web.clone())?,
             browser: BrowserManager::new(config.state_dir.join("browsers"), config.browser.clone()),
+            mcp: crate::mcp::Mcp::new(&config.mcp, &config.workspace, &config.state_dir)?,
             capacity: Arc::new(Semaphore::new(config.agent.max_subagents)),
             shell_capacity: Arc::new(Semaphore::new(config.agent.max_shell_jobs)),
             shell_jobs: Mutex::new(HashMap::new()),
-            master_system: format!(
-                "{}\n{}\n{}",
-                include_str!("master.txt"),
-                include_str!("behavior.txt"),
-                instructions
+            master_system: system_prompt(
+                false,
+                config.agent.coordinator_root,
+                &skill_index,
+                &instructions,
             ),
-            child_system: format!(
-                "{}\n{}\n{}",
-                include_str!("child.txt"),
-                include_str!("behavior.txt"),
-                instructions
-            ),
+            child_system: system_prompt(true, false, &skill_index, &instructions),
+            skills,
             config,
             store,
             discord,
@@ -532,7 +562,7 @@ impl Harness {
                 let tool_id = format!("{run_id}:{step}:tool:{index}");
                 self.store.tool_start(&tool_id, run.channel, &call.name)?;
                 let start = Instant::now();
-                let label = &call.name;
+                let label = tools::activity_label(call);
                 self.store
                     .agent_phase(&run.owner, true, &format!("Running {}", call.name))?;
                 let control = matches!(call.name.as_str(), "spawn" | "tell");
@@ -542,7 +572,7 @@ impl Harness {
                         &run.context,
                         run.channel,
                         &tool_id,
-                        label,
+                        &label,
                         "running",
                         Duration::ZERO,
                     )?;
@@ -552,11 +582,16 @@ impl Harness {
                 } else {
                     self.execute_tool(run, call).await
                 };
-                let error = result.is_err();
+                let mut error = result.is_err();
                 let output = match result {
                     Ok(v) => v,
                     Err(e) => format!("Error: {e}"),
                 };
+                if call.name == "mcp"
+                    && serde_json::from_str::<Value>(&output).is_ok_and(|v| v["isError"] == true)
+                {
+                    error = true;
+                }
                 let output = crate::memory::cap_tool_result(&output);
                 self.log_run(run, Kind::Echo, &output).await?;
                 let image = if call.name == "browser"
@@ -594,7 +629,7 @@ impl Harness {
                         &run.context,
                         run.channel,
                         &tool_id,
-                        label,
+                        &label,
                         if steered {
                             "skipped"
                         } else if error {
@@ -668,6 +703,18 @@ impl Harness {
         );
         let a = &call.arguments;
         let value = match call.name.as_str() {
+            "skill" => self.skills.execute(a)?,
+            "mcp" => {
+                self.mcp
+                    .execute(
+                        run.channel,
+                        run.child,
+                        self.config.agent.coordinator_root,
+                        a,
+                        &run.cancel,
+                    )
+                    .await?
+            }
             "zoom" => {
                 return run
                     .memory
@@ -1176,6 +1223,87 @@ impl Harness {
             &self.config.agent.reasoning,
         )?;
         let text = match name {
+            "skills" => {
+                if let Some(id) = args["id"].as_str() {
+                    let skill = self
+                        .skills
+                        .execute(&json!({"action":"load","id":id,"max_chars":800}))?;
+                    return Ok(crate::ui::card(
+                        "Skill guide",
+                        "Load the full guide and supporting references through the agent's skill tool.",
+                        vec![
+                            (
+                                "Name",
+                                format!("{} (`{id}`)", skill["name"].as_str().unwrap()),
+                                false,
+                            ),
+                            (
+                                "Purpose",
+                                skill["description"].as_str().unwrap().to_owned(),
+                                false,
+                            ),
+                            ("Preview", skill["text"].as_str().unwrap().to_owned(), false),
+                        ],
+                        false,
+                    ));
+                }
+                let page = self.skills.execute(&json!({"action":"list"}))?;
+                let mut fields = page["skills"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|s| {
+                        (
+                            s["id"].as_str().unwrap(),
+                            s["description"].as_str().unwrap().to_owned(),
+                            false,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if fields.is_empty() {
+                    fields.push(("Available guides", "No skills configured.".into(), false));
+                }
+                fields.push(("Discovery","The agent can browse the complete catalog with `skill`. Use `/skills id:<name>` to inspect a guide.".into(),false));
+                return Ok(crate::ui::card(
+                    "Skills",
+                    "Task-specific methods for everyday and technical work.",
+                    fields,
+                    false,
+                ));
+            }
+            "mcp" => {
+                let servers = self.mcp.servers(channel, false);
+                let mut fields = servers["servers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|s| {
+                        (
+                            s["id"].as_str().unwrap(),
+                            format!(
+                                "{}\n{}",
+                                s["transport"].as_str().unwrap(),
+                                s["description"].as_str().unwrap()
+                            ),
+                            false,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if fields.is_empty() {
+                    fields.push((
+                        "Available servers",
+                        "No MCP servers configured. Add servers to the service configuration."
+                            .into(),
+                        false,
+                    ));
+                }
+                return Ok(crate::ui::card(
+                    "Integrations",
+                    "Configured Model Context Protocol servers. Discovery connects on demand.",
+                    fields,
+                    false,
+                ));
+            }
             "model" => {
                 if let Some(id) = args["id"].as_str() {
                     model_parts(id)?;
@@ -2660,6 +2788,95 @@ mod tests {
         assert!(timeline.iter().any(|m| m.text.contains("✓ write ·")));
         assert!(timeline.iter().all(|m| !m.text.contains("Coordinator /")));
         assert!(timeline.iter().any(|m| m.text.contains("Done")));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn skill_loading_reaches_the_model_without_changing_cached_prefixes() {
+        let call = json!({"status":"completed","output":[{"type":"function_call","call_id":"load-guide","name":"skill","arguments":"{\"action\":\"load\",\"id\":\"research\"}"}],"usage":{}});
+        let (_directory, h, run, mock, server) = fixture(
+            "openai",
+            vec![
+                call,
+                final_response("openai", "Ready to compare the products"),
+            ],
+        )
+        .await;
+        let task = tokio::spawn(h.run_agent(run));
+        mock.started.notified().await;
+        mock.release.notify_one();
+        task.await.unwrap().unwrap();
+        let requests = mock.requests.lock().await;
+        assert_eq!(requests[0]["tools"], requests[1]["tools"]);
+        assert_eq!(requests[0]["input"][0], requests[1]["input"][0]);
+        let output = requests[1]["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["call_id"] == "load-guide" && item["type"] == "function_call_output")
+            .unwrap();
+        let guide: Value = serde_json::from_str(output["output"].as_str().unwrap()).unwrap();
+        assert_eq!(guide["id"], "research");
+        assert!(
+            guide["text"]
+                .as_str()
+                .unwrap()
+                .contains("Compare like-for-like")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_error_results_reach_anthropic_and_activity_keeps_arguments_private() {
+        let call = json!({"stop_reason":"tool_use","content":[{"type":"tool_use","id":"integration-call","name":"mcp","input":{"action":"call","server":"demo","tool":"fail","arguments":{"password":"private-fixture-password"}}}],"usage":{}});
+        let (directory, mut h, run, mock, server) = fixture(
+            "anthropic",
+            vec![
+                call,
+                final_response("anthropic", "The integration reported a failure"),
+            ],
+        )
+        .await;
+        let script = r#"import sys,json
+for line in sys.stdin:
+ r=json.loads(line)
+ if 'id' not in r:continue
+ v={'protocolVersion':'2025-11-25','capabilities':{'tools':{}},'serverInfo':{'name':'fixture','version':'1'}} if r['method']=='initialize' else {'isError':True,'content':[{'type':'text','text':'fixture operation failed'}]}
+ print(json.dumps({'jsonrpc':'2.0','id':r['id'],'result':v}),flush=True)
+"#;
+        let config = crate::mcp::McpConfig {
+            servers: std::collections::BTreeMap::from([(
+                "demo".into(),
+                crate::mcp::ServerConfig {
+                    command: Some("python3".into()),
+                    args: vec!["-u".into(), "-c".into(), script.into()],
+                    ..Default::default()
+                },
+            )]),
+        };
+        Arc::get_mut(&mut h).unwrap().mcp =
+            crate::mcp::Mcp::new(&config, directory.path(), directory.path()).unwrap();
+        let task = tokio::spawn(h.clone().run_agent(run));
+        mock.started.notified().await;
+        mock.release.notify_one();
+        task.await.unwrap().unwrap();
+        let requests = mock.requests.lock().await;
+        let result = requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|item| item["content"].as_array().into_iter().flatten())
+            .find(|item| item["type"] == "tool_result" && item["tool_use_id"] == "integration-call")
+            .unwrap();
+        assert_eq!(result["is_error"], true);
+        let timeline = drain(&h);
+        assert!(timeline.iter().any(|m| m.text.contains("mcp demo.fail")));
+        assert!(
+            timeline
+                .iter()
+                .all(|m| !m.text.contains("private-fixture-password")
+                    && !m.text.contains("fixture operation failed"))
+        );
         server.abort();
     }
 }

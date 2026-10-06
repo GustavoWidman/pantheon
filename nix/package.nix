@@ -2,6 +2,7 @@
   lib,
   rustPlatform,
   makeWrapper,
+  cacert,
   python3,
   browser,
   bash,
@@ -19,10 +20,12 @@ rustPlatform.buildRustPackage {
   cargoLock.lockFile = ../Cargo.lock;
   nativeBuildInputs = [ makeWrapper ];
   nativeCheckInputs = [ python3 ];
+  SSL_CERT_FILE = "${cacert}/etc/ssl/certs/ca-bundle.crt";
   postInstall = ''
     mkdir -p "$out/libexec/pantheon"
     cp scripts/browser-worker.py "$out/libexec/pantheon/browser-worker.py"
     wrapProgram "$out/bin/pantheon" \
+      --set-default SSL_CERT_FILE "${cacert}/etc/ssl/certs/ca-bundle.crt" \
       --set PANTHEON_CODEX_CLI "${codex}/bin/codex" \
       --set PANTHEON_BROWSER_PYTHON "${browser}/bin/pantheon-browser-python" \
       --set PANTHEON_NOVNC_WEB "${browser}/share/novnc" \
