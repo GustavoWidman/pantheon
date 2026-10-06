@@ -67,6 +67,53 @@ impl Provider {
         self.catalog = catalog;
         self
     }
+    pub(crate) async fn pricing_document(&self, source: &str) -> Result<String> {
+        use futures_util::StreamExt;
+        ensure!(
+            [
+                crate::pricing::OPENAI,
+                crate::pricing::ANTHROPIC,
+                crate::pricing::CODEX
+            ]
+            .contains(&source),
+            "Unsupported price source"
+        );
+        #[cfg(test)]
+        let url = self
+            .endpoint
+            .clone()
+            .unwrap_or_else(|| format!("{source}.md"));
+        #[cfg(not(test))]
+        let url = format!("{source}.md");
+        // Public documentation requests carry no account/authentication headers.
+        let response = self
+            .http
+            .get(url)
+            .header(
+                "User-Agent",
+                concat!("Pantheon/", env!("CARGO_PKG_VERSION")),
+            )
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .context("Official pricing transport failed")?;
+        ensure!(
+            response.status().is_success(),
+            "Official pricing returned HTTP {}",
+            response.status()
+        );
+        let mut bytes = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("Official pricing body could not be read")?;
+            ensure!(
+                bytes.len().saturating_add(chunk.len()) <= 524_288,
+                "Official pricing exceeded byte limit"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        String::from_utf8(bytes).context("Official pricing is not UTF-8")
+    }
     pub(crate) async fn list_models(&self, vendor: &str) -> Result<Vec<crate::models::Model>> {
         use crate::models::Model;
         if vendor == "codex" {

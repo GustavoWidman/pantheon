@@ -38,9 +38,11 @@ impl Model {
 pub struct Catalog {
     entries: RwLock<BTreeMap<String, Vec<Model>>>,
     chats: RwLock<(String, BTreeMap<u64, String>)>,
+    prices: crate::pricing::Prices,
 }
 impl Catalog {
     pub fn initialize(&self, config: &Config) {
+        self.prices.initialize(&config.state_dir);
         self.chats.write().unwrap().0 = config.agent.model.clone();
         let cached = std::fs::File::open(config.state_dir.join("model-catalog.json"))
             .ok()
@@ -78,12 +80,12 @@ impl Catalog {
             .write()
             .unwrap()
             .retain(|p, _| available.contains(&p.as_str()));
-        for name in available {
+        for name in &available {
             // Make a newly authenticated provider discoverable even if its listing is down.
             self.entries
                 .write()
                 .unwrap()
-                .entry(name.into())
+                .entry((*name).into())
                 .or_default();
             match provider.list_models(name).await {
                 Ok(models) => self.replace(name, models),
@@ -92,6 +94,9 @@ impl Catalog {
                 }
             }
         }
+        self.prices
+            .refresh(&config.state_dir, &available, provider)
+            .await;
         if let Err(error) = self.persist(&config.state_dir) {
             tracing::warn!(error=%error,"model catalog snapshot could not be saved");
         }
@@ -314,9 +319,15 @@ impl Catalog {
             .collect::<Vec<_>>();
         let limit = limit.clamp(1, 50);
         json!({"providers":entries.iter().map(|(p,ms)|json!({"id":p,"model_count":ms.len()})).collect::<Vec<_>>(),
-            "models":rows.iter().skip(offset).take(limit).map(|(p,m)|json!({"id":format!("{p}/{}",m.id),"name":m.name,"reasoning_levels":if m.efforts.is_empty(){Value::Null}else{json!(m.efforts)},"default_reasoning":m.default_effort,"source":m.source,"observed_at":m.observed_at,"pricing":null,"billing":if p.as_str()=="codex"{"ChatGPT subscription; token pricing is not exposed by the catalog"}else{"API; current token pricing is not exposed by the catalog"}})).collect::<Vec<_>>(),
+            "models":rows.iter().skip(offset).take(limit).map(|(p,m)| {
+                let prices = self.prices.report(p, &m.id, &m.name, crate::store::now());
+                json!({"id":format!("{p}/{}",m.id),"name":m.name,"reasoning_levels":if m.efforts.is_empty(){Value::Null}else{json!(m.efforts)},"default_reasoning":m.default_effort,"source":m.source,"observed_at":m.observed_at,
+                    "pricing":prices,
+                    "api_price_reference":if p.as_str()=="codex"{self.prices.api_reference(&m.id, &m.name, crate::store::now())}else{Value::Null},
+                    "billing":if p.as_str()=="codex"{"ChatGPT subscription; published credit-billing rates do not predict included quota or remaining limits"}else{"API; public list prices are estimates, not account-specific billing"}})
+            }).collect::<Vec<_>>(),
             "total":rows.len(),"next_offset":if offset.saturating_add(limit)<rows.len(){Some(offset+limit)}else{None},
-            "note":"Live provider discovery with last-known local snapshots during outages. Unknown reasoning or prices are null. Catalog visibility does not guarantee quota or endpoint access. Use exact provider/model IDs and advertised effort levels when spawning workers."})
+            "note":"Live provider discovery with last-known local snapshots during outages. Prices come separately from official public Standard text-token tables; check units (USD versus credits), source, observed_at, stale, applicability and context bands. Unknown metadata is null. Codex credits apply to credit-billed usage, not included subscription quota; API references are separate. Do not invent dollar conversions or quota weights. Catalog visibility does not guarantee access. Use exact IDs and advertised efforts when spawning workers."})
     }
 }
 fn normalize(models: &mut Vec<Model>) {

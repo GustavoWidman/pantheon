@@ -48,9 +48,57 @@ All agents have the `models` tool with optional `provider`, `query`, `offset`, a
 `limit` filters. Results include exact IDs, advertised efforts/defaults, observation
 time and source, provider counts, and `next_offset` for pagination. A fixed prompt
 instruction tells agents to consult this tool before choosing worker overrides;
-catalog refreshes do not rewrite the system prompt or tool schemas. Prices are `null`
-when catalogs do not expose them, rather than guessed from model names. Codex subscription
-quota is distinguished from API billing. The current catalogs do not expose token prices.
+catalog refreshes do not rewrite the system prompt or tool schemas.
+
+Pricing is discovered separately from the official
+[OpenAI pricing](https://developers.openai.com/api/docs/pricing) and
+[Claude pricing](https://platform.claude.com/docs/en/about-claude/pricing) pages, plus
+the [Codex credit rate card](https://learn.chatgpt.com/docs/pricing#token-rates), using
+their machine-readable `.md` versions. No third-party price fixture is bundled.
+The parser selects the Standard text-token table, excluding Batch, Flex, Fast,
+training, audio, tools and cloud-provider tables. Schema changes fail closed,
+retaining the last dated snapshot instead of silently interpreting another table.
+Prices refresh every six hours alongside catalog discovery; failed refreshes retry
+on the next five-minute discovery cycle. Successful snapshots are atomically saved
+with fsync to `state_dir/model-pricing.json`, and retained across restart and outages.
+`observed_at` records when the document was fetched, not its publication date.
+Snapshots older than 24 hours (or dated in the future) are marked `stale`.
+
+API model rows expose `pricing` with `currency: USD`, `unit: per_1m_tokens`,
+`service_tier: standard`, source URL, age, match identity/method and separate
+context-band `rates`. These contain input, output, cached input, cache write and,
+for Claude, one-hour cache write rates when advertised. Missing rate categories
+are `null`, not zero. Numeric context bounds are extracted only when explicitly
+published in the OpenAI document; otherwise consult the source's context labels.
+Claude uses the main base-rate table; any model-specific long-context exceptions
+still require consulting the source. These public list prices omit account discounts,
+geography/tier premiums, tool fees and taxes, and are not invoice estimates.
+
+OpenAI prices require an exact model-ID match; unknown IDs, snapshots and fine-tunes
+are not guessed from a family name. Claude table labels are normalized (for example,
+`Claude Sonnet 4.6` becomes `claude-sonnet-4-6`) and matched against the exact catalog
+ID, or its provider-advertised display name. The result states `matched_model` and
+`matched_by`. Prices do not grant access or add models to autocomplete.
+Codex `pricing` uses `unit: credits_per_1m_tokens`, `currency: null` and
+`applicability: credit_billed_usage_only`. These are published Standard rates for
+credit-billed usage, with exact normalized public labels (`GPT-6.1 Sol` maps to
+`gpt-6.1-sol`); cyber aliases and image-modality rows are not collapsed into text
+model IDs. Input, cached input and output rates are explicit. Codex has no separate
+cache-write charge; the null cache-write category does not mean zero input cost.
+Credit purchase prices/conversion depend on the plan or agreement, and some Enterprise
+customers still use a legacy rate card. Included subscription quota weights and
+remaining limits stay unknown: OpenAI explicitly says credit rates alone do not
+predict included usage. No dollar conversion is guessed. Where an exact OpenAI ID
+matches, `api_price_reference` contains a separate USD API comparison with
+`applicability: api_reference_only`; this is not subscription billing or quota.
+
+The root orchestration prompt instructs agents to choose economical capable workers
+for routine work and stronger models/reasoning for difficult work, honoring user
+preferences and considering total context, output and retries. It explicitly says
+prices are not capability scores, unknown is not free, credits are distinct from
+dollars, and neither rate card can be substituted for included subscription quota.
+Rates remain in on-demand tool
+results, not a changing system-prompt table, preserving the fixed cache prefix.
 
 For live, non-inference discovery outside Discord:
 
