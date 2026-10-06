@@ -322,12 +322,12 @@ impl Catalog {
             "models":rows.iter().skip(offset).take(limit).map(|(p,m)| {
                 let prices = self.prices.report(p, &m.id, &m.name, crate::store::now());
                 json!({"id":format!("{p}/{}",m.id),"name":m.name,"reasoning_levels":if m.efforts.is_empty(){Value::Null}else{json!(m.efforts)},"default_reasoning":m.default_effort,"source":m.source,"observed_at":m.observed_at,
-                    "pricing":if p.as_str()=="codex"{Value::Null}else{prices.clone()},
-                    "api_price_reference":if p.as_str()=="codex"{prices}else{Value::Null},
-                    "billing":if p.as_str()=="codex"{"ChatGPT subscription quota; per-token charges and relative quota weights are unknown"}else{"API; public list prices are estimates, not account-specific billing"}})
+                    "pricing":prices,
+                    "api_price_reference":if p.as_str()=="codex"{self.prices.api_reference(&m.id, &m.name, crate::store::now())}else{Value::Null},
+                    "billing":if p.as_str()=="codex"{"ChatGPT subscription; published credit-billing rates do not predict included quota or remaining limits"}else{"API; public list prices are estimates, not account-specific billing"}})
             }).collect::<Vec<_>>(),
             "total":rows.len(),"next_offset":if offset.saturating_add(limit)<rows.len(){Some(offset+limit)}else{None},
-            "note":"Live provider discovery with last-known local snapshots during outages. Prices come separately from official public Standard text-token tables; check source, observed_at, stale, applicability and context bands. Unknown metadata is null. Codex API references are not subscription charges or quota weights. Catalog visibility does not guarantee quota or endpoint access. Use exact provider/model IDs and advertised effort levels when spawning workers."})
+            "note":"Live provider discovery with last-known local snapshots during outages. Prices come separately from official public Standard text-token tables; check units (USD versus credits), source, observed_at, stale, applicability and context bands. Unknown metadata is null. Codex credits apply to credit-billed usage, not included subscription quota; API references are separate. Do not invent dollar conversions or quota weights. Catalog visibility does not guarantee access. Use exact IDs and advertised efforts when spawning workers."})
     }
 }
 fn normalize(models: &mut Vec<Model>) {

@@ -52,7 +52,8 @@ catalog refreshes do not rewrite the system prompt or tool schemas.
 
 Pricing is discovered separately from the official
 [OpenAI pricing](https://developers.openai.com/api/docs/pricing) and
-[Claude pricing](https://platform.claude.com/docs/en/about-claude/pricing) pages using
+[Claude pricing](https://platform.claude.com/docs/en/about-claude/pricing) pages, plus
+the [Codex credit rate card](https://learn.chatgpt.com/docs/pricing#token-rates), using
 their machine-readable `.md` versions. No third-party price fixture is bundled.
 The parser selects the Standard text-token table, excluding Batch, Flex, Fast,
 training, audio, tools and cloud-provider tables. Schema changes fail closed,
@@ -78,16 +79,25 @@ are not guessed from a family name. Claude table labels are normalized (for exam
 `Claude Sonnet 4.6` becomes `claude-sonnet-4-6`) and matched against the exact catalog
 ID, or its provider-advertised display name. The result states `matched_model` and
 `matched_by`. Prices do not grant access or add models to autocomplete.
-Codex has `pricing: null` because its subscription per-token charges and relative
-quota weights are unknown. Where an exact OpenAI ID matches, `api_price_reference`
-contains the API comparison with `applicability: api_reference_only`; this is not
-subscription billing and must not be interpreted as quota consumption.
+Codex `pricing` uses `unit: credits_per_1m_tokens`, `currency: null` and
+`applicability: credit_billed_usage_only`. These are published Standard rates for
+credit-billed usage, with exact normalized public labels (`GPT-6.1 Sol` maps to
+`gpt-6.1-sol`); cyber aliases and image-modality rows are not collapsed into text
+model IDs. Input, cached input and output rates are explicit. Codex has no separate
+cache-write charge; the null cache-write category does not mean zero input cost.
+Credit purchase prices/conversion depend on the plan or agreement, and some Enterprise
+customers still use a legacy rate card. Included subscription quota weights and
+remaining limits stay unknown: OpenAI explicitly says credit rates alone do not
+predict included usage. No dollar conversion is guessed. Where an exact OpenAI ID
+matches, `api_price_reference` contains a separate USD API comparison with
+`applicability: api_reference_only`; this is not subscription billing or quota.
 
 The root orchestration prompt instructs agents to choose economical capable workers
 for routine work and stronger models/reasoning for difficult work, honoring user
 preferences and considering total context, output and retries. It explicitly says
-prices are not capability scores, unknown is not free, and API references cannot
-be substituted for subscription quota weights. Rates remain in on-demand tool
+prices are not capability scores, unknown is not free, credits are distinct from
+dollars, and neither rate card can be substituted for included subscription quota.
+Rates remain in on-demand tool
 results, not a changing system-prompt table, preserving the fixed cache prefix.
 
 For live, non-inference discovery outside Discord:

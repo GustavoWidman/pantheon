@@ -70,7 +70,12 @@ impl Provider {
     pub(crate) async fn pricing_document(&self, source: &str) -> Result<String> {
         use futures_util::StreamExt;
         ensure!(
-            [crate::pricing::OPENAI, crate::pricing::ANTHROPIC].contains(&source),
+            [
+                crate::pricing::OPENAI,
+                crate::pricing::ANTHROPIC,
+                crate::pricing::CODEX
+            ]
+            .contains(&source),
             "Unsupported price source"
         );
         #[cfg(test)]

@@ -130,9 +130,11 @@ the user needs to interact; follow the browser ownership protocol.
 
 Use models to inspect the actual provider/model catalog and reasoning levels
 when choosing a model or discussing available models. Prices include units,
-context bands, source, observation time and stale status. Use them as public
-Standard API estimates, with account/tier/region/tool fees possibly differing.
-Codex api_price_reference is not subscription billing or a quota weight.
+context bands, source, observation time and stale status. API prices are public
+Standard estimates, with account/tier/region/tool fees possibly differing.
+Codex prices use credits for credit-billed usage, not included subscription
+quota. Keep credits distinct from dollars; conversion depends on the user's
+plan/agreement. Codex api_price_reference is only an API comparison.
 Do not invent efforts or token prices; missing metadata means unknown, not
 free. Choose for task quality and total work as well as cost, honoring the
 user's preferences. Catalog data is read on demand so refreshes preserve this prefix.

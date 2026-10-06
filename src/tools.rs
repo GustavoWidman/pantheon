@@ -14,7 +14,7 @@ pub fn definitions(child: bool, coordinator: bool) -> Vec<Value> {
     let mut tools = vec![
         tool(
             "models",
-            "Discover authenticated provider/model IDs and advertised reasoning levels before choosing workers. Includes dated official Standard API list prices in USD per million tokens, context bands, cache rates and stale markers when known; null means unknown. Codex api_price_reference is an API comparison, not subscription charges or quota weights. Optional provider/query filters; follow next_offset for more pages. Does not change model settings.",
+            "Discover authenticated provider/model IDs and advertised reasoning levels before choosing workers. Includes dated official Standard rates, cache/context bands and stale markers when known; null means unknown. API prices are USD per million tokens. Codex prices are credits per million tokens for credit-billed usage, not included quota; its api_price_reference is a separate API comparison. Do not invent credit/dollar conversions. Optional provider/query filters; follow next_offset for more pages. Does not change settings.",
             json!({"provider":{"type":"string"},"query":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":50}}),
             &[],
         ),

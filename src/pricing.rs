@@ -8,6 +8,7 @@ use std::{collections::BTreeMap, path::Path, sync::RwLock};
 
 pub(crate) const OPENAI: &str = "https://developers.openai.com/api/docs/pricing";
 pub(crate) const ANTHROPIC: &str = "https://platform.claude.com/docs/en/about-claude/pricing";
+pub(crate) const CODEX: &str = "https://learn.chatgpt.com/docs/pricing";
 const REFRESH_SECONDS: i64 = 6 * 3600;
 const STALE_SECONDS: i64 = 24 * 3600;
 const RETRY_SECONDS: i64 = 300;
@@ -56,10 +57,13 @@ impl Prices {
         *self.snapshots.write().unwrap() = snapshots;
     }
     pub async fn refresh(&self, dir: &Path, providers: &[&str], api: &Provider) {
-        let needed = providers
+        let mut needed = providers
             .iter()
-            .map(|p| if *p == "codex" { "openai" } else { *p })
+            .copied()
             .collect::<std::collections::BTreeSet<_>>();
+        if needed.contains("codex") {
+            needed.insert("openai");
+        }
         for provider in needed {
             let Some(url) = source(provider) else {
                 continue;
@@ -126,13 +130,8 @@ impl Prices {
         result
     }
     pub fn report(&self, provider: &str, id: &str, name: &str, now: i64) -> Value {
-        let api_provider = if provider == "codex" {
-            "openai"
-        } else {
-            provider
-        };
         let snapshots = self.snapshots.read().unwrap();
-        let Some(snapshot) = snapshots.get(api_provider) else {
+        let Some(snapshot) = snapshots.get(provider) else {
             return Value::Null;
         };
         // Exact public IDs first. Claude's public price table uses display names;
@@ -140,7 +139,7 @@ impl Prices {
         let display_id = claude_id(name);
         let matched = if snapshot.models.contains_key(id) {
             Some((id, "exact_id"))
-        } else if api_provider == "anthropic" {
+        } else if provider == "anthropic" {
             display_id
                 .as_deref()
                 .filter(|id| snapshot.models.contains_key(*id))
@@ -153,20 +152,30 @@ impl Prices {
         };
         let age = now.saturating_sub(snapshot.observed_at);
         json!({
-            "currency":"USD","unit":"per_1m_tokens","service_tier":"standard",
-            "applicability":if provider=="codex"{"api_reference_only"}else{"api_list_price"},
-            "api_provider":api_provider,"matched_model":matched_id,"matched_by":matched_by,
+            "currency":if provider=="codex"{Value::Null}else{json!("USD")},
+            "unit":if provider=="codex"{"credits_per_1m_tokens"}else{"per_1m_tokens"},
+            "service_tier":"standard",
+            "applicability":if provider=="codex"{"credit_billed_usage_only"}else{"api_list_price"},
+            "provider":provider,"matched_model":matched_id,"matched_by":matched_by,
             "source":snapshot.source,"observed_at":snapshot.observed_at,
             "age_seconds":age.max(0),"stale":!(0..STALE_SECONDS).contains(&age),
             "rates":snapshot.models[matched_id],
-            "scope":"Public Standard text-token list prices, not an account bill. Excludes service-tier/geography premiums, tool fees, taxes and negotiated discounts. Context labels without numeric bounds must be checked in the source. Subscription quota cannot be inferred from API prices."
+            "scope":if provider=="codex"{"Published Standard credit-billing rates only, not included subscription quota weights or remaining limits. Cash conversion depends on the plan/agreement; some Enterprise accounts use a legacy rate card. No separate cache-write charge. Speed modes have separate multipliers. Do not infer included tasks from credits or API rates."}else{"Public Standard text-token list prices, not an account bill. Excludes service-tier/geography premiums, tool fees, taxes and negotiated discounts. Context labels without numeric bounds must be checked in the source. Subscription quota cannot be inferred from API prices."}
         })
+    }
+    pub fn api_reference(&self, id: &str, name: &str, now: i64) -> Value {
+        let mut value = self.report("openai", id, name, now);
+        if let Some(object) = value.as_object_mut() {
+            object.insert("applicability".into(), json!("api_reference_only"));
+        }
+        value
     }
 }
 fn source(provider: &str) -> Option<&'static str> {
     match provider {
         "openai" => Some(OPENAI),
         "anthropic" => Some(ANTHROPIC),
+        "codex" => Some(CODEX),
         _ => None,
     }
 }
@@ -208,8 +217,13 @@ fn dollars(cell: &str) -> Result<Option<f64>> {
         .unwrap_or(text.len());
     let number: f64 = text[..end].parse().context("Invalid numeric price")?;
     let suffix = text[end..].trim();
+    let suffix = suffix.strip_prefix("/ MTok").unwrap_or(suffix).trim();
+    let footnote = suffix
+        .strip_prefix("<sup>")
+        .and_then(|s| s.strip_suffix("</sup>"));
     ensure!(
-        suffix.is_empty() || suffix.starts_with("/ MTok") || suffix.starts_with("<sup>"),
+        suffix.is_empty()
+            || footnote.is_some_and(|s| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit())),
         "Unrecognized price unit"
     );
     ensure!(number.is_finite() && number >= 0., "Invalid price range");
@@ -224,6 +238,9 @@ fn claude_id(name: &str) -> Option<String> {
     valid_id(&id).then_some(id)
 }
 fn parse(provider: &str, markdown: &str, observed_at: i64) -> Result<Snapshot> {
+    if provider == "codex" {
+        return parse_credits(markdown, observed_at);
+    }
     let (section, headers): (&str, Vec<&str>) = match provider {
         "openai" => (
             "### Standard pricing data",
@@ -365,11 +382,163 @@ fn parse(provider: &str, markdown: &str, observed_at: i64) -> Result<Snapshot> {
     })
 }
 
+fn parse_credits(markdown: &str, observed_at: i64) -> Result<Snapshot> {
+    use scraper::{Html, Selector};
+    let mut lines = markdown.lines();
+    ensure!(
+        lines.any(|line| line.trim() == "#### Token rates"),
+        "Official Codex credit section is missing"
+    );
+    let text = lines
+        .take_while(|line| !line.trim().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let html = Html::parse_fragment(&text);
+    let table_selector = Selector::parse("table").unwrap();
+    let header_selector = Selector::parse("thead th").unwrap();
+    let row_selector = Selector::parse("tbody tr").unwrap();
+    let cell_selector = Selector::parse("td").unwrap();
+    let clean = |cell: scraper::ElementRef<'_>| {
+        cell.text()
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let expected = [
+        "Credits per 1M tokens",
+        "Input Tokens",
+        "Cached input tokens",
+        "Output Tokens",
+    ];
+    let mut tables = html.select(&table_selector).filter(|table| {
+        table
+            .select(&header_selector)
+            .map(clean)
+            .collect::<Vec<_>>()
+            == expected
+    });
+    let table = tables
+        .next()
+        .context("Official Codex credit table schema changed")?;
+    ensure!(tables.next().is_none(), "Ambiguous Codex credit tables");
+    let number = |cell: &str| -> Result<f64> {
+        let text = cell
+            .strip_suffix(" credits")
+            .context("Unrecognized credit unit")?;
+        ensure!(
+            text.bytes()
+                .all(|c| c.is_ascii_digit() || b".,".contains(&c)),
+            "Invalid credit rate"
+        );
+        if let Some((_, fraction)) = text.split_once('.') {
+            ensure!(
+                !fraction.is_empty() && fraction.bytes().all(|c| c.is_ascii_digit()),
+                "Invalid credit fraction"
+            );
+        }
+        let grouping = text
+            .split('.')
+            .next()
+            .unwrap()
+            .split(',')
+            .collect::<Vec<_>>();
+        if grouping.len() > 1 {
+            ensure!(
+                (1..=3).contains(&grouping[0].len()) && grouping[1..].iter().all(|s| s.len() == 3),
+                "Invalid credit grouping"
+            );
+        }
+        let value: f64 = text
+            .replace(',', "")
+            .parse()
+            .context("Invalid numeric credit rate")?;
+        ensure!(value.is_finite() && value >= 0., "Invalid credit range");
+        Ok(value)
+    };
+    let mut models = BTreeMap::new();
+    for row in table.select(&row_selector) {
+        let cells = row.select(&cell_selector).map(clean).collect::<Vec<_>>();
+        ensure!(cells.len() == 4, "Official Codex credit row schema changed");
+        // Named cyber aliases and modality-specific image rows have no exact
+        // text-model identity. Do not collapse them into an available model ID.
+        if !cells[0].starts_with("GPT-") || cells[0].contains(['(', ')']) {
+            continue;
+        }
+        let id = cells[0].to_lowercase().replace(' ', "-");
+        ensure!(valid_id(&id), "Invalid Codex model label");
+        let rates = vec![Rates {
+            context: "base".into(),
+            input_tokens_max_inclusive: None,
+            input_tokens_min_exclusive: None,
+            input: number(&cells[1])?,
+            cached_input: Some(number(&cells[2])?),
+            output: number(&cells[3])?,
+            cache_write: None,
+            cache_write_1h: None,
+        }];
+        ensure!(
+            models.insert(id, rates).is_none(),
+            "Ambiguous duplicate credit rows"
+        );
+        ensure!(models.len() <= 1000, "Credit table exceeded row limit");
+    }
+    ensure!(!models.is_empty(), "Official credit table is empty");
+    Ok(Snapshot {
+        source: CODEX.into(),
+        observed_at,
+        models,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     const OPENAI_DOC: &str = "# Pricing\n### Standard pricing data\n\n| Model | Short context input | Short context cached input | Short context cache writes | Short context output | Long context input | Long context cached input | Long context cache writes | Long context output |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n| gpt-example | $2 | $0.20 | $2.50 | $10 | $4 | $0.40 | $5 | $15 |\n| gpt-small | $0 | - | - | $1 | - | - | - | - |\n\n### Batch pricing data\n| Model | Input | Output |\n| --- | --- | --- |\n| gpt-example | $1 | $5 |\n\nShort context: ≤272K input tokens. Long context: >272K input tokens.\n";
     const CLAUDE_DOC: &str = "## Model pricing\n\n| Model | Base input tokens | 5m cache writes | 1h cache writes | Cache hits and refreshes | Output tokens |\n| :--- | --- | --- | --- | --- | --- |\n| Claude Example 4.6 | $3 / MTok | $3.75 / MTok | $6 / MTok | $0.30 / MTok<sup>1</sup> | $15 / MTok |\n\n## Cloud platform pricing\n| Model | Input | Output |\n| --- | --- | --- |\n| Claude Example 4.6 | $99 | $999 |\n";
+    const CREDIT_DOC: &str = "# Pricing\n#### Token rates\nStandard credit-billed usage, not included quota.\n<table><thead><tr><th>Credits per 1M tokens</th><th>Input Tokens</th><th>Cached input tokens</th><th>Output Tokens</th></tr></thead><tbody><tr><td>GPT-6.1 Example</td><td>250 credits</td><td>2.5 credits</td><td>1,250 credits</td></tr><tr><td>Daybreak Blue</td><td>100 credits</td><td>10 credits</td><td>500 credits</td></tr><tr><td>GPT-Image-2 (text)</td><td>125 credits</td><td>31.25 credits</td><td>250 credits</td></tr></tbody><tfoot><tr><td colspan=\"4\">Footnote, not a model row</td></tr></tfoot></table>\n### Legacy rate card\nignored\n";
+
+    #[test]
+    fn credit_rates_are_not_dollars_api_prices_or_included_quota() {
+        let prices = Prices::default();
+        prices.snapshots.write().unwrap().insert(
+            "codex".into(),
+            parse("codex", &CREDIT_DOC.replace('\n', "\r\n"), 100).unwrap(),
+        );
+        let report = prices.report("codex", "gpt-6.1-example", "", 110);
+        assert_eq!(report["unit"], "credits_per_1m_tokens");
+        assert!(report["currency"].is_null());
+        assert_eq!(report["applicability"], "credit_billed_usage_only");
+        assert_eq!(report["rates"][0]["output"], 1250.0);
+        assert_eq!(report["rates"][0]["cached_input"], 2.5);
+        assert!(report["rates"][0]["cache_write"].is_null());
+        assert!(prices.api_reference("gpt-6.1-example", "", 110).is_null());
+        assert!(prices.report("codex", "gpt-image-2", "", 110).is_null());
+        assert_eq!(prices.snapshots.read().unwrap()["codex"].models.len(), 1);
+        for bad in [
+            CREDIT_DOC.replace("Input Tokens", "Dollars"),
+            CREDIT_DOC.replace("250 credits", "$250"),
+            CREDIT_DOC.replace("1,250 credits", "1,25 credits"),
+        ] {
+            assert!(parse("codex", &bad, 100).is_err());
+        }
+        let dir = tempfile::tempdir().unwrap();
+        prices.persist(dir.path()).unwrap();
+        let mut config = crate::config::Config {
+            state_dir: dir.path().into(),
+            ..Default::default()
+        };
+        config.auth.codex_home = Some(dir.path().into());
+        let catalog = crate::models::Catalog::default();
+        catalog.initialize(&config);
+        catalog.replace(
+            "codex",
+            vec![crate::models::Model::plain("gpt-6.1-example")],
+        );
+        let row = &catalog.report(Some("codex"), "", 0, 1)["models"][0];
+        assert_eq!(row["pricing"]["unit"], "credits_per_1m_tokens");
+        assert!(row["api_price_reference"].is_null());
+    }
 
     #[test]
     fn selects_standard_rates_and_preserves_context_and_cache_units() {
@@ -396,7 +565,7 @@ mod tests {
                 .is_null()
         );
         assert_eq!(
-            prices.report("codex", "gpt-example", "", 110)["applicability"],
+            prices.api_reference("gpt-example", "", 110)["applicability"],
             "api_reference_only"
         );
     }
@@ -494,10 +663,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let prices = Prices::default();
         prices
-            .refresh(dir.path(), &["codex", "openai"], &provider)
+            .refresh(dir.path(), &["openai", "openai"], &provider)
             .await;
         assert_eq!(hits.load(Ordering::SeqCst), 1);
-        prices.refresh(dir.path(), &["codex"], &provider).await;
+        prices.refresh(dir.path(), &["openai"], &provider).await;
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         let restored = Prices::default();
         restored.initialize(dir.path());
@@ -547,9 +716,9 @@ mod tests {
             .observed_at = now - STALE_SECONDS - 1;
         restored.persist(dir.path()).unwrap();
         let bytes = std::fs::read(dir.path().join("model-pricing.json")).unwrap();
-        restored.refresh(dir.path(), &["codex"], &provider).await;
+        restored.refresh(dir.path(), &["openai"], &provider).await;
         assert_eq!(hits.load(Ordering::SeqCst), 2);
-        restored.refresh(dir.path(), &["codex"], &provider).await;
+        restored.refresh(dir.path(), &["openai"], &provider).await;
         assert_eq!(
             hits.load(Ordering::SeqCst),
             2,
@@ -573,7 +742,7 @@ mod tests {
     #[ignore = "fetches current public provider documentation; no authentication or inference"]
     async fn official_pricing_documents_live() {
         let api = Provider::new(30).unwrap();
-        for provider in ["openai", "anthropic"] {
+        for provider in ["codex", "openai", "anthropic"] {
             let doc = api
                 .pricing_document(source(provider).unwrap())
                 .await
