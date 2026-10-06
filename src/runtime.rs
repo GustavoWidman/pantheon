@@ -993,7 +993,7 @@ impl Harness {
                     run.channel,
                     &format!("tell:{message_id}"),
                     &format!(
-                        "-> message sent to {} [{}]",
+                        "↗ message sent to {} [{}]",
                         self.store.agent_label(id)?,
                         crate::ui::short_id(id)
                     ),
@@ -1939,7 +1939,7 @@ impl Harness {
                             job.channel,
                             &format!("job:{}:{}:fired", job.id, job.due),
                             &format!(
-                                "-> {} notification for {}",
+                                "↙ {} notification for {}",
                                 job.kind,
                                 h.store.agent_label(
                                     job.payload["_owner"].as_str().unwrap_or("Coordinator")
@@ -2551,6 +2551,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scheduled_notifications_use_incoming_markers() {
+        let (_directory, h, run, _mock, server) = fixture("openai", vec![]).await;
+        for kind in ["wakeup", "monitor"] {
+            h.store.bind_context(kind, &run.context).unwrap();
+            h.store.add_job(&Job {
+                id: kind.into(), channel: 1, user: 2, kind: kind.into(),
+                payload: json!({"_owner":"channel:1","prompt":"check","command":"printf ready"}),
+                due: crate::store::now(), interval: None,
+            }).unwrap();
+        }
+        let worker = tokio::spawn(h.clone().job_worker());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let timeline = h
+                    .store
+                    .db
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT count(*) FROM ui_events WHERE label LIKE '↙ % notification%'",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap();
+                if timeline == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let timeline = drain(&h)
+            .into_iter()
+            .map(|m| m.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(timeline.contains("↙ wakeup notification for Coordinator"));
+        assert!(timeline.contains("↙ monitor notification for Coordinator"));
+        assert!(!timeline.contains("->"));
+        h.shutdown.cancel();
+        worker.await.unwrap().unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn scheduler_tools_are_owned_by_each_agent() {
         let (_directory, h, mut run, _mock, server) = fixture("openai", vec![]).await;
         run.child = true;
@@ -3084,12 +3130,9 @@ mod tests {
             }
         }).await.unwrap();
         let timeline = drain(&h);
-        assert!(
-            timeline
-                .iter()
-                .any(|m| m.channel == 1
-                    && m.text.contains("message sent to Coordinator [channel:3]"))
-        );
+        assert!(timeline.iter().any(
+            |m| m.channel == 1 && m.text.contains("↗ message sent to Coordinator [channel:3]")
+        ));
         let answer = timeline
             .iter()
             .find(|m| m.text == "neighbor response")
