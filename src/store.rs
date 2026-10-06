@@ -67,6 +67,7 @@ impl Store {
         CREATE TABLE IF NOT EXISTS shell_runs(id TEXT PRIMARY KEY,owner TEXT NOT NULL,channel TEXT NOT NULL,user TEXT NOT NULL,command TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'running',background INTEGER NOT NULL DEFAULT 0,output TEXT);
         PRAGMA user_version=2;")?;
         crate::ui::initialize(&db)?;
+        crate::cache::initialize(&db)?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS agent_lifecycle(id TEXT PRIMARY KEY REFERENCES tasks(id),channel TEXT NOT NULL,last_active INTEGER NOT NULL,archived INTEGER NOT NULL DEFAULT 0);
         CREATE INDEX IF NOT EXISTS agents_idle ON agent_lifecycle(last_active,id) WHERE archived=0;
         CREATE INDEX IF NOT EXISTS agents_visible ON agent_lifecycle(channel,id) WHERE archived=0;
@@ -310,13 +311,7 @@ impl Store {
         Ok(())
     }
     pub fn usage(&self, channel: u64, model: &str, usage: &Value) -> Result<()> {
-        let mut usage = usage.clone();
-        usage["_pantheon_model"] = serde_json::json!(model);
-        self.db.lock().unwrap().execute(
-            "UPDATE settings SET usage=?2 WHERE channel=?1",
-            params![channel.to_string(), usage.to_string()],
-        )?;
-        Ok(())
+        self.observed_usage(channel, model, usage, "unclassified")
     }
     pub fn stats(&self, channel: u64) -> Result<Value> {
         let db = self.db.lock().unwrap();
@@ -843,6 +838,16 @@ impl Store {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
         tx.execute("UPDATE shell_runs SET background=1 WHERE id=?1", [id])?;
+        if let Some(output) = tx
+            .query_row(
+                "SELECT output FROM shell_runs WHERE id=?1 AND state='done'",
+                [id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            crate::ui::shell_finished(&tx, id, &output, false)?;
+        }
         shell_delivery(&tx, id)?;
         tx.commit()?;
         Ok(())
@@ -854,6 +859,7 @@ impl Store {
             "UPDATE shell_runs SET state=?2,output=?3 WHERE id=?1",
             params![id, if cancelled { "cancelled" } else { "done" }, output],
         )?;
+        crate::ui::shell_finished(&tx, id, output, cancelled)?;
         shell_delivery(&tx, id)?;
         tx.commit()?;
         Ok(())
@@ -865,10 +871,7 @@ impl Store {
             "UPDATE ui_agents SET active=0,phase='Interrupted' WHERE active=1",
             [],
         )?;
-        tx.execute(
-            "UPDATE ui_events SET status='error' WHERE status='running'",
-            [],
-        )?;
+        crate::ui::interrupt_tools(&tx)?;
         let affected = {
             let mut s =
                 tx.prepare("SELECT DISTINCT channel,user FROM inbox WHERE state='running'")?;
@@ -903,6 +906,7 @@ impl Store {
         };
         for id in shells {
             tx.execute("UPDATE shell_runs SET state='done',background=1,output='Interrupted by harness restart. Inspect command effects before retrying; the command was not replayed.' WHERE id=?1",[&id])?;
+            crate::ui::shell_finished(&tx, &id, "Interrupted by harness restart", false)?;
             shell_delivery(&tx, &id)?;
         }
         let active_agents = {

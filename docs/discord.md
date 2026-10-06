@@ -11,6 +11,7 @@ Registered commands:
 | Command | Purpose |
 | --- | --- |
 | `/context` | Inspect model-window and memory grids, token counts and prompt-cache reuse |
+| `/cache` | Inspect provider cache reads/writes, recent requests and fresh-view prefix stability |
 | `/model [id]` | Inspect or choose the channel model |
 | `/reasoning [level]` | Inspect or choose reasoning effort |
 | `/stop` | Cancel the current run and its background agents |

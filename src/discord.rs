@@ -906,6 +906,11 @@ pub fn command_definitions() -> Value {
         ),
         command("status", "Show active work and delivery status", vec![]),
         command(
+            "cache",
+            "Show measured prompt-cache reuse and prefix stability",
+            vec![]
+        ),
+        command(
             "skills",
             "Browse available task guides",
             vec![string_option("id", "Skill ID to inspect", false)]

@@ -337,6 +337,15 @@ impl Harness {
                 *c.cancel.lock().await = None;
                 continue;
             }
+            let view = view.unwrap();
+            self.store.cache_turn(
+                channel,
+                &settings.0,
+                &settings.1,
+                &self.master_system,
+                &tools::definitions(false, self.config.agent.coordinator_root),
+                &view,
+            )?;
             let mut ids = vec![];
             let mut texts = vec![];
             for input in &queued {
@@ -359,7 +368,7 @@ impl Harness {
                 child: false,
                 memory: c.clone(),
                 cancel: cancel.clone(),
-                history: Provider::start(vendor, &view.unwrap(), &texts.join("\n\n")),
+                history: Provider::start(vendor, &view, &texts.join("\n\n")),
                 settings,
                 inputs: ids,
                 trace: None,
@@ -439,7 +448,7 @@ impl Harness {
             if run.cancel.is_cancelled() {
                 bail!("cancelled");
             }
-            self.steer(run, vendor).await?;
+            let steered = self.steer(run, vendor).await? || !run.steering.is_empty();
             for text in std::mem::take(&mut run.steering) {
                 run.history.push(Provider::user(vendor, &text));
             }
@@ -451,8 +460,18 @@ impl Harness {
                 _=run.cancel.cancelled()=>bail!("cancelled"),
             };
             if !run.child {
-                self.store
-                    .usage(run.channel, &run.settings.0, &response.usage)?;
+                self.store.observed_usage(
+                    run.channel,
+                    &run.settings.0,
+                    &response.usage,
+                    if step == 0 {
+                        "fresh_turn"
+                    } else if steered {
+                        "steered_step"
+                    } else {
+                        "tool_step"
+                    },
+                )?;
             }
             Provider::append_response(vendor, &mut run.history, &response);
             let final_steered = if response.calls.is_empty() {
@@ -548,8 +567,8 @@ impl Harness {
                 });
             }
             for (index, call) in response.calls.iter().enumerate() {
-                // Each boundary can receive steering; the next request keeps the exact prior prefix.
-                let steered = self.steer(run, vendor).await? || !run.steering.is_empty();
+                // Finish the model's requested batch before delivering queued steering.
+                // Provider transcripts require a result for every requested call.
                 if run.cancel.is_cancelled() {
                     bail!("cancelled");
                 }
@@ -562,26 +581,19 @@ impl Harness {
                 let tool_id = format!("{run_id}:{step}:tool:{index}");
                 self.store.tool_start(&tool_id, run.channel, &call.name)?;
                 let start = Instant::now();
-                let label = tools::activity_label(call);
                 self.store
                     .agent_phase(&run.owner, true, &format!("Running {}", call.name))?;
                 let control = matches!(call.name.as_str(), "spawn" | "tell");
                 if !control {
-                    self.store.agent_activity_event(
+                    self.store.start_tool_activity(
                         &run.owner,
                         &run.context,
                         run.channel,
                         &tool_id,
-                        &label,
-                        "running",
-                        Duration::ZERO,
+                        call,
                     )?;
                 }
-                let result = if steered {
-                    Ok("Skipped because new steering arrived; reconsider this call before executing.".to_string())
-                } else {
-                    self.execute_tool(run, call).await
-                };
+                let result = self.execute_tool_tracked(run, call, Some(&tool_id)).await;
                 let mut error = result.is_err();
                 let output = match result {
                     Ok(v) => v,
@@ -594,23 +606,21 @@ impl Harness {
                 }
                 let output = crate::memory::cap_tool_result(&output);
                 self.log_run(run, Kind::Echo, &output).await?;
-                let image = if call.name == "browser"
-                    && call.arguments["action"] == "screenshot"
-                    && !error
-                    && !steered
-                {
-                    let meta: Value = serde_json::from_str(&output)?;
-                    let path = tools::string(&meta, "path")?;
-                    let bytes = tokio::fs::read(path).await?;
-                    ensure!(
-                        bytes.len() <= 12_000_000,
-                        "screenshot too large for provider input"
-                    );
-                    use base64::Engine;
-                    Some(base64::engine::general_purpose::STANDARD.encode(bytes))
-                } else {
-                    None
-                };
+                let image =
+                    if call.name == "browser" && call.arguments["action"] == "screenshot" && !error
+                    {
+                        let meta: Value = serde_json::from_str(&output)?;
+                        let path = tools::string(&meta, "path")?;
+                        let bytes = tokio::fs::read(path).await?;
+                        ensure!(
+                            bytes.len() <= 12_000_000,
+                            "screenshot too large for provider input"
+                        );
+                        use base64::Engine;
+                        Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+                    } else {
+                        None
+                    };
                 Provider::append_result_with_image(
                     vendor,
                     &mut run.history,
@@ -623,16 +633,15 @@ impl Harness {
                 let background = !error
                     && serde_json::from_str::<Value>(&output)
                         .is_ok_and(|v| v["state"] == "background");
-                if !control || error || steered {
-                    self.store.agent_activity_event(
+                if !control || error {
+                    self.store.finish_tool_activity(
                         &run.owner,
                         &run.context,
                         run.channel,
                         &tool_id,
-                        &label,
-                        if steered {
-                            "skipped"
-                        } else if error {
+                        call,
+                        &output,
+                        if error {
                             "error"
                         } else if background {
                             "background"
@@ -673,16 +682,6 @@ impl Harness {
                     continue;
                 }
                 self.store.bind_context(&input.id, &run.context)?;
-                if !prompt && input.id.starts_with("shell:") {
-                    self.store.activity_event(
-                        &run.context,
-                        run.channel,
-                        &format!("incoming:{}", input.id),
-                        "-> shell completion for Coordinator",
-                        "event",
-                        Duration::ZERO,
-                    )?;
-                }
                 self.store.input_state(&input.id, "running")?;
                 Self::append_input(&run.memory, &input).await?;
                 self.store.mark_logged(&input.id)?;
@@ -693,7 +692,16 @@ impl Harness {
         }
         Ok(received)
     }
+    #[cfg(test)]
     async fn execute_tool(self: &Arc<Self>, run: &mut Run, call: &ToolCall) -> Result<String> {
+        self.execute_tool_tracked(run, call, None).await
+    }
+    async fn execute_tool_tracked(
+        self: &Arc<Self>,
+        run: &mut Run,
+        call: &ToolCall,
+        tool_id: Option<&str>,
+    ) -> Result<String> {
         ensure!(
             tools::definitions(run.child, self.config.agent.coordinator_root)
                 .iter()
@@ -730,7 +738,11 @@ impl Harness {
                     tools::string(a, "path")?,
                     false,
                 )?;
-                return tools::read_file(&p).await;
+                let (text, lines) = tools::read_file_observed(&p).await?;
+                if let Some(id) = tool_id {
+                    self.store.tool_output_lines(id, lines)?;
+                }
+                return Ok(text);
             }
             "write" => {
                 let p =
@@ -751,7 +763,9 @@ impl Harness {
                 json!({"written":text.len()})
             }
             "shell" => {
-                return self.shell_tool(run, tools::string(a, "command")?).await;
+                return self
+                    .shell_tool_tracked(run, tools::string(a, "command")?, tool_id)
+                    .await;
             }
             "web_fetch" => {
                 let max_chars = a
@@ -1085,7 +1099,16 @@ impl Harness {
         .await?;
         Ok(())
     }
+    #[cfg(test)]
     async fn shell_tool(self: &Arc<Self>, run: &Run, command: &str) -> Result<String> {
+        self.shell_tool_tracked(run, command, None).await
+    }
+    async fn shell_tool_tracked(
+        self: &Arc<Self>,
+        run: &Run,
+        command: &str,
+        tool_id: Option<&str>,
+    ) -> Result<String> {
         ensure!(!command.is_empty(), "empty command");
         let permit = self
             .shell_capacity
@@ -1096,6 +1119,9 @@ impl Harness {
         self.store.bind_context(&id, &run.context)?;
         self.store
             .shell_start(&id, &run.owner, run.channel, run.user, command)?;
+        if let Some(event) = tool_id {
+            self.store.bind_shell_activity(&id, event)?;
+        }
         let cancel = run.cancel.child_token();
         self.shell_jobs
             .lock()
@@ -1106,15 +1132,32 @@ impl Harness {
         let job_id = id.clone();
         let command = command.to_owned();
         let channel = run.channel;
+        let event = tool_id.map(str::to_owned);
         tokio::spawn(async move {
             let _permit = permit;
-            let result = tools::shell(
+            let progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let execution = tools::shell_with_progress(
                 &h.config.workspace,
                 &command,
                 h.config.agent.shell_timeout_seconds,
                 &cancel,
-            )
-            .await;
+                Some(progress.clone()),
+            );
+            tokio::pin!(execution);
+            let mut tick = tokio::time::interval_at(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                Duration::from_secs(1),
+            );
+            let result = loop {
+                tokio::select! {
+                    result=&mut execution=>break result,
+                    _=tick.tick()=>if let Some(id)=&event
+                        && progress.load(std::sync::atomic::Ordering::Relaxed)>0
+                        && let Err(error)=h.store.tool_output_lines(id,progress.load(std::sync::atomic::Ordering::Relaxed)) {
+                            h.shutdown.cancel();cancel.cancel();break Err(error.context("persist shell progress"));
+                        },
+                }
+            };
             let output = match &result {
                 Ok(output) => output.clone(),
                 Err(error) => format!("Error: {error}"),
@@ -1342,6 +1385,7 @@ impl Harness {
                     false,
                 ));
             }
+            "cache" => return self.store.cache_card(channel),
             "context" => {
                 let stats = c.memory.lock().await.stats();
                 let operational = self.store.stats(channel)?;
@@ -1621,8 +1665,13 @@ impl Harness {
     }
     async fn progress_worker(self: Arc<Self>) -> Result<()> {
         let mut typing = tokio::task::JoinSet::new();
+        let mut last_typing = Instant::now() - Duration::from_secs(4);
         loop {
-            tokio::select! {_=self.shutdown.cancelled()=>break,_=tokio::time::sleep(Duration::from_secs(4))=>{}};
+            tokio::select! {_=self.shutdown.cancelled()=>break,_=tokio::time::sleep(Duration::from_secs(1))=>{}};
+            let send_typing = last_typing.elapsed() >= Duration::from_secs(4);
+            if send_typing {
+                last_typing = Instant::now();
+            }
             while typing.try_join_next().is_some() {}
             let channels = self
                 .channels
@@ -1633,7 +1682,7 @@ impl Harness {
                 .collect::<Vec<_>>();
             for (id, c) in channels {
                 let settled = c.memory.lock().await.is_settled();
-                if self.store.refresh_activities(id, settled)? && typing.len() < 16 {
+                if self.store.refresh_activities(id, settled)? && send_typing && typing.len() < 16 {
                     let discord = self.discord.clone();
                     let stop = self.shutdown.clone();
                     typing.spawn(async move {
@@ -2403,7 +2452,7 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
-    async fn anthropic_steering_follows_all_tool_results_and_skips_pending_effects() {
+    async fn anthropic_steering_queues_until_all_requested_tool_effects_finish() {
         let calls = json!({"stop_reason":"tool_use","content":[{"type":"thinking","thinking":"private-thought","signature":"native-signature"},{"type":"tool_use","id":"c1","name":"write","input":{"path":"should-not-exist","text":"bad"}},{"type":"tool_use","id":"c2","name":"write","input":{"path":"also-missing","text":"bad"}}],"usage":{}});
         let (d, h, run, mock, server) = fixture(
             "anthropic",
@@ -2423,8 +2472,14 @@ mod tests {
             .unwrap();
         mock.release.notify_one();
         task.await.unwrap().unwrap();
-        assert!(!d.path().join("should-not-exist").exists());
-        assert!(!d.path().join("also-missing").exists());
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("should-not-exist")).unwrap(),
+            "bad"
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("also-missing")).unwrap(),
+            "bad"
+        );
         let requests = mock.requests.lock().await;
         let messages = requests[1]["messages"].as_array().unwrap();
         assert_eq!(messages[1]["content"], calls["content"]);
@@ -2437,6 +2492,135 @@ mod tests {
         let exported = memory.memory.lock().await.export_html();
         assert!(!exported.contains("private-thought"));
         assert!(!exported.contains("native-signature"));
+        server.abort();
+    }
+    #[tokio::test]
+    async fn steering_accumulates_during_shell_and_follows_the_completed_batch() {
+        let calls = json!({"status":"completed","output":[{"type":"function_call","call_id":"slow","name":"shell","arguments":"{\"command\":\"printf started > marker; sleep 0.2; printf done\"}"},{"type":"function_call","call_id":"write","name":"write","arguments":"{\"path\":\"finished.txt\",\"text\":\"finished\"}"}]});
+        let (d, h, run, mock, server) = fixture(
+            "openai",
+            vec![
+                calls,
+                final_response("openai", "Finished; received both steers"),
+            ],
+        )
+        .await;
+        let task = tokio::spawn(h.clone().run_agent(run));
+        mock.started.notified().await;
+        mock.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !d.path().join("marker").exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        for (id, text) in [
+            ("steer-a", "first correction"),
+            ("steer-b", "second correction"),
+        ] {
+            h.store
+                .admit(&Input {
+                    id: id.into(),
+                    channel: 1,
+                    user: 2,
+                    text: text.into(),
+                })
+                .unwrap();
+        }
+        task.await.unwrap().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("finished.txt")).unwrap(),
+            "finished"
+        );
+        let requests = mock.requests.lock().await;
+        let input = requests[1]["input"].as_array().unwrap();
+        let outputs = input
+            .iter()
+            .filter(|i| i["type"] == "function_call_output")
+            .collect::<Vec<_>>();
+        assert_eq!(outputs.len(), 2);
+        assert!(
+            outputs[0]["output"]
+                .as_str()
+                .unwrap()
+                .contains("stdout:\ndone")
+        );
+        assert!(!outputs.iter().any(|o| o.to_string().contains("Skipped")));
+        let tail = &input[input.len() - 2..];
+        assert_eq!(tail[0]["content"][0]["text"], "first correction");
+        assert_eq!(tail[1]["content"][0]["text"], "second correction");
+        assert!(
+            h.store
+                .cache_card(1)
+                .unwrap()
+                .to_string()
+                .contains("steered step")
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn root_detached_shell_updates_original_activity_without_completion_marker() {
+        let (_d, mut h, mut run, _mock, server) = fixture("openai", vec![]).await;
+        Arc::get_mut(&mut h)
+            .unwrap()
+            .config
+            .agent
+            .shell_background_after_seconds = 0;
+        let call = ToolCall {
+            id: "shell-call".into(),
+            name: "shell".into(),
+            arguments: json!({"command":"sleep 0.1; printf done"}),
+        };
+        h.store
+            .start_tool_activity(&run.owner, &run.context, 1, "public-call", &call)
+            .unwrap();
+        let reply = h
+            .execute_tool_tracked(&mut run, &call, Some("public-call"))
+            .await
+            .unwrap();
+        h.store
+            .finish_tool_activity(
+                &run.owner,
+                &run.context,
+                1,
+                "public-call",
+                &call,
+                &reply,
+                "background",
+                Duration::ZERO,
+            )
+            .unwrap();
+        h.store
+            .enqueue_notice(
+                &run.context,
+                "progress",
+                1,
+                None,
+                "Continuing independent work",
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while h
+                .store
+                .queued(1)
+                .unwrap()
+                .iter()
+                .all(|i| !i.id.starts_with("shell:"))
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        h.steer(&mut run, "openai").await.unwrap();
+        let timeline = drain(&h);
+        assert_eq!(timeline.len(), 2);
+        assert!(timeline[0].text.contains("↙ shell"));
+        assert!(timeline[0].text.contains("↓ 1 lines"));
+        assert!(!timeline.iter().any(|t| t.text.contains("shell completion")));
+        assert!(run.steering[0].contains("stdout:\ndone"));
+        h.shutdown.cancel();
         server.abort();
     }
     #[tokio::test]

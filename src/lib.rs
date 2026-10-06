@@ -1,5 +1,7 @@
+pub mod activity;
 pub mod auth;
 pub mod browser;
+pub mod cache;
 pub mod config;
 pub mod discord;
 pub mod mcp;

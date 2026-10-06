@@ -1,6 +1,6 @@
 [package]
 name = "pantheon"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -17,6 +17,7 @@ if-addrs = "0.15"
 hex = "0.4"
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+regex = "1"
 rmcp = { version = "3.5.1", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
 reqwest_mcp = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
