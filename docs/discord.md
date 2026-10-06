@@ -12,8 +12,8 @@ Registered commands:
 | --- | --- |
 | `/context` | Inspect model-window and memory grids, token counts and prompt-cache reuse |
 | `/cache` | Inspect provider cache reads/writes, recent requests and fresh-view prefix stability |
-| `/model [id]` | Inspect or choose the channel model |
-| `/reasoning [level]` | Inspect or choose reasoning effort |
+| `/model [kind] [provider] [model]` | Chat-local agent/compactor overrides; model and provider autocomplete |
+| `/reasoning [level]` | Select an effort advertised by this chat’s model, with autocomplete |
 | `/stop` | Cancel the current run and its background agents |
 | `/status` | Inspect active agent phases, shell jobs, message queues, schedules and delivery |
 | `/subagents` | List background agents |
@@ -52,7 +52,7 @@ Each accepted input receives 📥. That becomes 🧠 when an actual model reques
 
 A four-second heartbeat renews typing while the coordinator, workers, detached shell jobs, queued reports or context compaction are busy. Activity edits are limited to one per two seconds per channel and use a two-second transport deadline; durable retries preserve backoff. New fences and prose can pass delayed edits of existing messages, while an unsent earlier fence preserves the order of new messages.
 
-Codex reasoning choices resolve against the CLI's local model capability metadata. A request for `minimal` uses `low` when available, or the first supported effort, when a model does not support `minimal`; spawn metadata and saved settings show the actual effort. Other unsupported known efforts produce a visible validation error before dispatch.
+Reasoning autocomplete uses this chat model’s live advertised efforts. Known unsupported manual choices are rejected with the available levels. Live catalog metadata takes precedence over older CLI cache metadata. Legacy internal `minimal` requests can map to `low`; the picker does not advertise unsupported levels. See [model discovery](models.md).
 
 Slash commands return private, branded embeds with structured model, effort, context usage, cache and worker fields. Errors use a distinct error color. Embed and message limits count UTF-16 units, including emoji.
 
@@ -71,3 +71,5 @@ REST calls retry rate limits, connection failures, and HTTP 5xx responses at mos
 Protocol references: [Gateway](https://docs.discord.com/developers/events/gateway), [Message resource](https://docs.discord.com/developers/resources/message), and [Interaction responses](https://docs.discord.com/developers/interactions/receiving-and-responding).
 
 Idle identities are hidden from `/subagents` after one hour by default, with history retained. Busy or queued workers remain visible. The agent-facing `list_agents` directory is paginated, can include archived identities, and supports coordinator discovery across channels; worker discovery stays local. `tell` automatically restores and wakes an idle identity; user input and scheduled notifications do the same. Incoming cross-channel coordinator messages have their own visible activity marker. A message that wakes a settled coordinator starts a new activity without replying to an old Discord message or automatically mentioning its author.
+
+Model selections are scoped to this chat and survive restart; `model:default` restores config defaults. See [model discovery](models.md) for catalog sources, reasoning compatibility and compactor transitions.

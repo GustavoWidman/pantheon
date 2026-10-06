@@ -23,6 +23,17 @@ enum Action {
     Run,
     /// Check configuration, credentials and bundled browser dependencies without network calls.
     Doctor,
+    /// Discover authenticated providers and live model/effort catalogs without inference.
+    Models {
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long, default_value = "")]
+        query: String,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
     /// Sign in with ChatGPT using the bundled official Codex CLI and configured auth home.
     LoginCodex {
         #[arg(long)]
@@ -59,6 +70,29 @@ async fn main() -> Result<()> {
     }
     if let Some(Action::LoginCodex { device_auth }) = cli.command {
         return config.auth.login(device_auth).await;
+    }
+    if let Some(Action::Models {
+        provider,
+        query,
+        offset,
+        limit,
+    }) = &cli.command
+    {
+        std::fs::create_dir_all(&config.state_dir)?;
+        let catalog = pantheon::models::Catalog::default();
+        catalog.initialize(&config);
+        let api = pantheon::provider::Provider::new(30)?.with_auth(config.auth.clone());
+        catalog.refresh(&config, &api).await;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&catalog.report(
+                provider.as_deref(),
+                query,
+                *offset,
+                *limit
+            ))?
+        );
+        return Ok(());
     }
     std::fs::create_dir_all(&config.state_dir)?;
     // Entire daemon, operational DB and offline CLI share one lifetime writer lock.
@@ -128,7 +162,7 @@ async fn main() -> Result<()> {
             result?;
             gateway_result?;
         }
-        Action::Doctor | Action::LoginCodex { .. } => unreachable!(),
+        Action::Doctor | Action::LoginCodex { .. } | Action::Models { .. } => unreachable!(),
     }
     drop(lock);
     Ok(())

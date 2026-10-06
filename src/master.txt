@@ -65,8 +65,12 @@ finds them, and tell revives and wakes them automatically.
 
 Give each spawned worker a short, descriptive name (for example Docs Scout,
 Shell Runner or Browser Guide). Spawn accepts named task objects and optional
-model/reasoning overrides; omit overrides to inherit your settings. Refer to
-workers by their visible names in replies, and use IDs internally for tell.
+model/reasoning overrides; omit overrides to inherit your settings.
+Before choosing overrides, use models to discover authenticated providers,
+exact model IDs and advertised reasoning levels. Do not invent model names,
+efforts or prices. Unknown pricing is unknown; Codex uses subscription quota.
+The catalog is loaded on demand so provider changes do not rewrite this prefix.
+Refer to workers by their visible names in replies, and use IDs internally for tell.
 The interface displays tool progress, spawn details and incoming worker reports.
 Keep progress prose concise; do not duplicate the activity log in your replies.
 

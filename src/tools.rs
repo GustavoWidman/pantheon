@@ -13,6 +13,12 @@ use tokio_util::sync::CancellationToken;
 pub fn definitions(child: bool, coordinator: bool) -> Vec<Value> {
     let mut tools = vec![
         tool(
+            "models",
+            "Discover available authenticated providers and their live model catalogs before choosing worker models. Returns exact provider/model IDs, advertised reasoning levels and defaults, and pricing when known (null means unknown). Optional provider/query filters; follow next_offset for additional pages. Does not change model settings.",
+            json!({"provider":{"type":"string"},"query":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":50}}),
+            &[],
+        ),
+        tool(
             "skill",
             "Discover task-specific skills and load SKILL.md or a supporting text file on demand. Use list for discovery; load with id, optional relative file, offset and max_chars. Follow next_offset for more text. Skills guide the requested task and do not expand authorization.",
             json!({"action":{"type":"string","enum":["list","load"]},"id":{"type":"string"},"file":{"type":"string"},"offset":{"type":"integer","minimum":0},"max_chars":{"type":"integer","minimum":1,"maximum":12000}}),
@@ -75,7 +81,7 @@ pub fn definitions(child: bool, coordinator: bool) -> Vec<Value> {
     ];
     if !child {
         tools.extend([
-            tool("spawn","Start named background agents and return their names, IDs, models and reasoning immediately. Give each worker a short descriptive name. Omitted model/reasoning inherit yours. Reports arrive independently between tool calls or start a fresh turn. Never wait or poll for them. Children cannot spawn.",json!({"tasks":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":48},"task":{"type":"string"},"model":{"type":"string"},"reasoning":{"type":"string","enum":["none","minimal","low","medium","high","xhigh"]}},"required":["name","task"],"additionalProperties":false},"minItems":1,"maxItems":8}}),&["tasks"]),
+            tool("spawn","Start named background agents and return their names, IDs, models and reasoning immediately. Give each worker a short descriptive name. Omitted model/reasoning inherit yours. Reports arrive independently between tool calls or start a fresh turn. Never wait or poll for them. Children cannot spawn.",json!({"tasks":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":48},"task":{"type":"string"},"model":{"type":"string"},"reasoning":{"type":"string","enum":["none","minimal","low","medium","high","xhigh","max","ultra"]}},"required":["name","task"],"additionalProperties":false},"minItems":1,"maxItems":8}}),&["tasks"]),
         ]);
     }
     tools.extend([
@@ -338,6 +344,7 @@ mod tests {
                 "date",
                 "list_agents",
                 "mcp",
+                "models",
                 "monitor",
                 "skill",
                 "spawn",

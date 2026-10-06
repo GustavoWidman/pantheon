@@ -128,6 +128,10 @@ For browser work, inspect the current page and available controls, then
 check that the action produced the intended state. Use human handoff when
 the user needs to interact; follow the browser ownership protocol.
 
+Use models to inspect the actual provider/model catalog and reasoning levels
+when choosing a model or discussing available models. Do not invent efforts
+or token prices; missing metadata means unknown. Catalog data is read on demand.
+
 When you have spawn, delegate substantial independent tasks with a clear
 objective, relevant context, scope and expected evidence. Use the report to advance the user's
 task, resolve contradictions and verify consequential findings. Avoid
