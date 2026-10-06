@@ -1929,13 +1929,7 @@ impl Harness {
                             &context,
                             job.channel,
                             &format!("job:{}:{}:fired", job.id, job.due),
-                            &format!(
-                                "↙ {} notification for {}",
-                                job.kind,
-                                h.store.agent_label(
-                                    job.payload["_owner"].as_str().unwrap_or("Coordinator")
-                                )?
-                            ),
+                            &format!("↙ {} notification", job.kind),
                             "event",
                             Duration::ZERO,
                         )?;
@@ -2672,9 +2666,10 @@ mod tests {
             .map(|m| m.text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(timeline.contains("↙ wakeup notification for Coordinator"));
-        assert!(timeline.contains("↙ monitor notification for Coordinator"));
+        assert!(timeline.contains("↙ wakeup notification"));
+        assert!(timeline.contains("↙ monitor notification"));
         assert!(!timeline.contains("->"));
+        assert!(!timeline.contains("for Coordinator"));
         h.shutdown.cancel();
         worker.await.unwrap().unwrap();
         server.abort();
