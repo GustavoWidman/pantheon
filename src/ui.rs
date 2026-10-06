@@ -327,10 +327,14 @@ impl Store {
     pub fn refresh_activities(&self, channel: u64, settled: bool) -> Result<bool> {
         let mut locked = self.db.lock().unwrap();
         let db = locked.transaction()?;
-        let mut stmt=db.prepare("SELECT s.activity FROM ui_sessions s WHERE channel=?1 AND (s.settled=0 OR EXISTS(SELECT 1 FROM ui_reactions r WHERE r.activity=s.activity AND r.desired<2) OR s.activity=(SELECT activity FROM ui_contexts WHERE source=?2) OR EXISTS(SELECT 1 FROM ui_agents a WHERE a.activity=s.activity AND active=1) OR EXISTS(SELECT 1 FROM shell_runs r JOIN ui_contexts c ON c.source=r.id WHERE c.activity=s.activity AND r.state='running') OR EXISTS(SELECT 1 FROM agent_inbox i JOIN ui_contexts c ON c.source=i.id WHERE c.activity=s.activity AND i.state='queued'))")?;
+        let mut stmt=db.prepare("SELECT s.activity FROM ui_sessions s WHERE channel=?1 AND (s.settled=0 OR EXISTS(SELECT 1 FROM ui_reactions r WHERE r.activity=s.activity AND r.desired<2) OR s.activity=(SELECT activity FROM ui_contexts WHERE source=?2) OR EXISTS(SELECT 1 FROM ui_agents a WHERE a.activity=s.activity AND active=1) OR EXISTS(SELECT 1 FROM shell_runs r JOIN ui_contexts c ON c.source=r.id WHERE c.activity=s.activity AND r.state='running') OR EXISTS(SELECT 1 FROM agent_inbox i JOIN ui_contexts c ON c.source=i.id WHERE c.activity=s.activity AND i.state='queued') OR EXISTS(SELECT 1 FROM inbox i JOIN ui_contexts c ON c.source=i.id WHERE c.activity=s.activity AND i.state IN ('queued','running')) OR EXISTS(SELECT 1 FROM jobs j JOIN ui_contexts c ON c.source=j.id WHERE c.activity=s.activity AND j.state='active' AND j.due<=?3))")?;
         let activities = stmt
             .query_map(
-                params![channel.to_string(), format!("channel:{channel}")],
+                params![
+                    channel.to_string(),
+                    format!("channel:{channel}"),
+                    crate::store::now()
+                ],
                 |r| r.get::<_, String>(0),
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -343,12 +347,13 @@ impl Store {
             )?;
             let working = render_activity(&db, &activity)?;
             busy |= working;
-            let closed: bool = db.query_row(
-                "SELECT closed FROM ui_sessions WHERE activity=?1",
-                [&activity],
-                |r| r.get(0),
-            )?;
-            if closed && !working {
+            if !working {
+                // A silent monitor tick or cancellation can drain background work
+                // without another model turn to close the activity.
+                db.execute(
+                    "UPDATE ui_sessions SET closed=1 WHERE activity=?1",
+                    [&activity],
+                )?;
                 db.execute(
                     "UPDATE ui_reactions SET desired=2,next_try=0 WHERE activity=?1 AND desired<2",
                     [&activity],
@@ -533,7 +538,7 @@ pub(crate) fn close_segments(db: &Connection, channel: u64) -> Result<()> {
     Ok(())
 }
 pub(crate) fn background_count(db: &Connection, activity: &str) -> Result<i64> {
-    Ok(db.query_row("SELECT (SELECT count(*) FROM tasks t JOIN ui_contexts c ON c.source=t.id WHERE c.activity=?1 AND t.state='running')+(SELECT count(*) FROM ui_agents a WHERE a.activity=?1 AND active=1 AND owner NOT LIKE 'channel:%')+(SELECT count(*) FROM shell_runs r JOIN ui_contexts c ON c.source=r.id WHERE c.activity=?1 AND r.state='running')+(SELECT count(*) FROM agent_runs r JOIN ui_contexts c ON c.source=r.owner WHERE c.activity=?1 AND r.state='running')+(SELECT count(*) FROM agent_inbox i JOIN ui_contexts c ON c.source=i.id WHERE c.activity=?1 AND i.state='queued')",[activity],|r|r.get(0))?)
+    Ok(db.query_row("SELECT (SELECT count(*) FROM tasks t JOIN ui_contexts c ON c.source=t.id WHERE c.activity=?1 AND t.state='running')+(SELECT count(*) FROM ui_agents a WHERE a.activity=?1 AND active=1 AND owner NOT LIKE 'channel:%')+(SELECT count(*) FROM shell_runs r JOIN ui_contexts c ON c.source=r.id WHERE c.activity=?1 AND r.state='running')+(SELECT count(*) FROM agent_runs r JOIN ui_contexts c ON c.source=r.owner WHERE c.activity=?1 AND r.state='running')+(SELECT count(*) FROM agent_inbox i JOIN ui_contexts c ON c.source=i.id WHERE c.activity=?1 AND i.state='queued')+(SELECT count(*) FROM jobs j JOIN ui_contexts c ON c.source=j.id WHERE c.activity=?1 AND j.state='active' AND j.due<=?2)",params![activity,crate::store::now()],|r|r.get(0))?)
 }
 fn render_activity(db: &Connection, activity: &str) -> Result<bool> {
     let settled: bool = db.query_row(
@@ -546,7 +551,7 @@ fn render_activity(db: &Connection, activity: &str) -> Result<bool> {
         [activity],
         |r| r.get(0),
     )?;
-    let pending:i64=db.query_row("SELECT count(*) FROM inbox i JOIN ui_contexts c ON c.source=i.id WHERE c.activity=?1 AND i.state='queued'",[activity],|r|r.get(0))?;
+    let pending:i64=db.query_row("SELECT count(*) FROM inbox i JOIN ui_contexts c ON c.source=i.id WHERE c.activity=?1 AND i.state IN ('queued','running')",[activity],|r|r.get(0))?;
     let busy = !settled || active > 0 || pending > 0 || background_count(db, activity)? > 0;
     let mut stmt=db.prepare("SELECT id FROM ui_segments s WHERE activity=?1 AND (open=1 OR EXISTS(SELECT 1 FROM ui_events e WHERE e.segment=s.id AND e.status IN ('running','background')))")?;
     let segments = stmt
@@ -1750,6 +1755,231 @@ mod tests {
         );
         assert_eq!(out.reply_to, None);
         assert!(!out.text.contains("duplicate"));
+    }
+
+    #[test]
+    fn due_schedules_keep_completion_quiet_and_silent_drains_settle_reactions() {
+        use crate::store::{Input, Job};
+        for kind in ["monitor", "wakeup"] {
+            for cancel in [false, true] {
+                if kind == "wakeup" && !cancel {
+                    continue;
+                }
+                let dir = tempfile::tempdir().unwrap();
+                let store = Store::open(&dir.path().join("db")).unwrap();
+                store
+                    .admit(&Input {
+                        id: "100".into(),
+                        channel: 1,
+                        user: 2,
+                        text: "work".into(),
+                    })
+                    .unwrap();
+                store.input_state("100", "running").unwrap();
+                store.submitted_inputs(&["100".into()]).unwrap();
+                let context = store.reply_context("100").unwrap();
+                store.bind_context("job", &context).unwrap();
+                let job = Job {
+                    id: "job".into(),
+                    channel: 1,
+                    user: 2,
+                    kind: kind.into(),
+                    payload: json!({"_owner":"channel:1","command":"true"}),
+                    due: crate::store::now() - 1,
+                    interval: Some(600),
+                };
+                store.add_job(&job).unwrap();
+                // A later owner context must not steal the job's original activity.
+                store
+                    .bind_context("channel:1", &ReplyContext::request("200"))
+                    .unwrap();
+                if !cancel {
+                    store
+                        .db
+                        .lock()
+                        .unwrap()
+                        .execute("UPDATE jobs SET last='unchanged' WHERE id='job'", [])
+                        .unwrap();
+                }
+                assert!(
+                    store
+                        .complete_turn(
+                            &["100".into()],
+                            "progress",
+                            1,
+                            2,
+                            &["Still checking".into()]
+                        )
+                        .unwrap()
+                );
+                let out = store.next_outbound().unwrap().unwrap();
+                assert_eq!(out.reply_to, None);
+                assert_eq!(out.user, None);
+                store.delivered(&out, "receipt").unwrap();
+                assert!(store.refresh_activities(1, true).unwrap());
+                assert_eq!(store.next_reaction(&[]).unwrap().unwrap().2, 1);
+                store
+                    .enqueue_notice(&context, "notice", 1, Some(2), "Not finished")
+                    .unwrap();
+                let out = store.next_outbound().unwrap().unwrap();
+                assert_eq!(out.reply_to, None);
+                assert_eq!(out.user, None);
+                store.delivered(&out, "notice-receipt").unwrap();
+                if cancel {
+                    assert!(store.cancel_job(1, "job").unwrap());
+                } else {
+                    // No inbox event or subsequent model turn closes an unchanged tick.
+                    assert!(!store.monitor_result(&job, "unchanged").unwrap());
+                }
+                assert!(store.queued(1).unwrap().is_empty());
+                // Silent draining and the reaction's desired state survive reopening.
+                let path = dir.path().join("db");
+                drop(store);
+                let store = Store::open(&path).unwrap();
+                assert!(!store.refresh_activities(1, true).unwrap());
+                assert_eq!(store.next_reaction(&[]).unwrap().unwrap().2, 2);
+                // The drained loop no longer captures a new user message as a steer.
+                store
+                    .admit(&Input {
+                        id: "300".into(),
+                        channel: 1,
+                        user: 2,
+                        text: "new task".into(),
+                    })
+                    .unwrap();
+                assert_eq!(store.reply_context("300").unwrap().reply_to, Some(300));
+            }
+        }
+    }
+
+    #[test]
+    fn future_schedules_do_not_hold_completion_and_due_deliveries_handoff_to_inbox() {
+        use crate::store::{Input, Job};
+        for kind in ["monitor", "wakeup"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(&dir.path().join("db")).unwrap();
+            store
+                .admit(&Input {
+                    id: "100".into(),
+                    channel: 1,
+                    user: 2,
+                    text: "schedule".into(),
+                })
+                .unwrap();
+            store.input_state("100", "running").unwrap();
+            let context = store.reply_context("100").unwrap();
+            store.bind_context("job", &context).unwrap();
+            let mut job = Job {
+                id: "job".into(),
+                channel: 1,
+                user: 2,
+                kind: kind.into(),
+                payload: json!({"_owner":"channel:1","command":"true"}),
+                due: crate::store::now() + 3600,
+                interval: Some(600),
+            };
+            store.add_job(&job).unwrap();
+            store
+                .complete_turn(&["100".into()], "saved", 1, 2, &["Scheduled".into()])
+                .unwrap();
+            let out = store.next_outbound().unwrap().unwrap();
+            assert_eq!(out.reply_to, Some(100));
+            assert_eq!(out.user, Some(2));
+            store.delivered(&out, "receipt").unwrap();
+            assert!(!store.refresh_activities(1, true).unwrap());
+            store
+                .bind_context("channel:1", &ReplyContext::request("200"))
+                .unwrap();
+            job.due = crate::store::now() - 1;
+            store
+                .db
+                .lock()
+                .unwrap()
+                .execute("UPDATE jobs SET due=?1 WHERE id='job'", [job.due])
+                .unwrap();
+            assert!(store.refresh_activities(1, true).unwrap());
+            if kind == "wakeup" {
+                assert!(store.fire_wakeup(&job, "wake").unwrap());
+            } else {
+                assert!(store.monitor_result(&job, "changed").unwrap());
+            }
+            assert!(store.refresh_activities(1, true).unwrap());
+            let event = store.queued(1).unwrap().remove(0);
+            store.input_state(&event.id, "running").unwrap();
+            // Running inbox input remains busy even before agent presentation.
+            assert!(store.refresh_activities(1, true).unwrap());
+            store
+                .complete_turn(&[event.id], "done", 1, 2, &["Done".into()])
+                .unwrap();
+            let out = store.next_outbound().unwrap().unwrap();
+            assert_eq!(out.reply_to, Some(100));
+            assert_eq!(out.user, Some(2));
+            assert!(!store.refresh_activities(1, true).unwrap());
+        }
+    }
+
+    #[test]
+    fn worker_owned_due_ticks_handoff_privately_and_do_not_hold_idle_intervals() {
+        use crate::store::{Input, Job};
+        for kind in ["monitor", "wakeup"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(&dir.path().join("db")).unwrap();
+            store
+                .admit(&Input {
+                    id: "100".into(),
+                    channel: 1,
+                    user: 2,
+                    text: "work".into(),
+                })
+                .unwrap();
+            store.input_state("100", "running").unwrap();
+            let context = store.reply_context("100").unwrap();
+            store.add_task("worker", "batch", 1, 2, "check").unwrap();
+            store
+                .present_agent("worker", 1, &context, "Scout", "codex/test")
+                .unwrap();
+            store.finish_task("worker", "Initial report").unwrap();
+            for event in store.queued(1).unwrap() {
+                store.input_state(&event.id, "done").unwrap();
+            }
+            while let Some(out) = store.next_outbound().unwrap() {
+                store.delivered(&out, "receipt").unwrap();
+            }
+            let job = Job {
+                id: "job".into(),
+                channel: 1,
+                user: 2,
+                kind: kind.into(),
+                payload: json!({"_owner":"worker","command":"true"}),
+                due: crate::store::now() - 1,
+                interval: Some(600),
+            };
+            store.bind_context("job", &context).unwrap();
+            store.add_job(&job).unwrap();
+            store
+                .complete_turn(&["100".into()], "progress", 1, 2, &["Checking".into()])
+                .unwrap();
+            let out = store.next_outbound().unwrap().unwrap();
+            assert_eq!(out.reply_to, None);
+            assert_eq!(out.user, None);
+            store.delivered(&out, "progress-receipt").unwrap();
+            if kind == "wakeup" {
+                assert!(store.fire_wakeup(&job, "wake").unwrap());
+            } else {
+                assert!(store.monitor_result(&job, "changed").unwrap());
+            }
+            assert!(store.queued(1).unwrap().is_empty());
+            assert!(store.next_outbound().unwrap().is_none());
+            assert!(store.refresh_activities(1, true).unwrap());
+            store.agent_phase("worker", true, "Thinking").unwrap();
+            for event in store.agent_events("worker").unwrap() {
+                store.agent_event_done(&event.id).unwrap();
+            }
+            assert!(store.refresh_activities(1, true).unwrap());
+            store.agent_phase("worker", false, "Idle").unwrap();
+            assert!(!store.refresh_activities(1, true).unwrap());
+            assert_eq!(store.next_reaction(&[]).unwrap().unwrap().2, 2);
+        }
     }
 
     #[test]

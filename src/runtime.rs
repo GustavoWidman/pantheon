@@ -442,11 +442,15 @@ impl Harness {
                 .await;
             self.store
                 .refresh_activities(run.channel, run.memory.memory.lock().await.is_settled())?;
-            self.store.agent_phase(
-                &run.owner,
-                false,
-                if outcome.is_ok() { "Idle" } else { "Stopped" },
-            )?;
+            // Failed root turns still owe a public error notice. Keep their
+            // activity live until channel_worker has committed that notice.
+            if run.child || outcome.is_ok() {
+                self.store.agent_phase(
+                    &run.owner,
+                    false,
+                    if outcome.is_ok() { "Idle" } else { "Stopped" },
+                )?;
+            }
             if !run.child {
                 for id in &run.inputs {
                     self.store
@@ -2541,6 +2545,44 @@ mod tests {
         assert!(names(&status).contains(&"Active work".into()));
         assert!(names(&status).contains(&"Schedules".into()));
         assert!(!names(&status).contains(&"Model window".into()));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_root_activity_stays_live_until_its_error_notice_commits() {
+        let (_directory, h, mut run, _mock, server) = fixture("openai", vec![]).await;
+        h.store
+            .complete_turn(&["first".into()], "setup", 1, 2, &[])
+            .unwrap();
+        h.store
+            .admit(&Input {
+                id: "100".into(),
+                channel: 1,
+                user: 2,
+                text: "work".into(),
+            })
+            .unwrap();
+        h.store.input_state("100", "running").unwrap();
+        run.context = h.store.reply_context("100").unwrap();
+        run.inputs = vec!["100".into()];
+        run.cancel.cancel();
+        assert!(h.clone().run_agent(run).await.is_err());
+        assert!(h.store.refresh_activities(1, true).unwrap());
+        let closed: bool = h.store.db.lock().unwrap().query_row(
+            "SELECT closed FROM ui_sessions WHERE activity=(SELECT activity FROM ui_contexts WHERE source='100')",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert!(!closed);
+        // Mirror channel_worker cleanup: persist notice before clearing activity.
+        h.notice("error:100", 1, Some(2), "Turn stopped").unwrap();
+        h.store.agent_phase("channel:1", false, "Idle").unwrap();
+        assert!(!h.store.refresh_activities(1, true).unwrap());
+        let out = drain(&h)
+            .into_iter()
+            .find(|m| m.text == "Turn stopped")
+            .unwrap();
+        assert_eq!(out.reply_to, Some(100));
+        assert_eq!(out.user, Some(2));
         server.abort();
     }
 
