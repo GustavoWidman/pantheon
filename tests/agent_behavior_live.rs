@@ -1,6 +1,58 @@
 //! Opt-in behavior evaluations: real inference, controlled results, no tool execution.
 use pantheon::{provider::Provider, tools};
 
+#[tokio::test]
+#[ignore = "requires a Codex ChatGPT login and uses subscription quota"]
+async fn fresh_turn_cache_probe_reports_real_provider_counters() {
+    let model = std::env::var("PANTHEON_TEST_CODEX_MODEL").expect("set PANTHEON_TEST_CODEX_MODEL");
+    assert!(model.starts_with("codex/"));
+    let p = Provider::new(120).unwrap();
+    let system = system(false);
+    let defs = tools::definitions(false, false);
+    let d = tempfile::tempdir().unwrap();
+    let mut memory = pantheon::memory::Memory::open(d.path(), 128000).unwrap();
+    memory
+        .append(
+            pantheon::memory::Kind::User,
+            "This is a greeting-only cache probe. Reply with hi when asked.",
+        )
+        .unwrap();
+    let initial = memory.render();
+    for (phase, view) in [
+        ("cold", initial.clone()),
+        ("identical fresh request", initial),
+        ("appended fresh turn", String::new()),
+        ("next appended fresh turn", String::new()),
+    ] {
+        let view = if view.is_empty() {
+            memory.render()
+        } else {
+            view
+        };
+        let history = Provider::start("openai", &view, "Say exactly hi.");
+        let response = p
+            .step(&model, "medium", &system, &history, &defs)
+            .await
+            .unwrap();
+        assert!(
+            response.calls.is_empty(),
+            "greeting probe must not run tools"
+        );
+        eprintln!(
+            "CACHE PROBE {phase}: {}",
+            serde_json::to_string(&pantheon::cache::Usage::parse(&response.usage)).unwrap()
+        );
+        if phase != "cold" {
+            memory
+                .append(pantheon::memory::Kind::User, "Say exactly hi.")
+                .unwrap();
+            memory
+                .append(pantheon::memory::Kind::Talk, &visible(&response))
+                .unwrap();
+        }
+    }
+}
+
 fn system(worker: bool) -> String {
     let skills = pantheon::skills::Skills::load(&Default::default()).unwrap();
     pantheon::runtime::system_prompt(

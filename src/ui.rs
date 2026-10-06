@@ -37,6 +37,7 @@ pub(crate) fn initialize(db: &Connection) -> Result<()> {
     for (table, column, definition) in [
         ("ui_sessions", "closed", "INTEGER NOT NULL DEFAULT 1"),
         ("ui_events", "segment", "TEXT"),
+        ("ui_events", "presentation", "TEXT NOT NULL DEFAULT '{}'"),
     ] {
         let exists = db
             .prepare(&format!("PRAGMA table_info({table})"))?
@@ -52,6 +53,7 @@ pub(crate) fn initialize(db: &Connection) -> Result<()> {
         }
     }
     db.execute_batch("CREATE TABLE IF NOT EXISTS ui_segments(id TEXT PRIMARY KEY,channel TEXT NOT NULL,activity TEXT NOT NULL,open INTEGER NOT NULL DEFAULT 1);
+        CREATE TABLE IF NOT EXISTS shell_ui(job TEXT PRIMARY KEY,event TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS ui_segments_open ON ui_segments(channel,open);
         CREATE TABLE IF NOT EXISTS ui_reactions(message TEXT PRIMARY KEY,channel TEXT NOT NULL,activity TEXT NOT NULL,desired INTEGER NOT NULL DEFAULT 0,delivered INTEGER NOT NULL DEFAULT -1,next_try INTEGER NOT NULL DEFAULT 0);
         CREATE INDEX IF NOT EXISTS ui_events_segment ON ui_events(segment,seq);
@@ -65,6 +67,129 @@ pub(crate) fn copy_context(db: &Connection, from: &str, to: &str) -> Result<()> 
     Ok(())
 }
 impl Store {
+    pub fn start_tool_activity(
+        &self,
+        owner: &str,
+        context: &ReplyContext,
+        channel: u64,
+        id: &str,
+        call: &crate::provider::ToolCall,
+    ) -> Result<()> {
+        if !owner.starts_with("channel:") {
+            return Ok(());
+        }
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        activity_event_transaction(
+            &tx,
+            context,
+            channel,
+            id,
+            &crate::tools::activity_label(call),
+            "running",
+            Duration::ZERO,
+        )?;
+        tx.execute(
+            "UPDATE ui_events SET presentation=?2 WHERE event=?1",
+            params![
+                id,
+                serde_json::to_string(&crate::activity::Presentation::call(call))?
+            ],
+        )?;
+        render_tool_event(&tx, id)?;
+        tx.commit()?;
+        Ok(())
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_tool_activity(
+        &self,
+        owner: &str,
+        context: &ReplyContext,
+        channel: u64,
+        id: &str,
+        call: &crate::provider::ToolCall,
+        output: &str,
+        status: &str,
+        elapsed: Duration,
+    ) -> Result<()> {
+        if !owner.starts_with("channel:") {
+            return Ok(());
+        }
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let old: Option<(String, String)> = tx
+            .query_row(
+                "SELECT status,presentation FROM ui_events WHERE event=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        // A shell may finish between detaching and returning the background receipt.
+        if status == "background"
+            && old
+                .as_ref()
+                .is_some_and(|(s, _)| matches!(s.as_str(), "returned" | "done" | "error"))
+        {
+            return Ok(());
+        }
+        let mut p = old
+            .as_ref()
+            .and_then(|(_, p)| serde_json::from_str::<crate::activity::Presentation>(p).ok())
+            .unwrap_or_else(|| crate::activity::Presentation::call(call));
+        p.finish(&call.name, output);
+        let status = if status == "done" && p.failed() {
+            "error"
+        } else {
+            status
+        };
+        activity_event_transaction(
+            &tx,
+            context,
+            channel,
+            id,
+            &crate::tools::activity_label(call),
+            status,
+            elapsed,
+        )?;
+        tx.execute(
+            "UPDATE ui_events SET presentation=?2 WHERE event=?1",
+            params![id, serde_json::to_string(&p)?],
+        )?;
+        render_tool_event(&tx, id)?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn tool_output_lines(&self, id: &str, lines: u64) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        if let Some(text) = tx
+            .query_row(
+                "SELECT presentation FROM ui_events WHERE event=?1",
+                [id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            let mut p: crate::activity::Presentation = serde_json::from_str(&text)?;
+            p.output_lines = Some(lines);
+            let changed = tx.execute(
+                "UPDATE ui_events SET presentation=?2 WHERE event=?1 AND presentation!=?2",
+                params![id, serde_json::to_string(&p)?],
+            )?;
+            if changed > 0 {
+                render_tool_event(&tx, id)?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn bind_shell_activity(&self, job: &str, event: &str) -> Result<()> {
+        self.db.lock().unwrap().execute(
+            "INSERT INTO shell_ui(job,event) SELECT ?1,event FROM ui_events WHERE event=?2",
+            params![job, event],
+        )?;
+        Ok(())
+    }
     pub fn reply_context(&self, source: &str) -> Result<ReplyContext> {
         Ok(self
             .db
@@ -200,7 +325,8 @@ impl Store {
     }
 
     pub fn refresh_activities(&self, channel: u64, settled: bool) -> Result<bool> {
-        let db = self.db.lock().unwrap();
+        let mut locked = self.db.lock().unwrap();
+        let db = locked.transaction()?;
         let mut stmt=db.prepare("SELECT s.activity FROM ui_sessions s WHERE channel=?1 AND (s.settled=0 OR EXISTS(SELECT 1 FROM ui_reactions r WHERE r.activity=s.activity AND r.desired<2) OR s.activity=(SELECT activity FROM ui_contexts WHERE source=?2) OR EXISTS(SELECT 1 FROM ui_agents a WHERE a.activity=s.activity AND active=1) OR EXISTS(SELECT 1 FROM shell_runs r JOIN ui_contexts c ON c.source=r.id WHERE c.activity=s.activity AND r.state='running') OR EXISTS(SELECT 1 FROM agent_inbox i JOIN ui_contexts c ON c.source=i.id WHERE c.activity=s.activity AND i.state='queued'))")?;
         let activities = stmt
             .query_map(
@@ -208,10 +334,11 @@ impl Store {
                 |r| r.get::<_, String>(0),
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
         let mut busy = !settled;
         for activity in activities {
             db.execute(
-                "UPDATE ui_sessions SET settled=?2 WHERE activity=?1",
+                "UPDATE ui_sessions SET settled=?2 WHERE activity=?1 AND settled!=?2",
                 params![activity, settled],
             )?;
             let working = render_activity(&db, &activity)?;
@@ -228,6 +355,7 @@ impl Store {
                 )?;
             }
         }
+        db.commit()?;
         Ok(busy)
     }
     pub fn break_activity(&self, channel: u64) -> Result<()> {
@@ -420,7 +548,7 @@ fn render_activity(db: &Connection, activity: &str) -> Result<bool> {
     )?;
     let pending:i64=db.query_row("SELECT count(*) FROM inbox i JOIN ui_contexts c ON c.source=i.id WHERE c.activity=?1 AND i.state='queued'",[activity],|r|r.get(0))?;
     let busy = !settled || active > 0 || pending > 0 || background_count(db, activity)? > 0;
-    let mut stmt=db.prepare("SELECT id FROM ui_segments s WHERE activity=?1 AND (open=1 OR EXISTS(SELECT 1 FROM ui_events e WHERE e.segment=s.id AND e.status='running'))")?;
+    let mut stmt=db.prepare("SELECT id FROM ui_segments s WHERE activity=?1 AND (open=1 OR EXISTS(SELECT 1 FROM ui_events e WHERE e.segment=s.id AND e.status IN ('running','background')))")?;
     let segments = stmt
         .query_map([activity], |r| r.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -436,14 +564,14 @@ fn render_segment(db: &Connection, segment: &str) -> Result<()> {
         |r| r.get(0),
     )?;
     let mut events = db.prepare(
-        "SELECT label,status,started,elapsed FROM ui_events WHERE segment=?1 ORDER BY seq",
+        "SELECT label,status,started,elapsed,presentation FROM ui_events WHERE segment=?1 ORDER BY seq",
     )?;
     let now = chrono::Utc::now().timestamp_millis();
     let lines = events
         .query_map([segment], |r| {
             let label: String = r.get(0)?;
             let state: String = r.get(1)?;
-            let elapsed = if state == "running" {
+            let elapsed = if matches!(state.as_str(), "running" | "background") {
                 now - r.get::<_, i64>(2)?
             } else {
                 r.get(3)?
@@ -451,17 +579,9 @@ fn render_segment(db: &Connection, segment: &str) -> Result<()> {
             Ok(if state == "event" {
                 label
             } else {
-                format!(
-                    "{} {label} · {:.1}s",
-                    match state.as_str() {
-                        "running" => "◌",
-                        "done" => "✓",
-                        "background" => "↗",
-                        "skipped" => "–",
-                        _ => "✗",
-                    },
-                    elapsed.max(0) as f64 / 1000.0
-                )
+                serde_json::from_str::<crate::activity::Presentation>(&r.get::<_, String>(4)?)
+                    .unwrap_or_default()
+                    .row(&label, &state, elapsed)
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -471,6 +591,65 @@ fn render_segment(db: &Connection, segment: &str) -> Result<()> {
     let text = format!("```text\n{}\n```", lines.join("\n"));
     let id = format!("segment:{segment}:activity:0");
     db.execute("INSERT INTO outbox(id,channel,text,nonce) VALUES(?1,?2,?3,?1) ON CONFLICT(id) DO UPDATE SET text=excluded.text,state='queued' WHERE outbox.text!=excluded.text",params![id,channel,text])?;
+    Ok(())
+}
+
+fn render_tool_event(db: &Connection, event: &str) -> Result<()> {
+    if let Some(segment) = db
+        .query_row(
+            "SELECT segment FROM ui_events WHERE event=?1",
+            [event],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+    {
+        render_segment(db, &segment)?;
+    }
+    Ok(())
+}
+pub(crate) fn shell_finished(
+    db: &Connection,
+    job: &str,
+    output: &str,
+    cancelled: bool,
+) -> Result<()> {
+    let event:Option<(String,String,bool,i64)>=db.query_row("SELECT e.event,e.presentation,r.background,e.started FROM shell_ui s JOIN ui_events e ON e.event=s.event JOIN shell_runs r ON r.id=s.job WHERE s.job=?1",[job],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+    if let Some((id, p, background, started)) = event {
+        let mut p: crate::activity::Presentation = serde_json::from_str(&p)?;
+        p.finish("shell", output);
+        let status =
+            if cancelled || output.starts_with("Error:") || output.starts_with("Interrupted") {
+                "error"
+            } else if background {
+                "returned"
+            } else if p.failed() {
+                "error"
+            } else {
+                "done"
+            };
+        db.execute(
+            "UPDATE ui_events SET status=?2,presentation=?3,elapsed=?4 WHERE event=?1",
+            params![
+                id,
+                status,
+                serde_json::to_string(&p)?,
+                (chrono::Utc::now().timestamp_millis() - started).max(0)
+            ],
+        )?;
+        render_tool_event(db, &id)?;
+    }
+    Ok(())
+}
+pub(crate) fn interrupt_tools(db: &Connection) -> Result<()> {
+    let events = db
+        .prepare("SELECT event FROM ui_events WHERE status IN ('running','background')")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    db.execute("UPDATE ui_events SET status='error',elapsed=MAX(0,?1-started) WHERE status IN ('running','background')",[chrono::Utc::now().timestamp_millis()])?;
+    for event in events {
+        render_tool_event(db, &event)?;
+    }
     Ok(())
 }
 
@@ -552,7 +731,7 @@ pub fn model_window(config: &crate::config::Config, model: &str) -> Option<(u64,
         .filter(|n| *n > 0)?;
     Some((tokens, "Codex model metadata"))
 }
-fn number(n: u64) -> String {
+pub(crate) fn number(n: u64) -> String {
     let digits = n.to_string();
     let mut result = String::new();
     for (i, ch) in digits.chars().enumerate() {
@@ -598,44 +777,76 @@ pub fn context_card(
     usage: &Value,
 ) -> Value {
     let recorded_model = usage["_pantheon_model"].as_str();
-    let cached = usage["input_tokens_details"]["cached_tokens"]
-        .as_u64()
-        .or_else(|| usage["cache_read_input_tokens"].as_u64())
-        .unwrap_or(0);
-    let input = usage["input_tokens"].as_u64().unwrap_or(0).saturating_add(
-        if usage.get("cache_read_input_tokens").is_some() {
-            cached.saturating_add(usage["cache_creation_input_tokens"].as_u64().unwrap_or(0))
-        } else {
-            0
-        },
-    );
+    let report = crate::cache::Usage::parse(usage);
+    let cached = report.cached.unwrap_or(0);
+    let input = report.input.unwrap_or(0);
     let output = usage["output_tokens"].as_u64().unwrap_or(0);
     let total = input.saturating_add(output);
     let fresh = input.saturating_sub(cached);
     let window_model = recorded_model.unwrap_or(model);
     let capacity = model_window(config, window_model);
-    let has_usage = usage.get("input_tokens").is_some();
+    let has_usage = report.input.is_some();
     let mut fields = vec![("Channel model", format!("`{model}` · {reasoning}"), false)];
     let window = match capacity {
-        Some((limit, source)) if recorded_model.is_some() && has_usage => format!("{}\n**{} / {} tokens · {:.1}%**\nLast recorded request · {source}{}",squares(&[(cached.min(input),"🟦"),(fresh,"🟪"),(output,"🟧")],limit,100),number(total),number(limit),total as f64 / limit as f64 * 100.0,if total>limit {" · exceeds displayed limit"}else{""}),
+        Some((limit, source)) if recorded_model.is_some() && has_usage => format!("{}\n**{} / {} tokens · {:.1}%**\nLast recorded request · {source}{}",squares(&[(cached.min(input),"🟦"),(fresh,if report.cached.is_some(){"🟪"}else{"⬜"}),(output,"🟧")],limit,100),number(total),number(limit),total as f64 / limit as f64 * 100.0,if total>limit {" · exceeds displayed limit"}else{""}),
         Some((limit, source)) => format!("{}\n**{}-token window** · {source}\n⬜ Usage unavailable · {}",squares(&[],limit,100).replace("⬛","⬜"),number(limit),if has_usage {"Previous usage has no recorded model; occupancy unavailable."}else{"No request recorded yet."}),
         None => "Model capacity unavailable. Set `agent.context_windows` for this model to enable its window grid.".into(),
     };
     fields.push(("Model window", window, false));
     if has_usage {
-        fields.push(("Request breakdown",format!("🟦 Cached input  **{}**\n🟪 Fresh input  **{}**\n🟧 Output  **{}**{}\nInput total  **{}**",number(cached.min(input)),number(fresh),number(output),if recorded_model.is_some(){capacity.map(|(limit,_)|format!("\n⬛ Remaining  **{}**",number(limit.saturating_sub(total)))).unwrap_or_default()}else{String::new()},number(input)),true));
+        fields.push((
+            "Request breakdown",
+            format!(
+                "{}\n🟧 Output  **{}**{}\nInput total  **{}**",
+                if report.cached.is_some() {
+                    format!(
+                        "🟦 Cached input  **{}**\n🟪 Fresh input  **{}**",
+                        number(cached.min(input)),
+                        number(fresh)
+                    )
+                } else {
+                    format!("⬜ Input  **{}** · cache split unavailable", number(input))
+                },
+                number(output),
+                if recorded_model.is_some() {
+                    capacity
+                        .map(|(limit, _)| {
+                            format!(
+                                "\n⬛ Remaining  **{}**",
+                                number(limit.saturating_sub(total))
+                            )
+                        })
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                },
+                number(input)
+            ),
+            true,
+        ));
         fields.push((
             "Prompt cache",
-            if input > 0 {
+            if input > 0 && report.cached.is_some() {
                 format!(
                     "**{:.1}%** of input reused\nCached input occupies context normally.",
                     cached.min(input) as f64 / input as f64 * 100.0
                 )
             } else {
-                "No input usage recorded".into()
+                "Provider did not report cache reuse.\nUnknown is not a zero-percent hit rate."
+                    .into()
             },
             true,
         ));
+        if let Some(written) = report.written {
+            fields.push((
+                "Cache writes",
+                format!(
+                    "**{} tokens**\nIncluded in input; separate from cache reads.",
+                    number(written)
+                ),
+                true,
+            ));
+        }
         if let Some(last) = recorded_model.filter(|last| *last != model) {
             fields.push((
                 "Recorded request model",
@@ -677,6 +888,260 @@ pub fn context_card(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn shell_call() -> crate::provider::ToolCall {
+        crate::provider::ToolCall {
+            id: "native-call".into(),
+            name: "shell".into(),
+            arguments: json!({"command":"sleep 20"}),
+        }
+    }
+    #[test]
+    fn detached_shell_ticks_and_completes_in_its_original_closed_fence() {
+        let d = tempfile::tempdir().unwrap();
+        let store = Store::open(&d.path().join("db")).unwrap();
+        let context = ReplyContext::request("100");
+        let call = shell_call();
+        store
+            .start_tool_activity("channel:1", &context, 1, "call", &call)
+            .unwrap();
+        let first = store.next_outbound().unwrap().unwrap();
+        store.delivered(&first, "original-discord-message").unwrap();
+        store.bind_context("job", &context).unwrap();
+        store
+            .shell_start("job", "channel:1", 1, 2, "sleep 20")
+            .unwrap();
+        store.bind_shell_activity("job", "call").unwrap();
+        store.shell_detach("job").unwrap();
+        store
+            .finish_tool_activity(
+                "channel:1",
+                &context,
+                1,
+                "call",
+                &call,
+                "{\"state\":\"background\"}",
+                "background",
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        store
+            .enqueue_notice(&context, "prose", 1, None, "Working on other things")
+            .unwrap();
+        store
+            .start_tool_activity(
+                "channel:1",
+                &context,
+                1,
+                "later",
+                &crate::provider::ToolCall {
+                    id: "later".into(),
+                    name: "read".into(),
+                    arguments: json!({"path":"notes.txt"}),
+                },
+            )
+            .unwrap();
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE ui_events SET started=?1 WHERE event='call'",
+                [chrono::Utc::now().timestamp_millis() - 6100],
+            )
+            .unwrap();
+        assert!(store.refresh_activities(1, true).unwrap());
+        let (text, receipt): (String, String) = store
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT text,receipt FROM outbox WHERE id=?1",
+                [&first.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(text.contains("↗ shell · sleep 20 · ↑ 1 · "));
+        assert_eq!(receipt, "original-discord-message");
+        let later:String=store.db.lock().unwrap().query_row("SELECT o.text FROM outbox o JOIN ui_segments s ON o.id='segment:'||s.id||':activity:0' JOIN ui_events e ON e.segment=s.id WHERE e.event='later'",[],|r|r.get(0)).unwrap();
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE ui_events SET started=?1 WHERE event='call'",
+                [chrono::Utc::now().timestamp_millis() - 6700],
+            )
+            .unwrap();
+        store
+            .shell_finish(
+                "job",
+                "exit: 0\noutput_lines: 31\nstdout:\nHi\nstderr:\n",
+                false,
+            )
+            .unwrap();
+        let (text, receipt): (String, String) = store
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT text,receipt FROM outbox WHERE id=?1",
+                [&first.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(text.contains("↙ shell · sleep 20 · ↑ 1 ↓ 31 lines · exit 0 · "));
+        assert_eq!(receipt, "original-discord-message");
+        let unchanged:String=store.db.lock().unwrap().query_row("SELECT o.text FROM outbox o JOIN ui_segments s ON o.id='segment:'||s.id||':activity:0' JOIN ui_events e ON e.segment=s.id WHERE e.event='later'",[],|r|r.get(0)).unwrap();
+        assert_eq!(later, unchanged);
+        assert_eq!(
+            store
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM outbox", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(store.queued(1).unwrap()[0].id, "shell:job");
+    }
+    #[test]
+    fn completion_before_detach_stays_terminal_and_restart_updates_closed_rows() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("db");
+        let store = Store::open(&path).unwrap();
+        let c = ReplyContext::request("100");
+        let call = shell_call();
+        store
+            .start_tool_activity("channel:1", &c, 1, "call", &call)
+            .unwrap();
+        store.bind_context("job", &c).unwrap();
+        store
+            .shell_start("job", "channel:1", 1, 2, "sleep 20")
+            .unwrap();
+        store.bind_shell_activity("job", "call").unwrap();
+        store
+            .shell_finish(
+                "job",
+                "exit: 1\noutput_lines: 2\nstdout:\n\nstderr:\nfailed",
+                false,
+            )
+            .unwrap();
+        store.shell_detach("job").unwrap();
+        store
+            .finish_tool_activity(
+                "channel:1",
+                &c,
+                1,
+                "call",
+                &call,
+                "{\"state\":\"background\"}",
+                "background",
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        let status: String = store
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT status FROM ui_events WHERE event='call'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "returned");
+        store
+            .start_tool_activity("channel:1", &c, 1, "interrupted", &call)
+            .unwrap();
+        store.bind_context("pending", &c).unwrap();
+        store
+            .shell_start("pending", "channel:1", 1, 2, "sleep 20")
+            .unwrap();
+        store.bind_shell_activity("pending", "interrupted").unwrap();
+        store.shell_detach("pending").unwrap();
+        store
+            .finish_tool_activity(
+                "channel:1",
+                &c,
+                1,
+                "interrupted",
+                &call,
+                "{\"state\":\"background\"}",
+                "background",
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        store.break_activity(1).unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        store.recover().unwrap();
+        let statuses = store
+            .db
+            .lock()
+            .unwrap()
+            .prepare("SELECT status FROM ui_events ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(statuses, vec!["returned", "error"]);
+        let text: String = store
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT text FROM outbox WHERE id LIKE '%activity:0'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(text.contains("✗ shell"));
+        assert!(!text.contains("↗ shell"));
+    }
+    #[test]
+    fn rich_tool_rows_roll_over_without_clipping_or_losing_entries() {
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::open(&d.path().join("db")).unwrap();
+        let c = ReplyContext::request("100");
+        for i in 0..25 {
+            let call = crate::provider::ToolCall {
+                id: i.to_string(),
+                name: "shell".into(),
+                arguments: json!({"command":"cargo test --locked --all-targets 🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀"}),
+            };
+            let id = i.to_string();
+            s.start_tool_activity("channel:1", &c, 1, &id, &call)
+                .unwrap();
+            s.finish_tool_activity(
+                "channel:1",
+                &c,
+                1,
+                &id,
+                &call,
+                "exit: 0\noutput_lines: 50000\nstdout:\n\nstderr:\n",
+                "done",
+                Duration::from_millis(1250),
+            )
+            .unwrap();
+        }
+        let texts =
+            s.db.lock()
+                .unwrap()
+                .prepare("SELECT text FROM outbox ORDER BY seq")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+        assert_eq!(texts.len(), 3);
+        assert_eq!(
+            texts
+                .iter()
+                .map(|t| t.matches("✓ shell").count())
+                .sum::<usize>(),
+            25
+        );
+        assert!(texts.iter().all(|t| t.encode_utf16().count() <= 2000));
+    }
     fn field<'a>(card: &'a Value, name: &str) -> &'a str {
         card["embeds"][0]["fields"]
             .as_array()
@@ -766,7 +1231,7 @@ mod tests {
             &json!({"_pantheon_model":"openai/test","input_tokens":200,"output_tokens":10}),
         );
         let grid = field(&card, "Model window");
-        assert_eq!(grid.matches("🟪").count(), 100);
+        assert_eq!(grid.matches("⬜").count(), 100);
         assert_eq!(grid.matches("⬛").count(), 0);
         assert!(grid.contains("210 / 100"));
         assert!(grid.contains("exceeds displayed limit"));

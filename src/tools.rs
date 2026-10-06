@@ -153,10 +153,16 @@ pub fn workspace_path(workspace: &Path, input: &str, write: bool) -> Result<Path
     Ok(resolved)
 }
 // Drain both pipes concurrently with bounded buffers, so verbose tools never exhaust memory.
-async fn drain(mut pipe: impl AsyncRead + Unpin) -> Result<String> {
+async fn drain(
+    mut pipe: impl AsyncRead + Unpin,
+    progress: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+) -> Result<(String, u64)> {
     let mut head = Vec::new();
     let mut tail = std::collections::VecDeque::new();
     let mut count = 0usize;
+    let mut newlines = 0u64;
+    let mut last = None;
+    let mut reported = 0;
     let mut buf = [0u8; 8192];
     loop {
         let n = pipe.read(&mut buf).await?;
@@ -164,6 +170,13 @@ async fn drain(mut pipe: impl AsyncRead + Unpin) -> Result<String> {
             break;
         }
         count += n;
+        newlines += buf[..n].iter().filter(|b| **b == b'\n').count() as u64;
+        last = Some(buf[n - 1]);
+        let lines = newlines + u64::from(last != Some(b'\n'));
+        if let Some(progress) = &progress {
+            progress.fetch_add(lines - reported, std::sync::atomic::Ordering::Relaxed);
+        }
+        reported = lines;
         for b in &buf[..n] {
             if head.len() < 60_000 {
                 head.push(*b);
@@ -182,10 +195,16 @@ async fn drain(mut pipe: impl AsyncRead + Unpin) -> Result<String> {
     result.push_str(&String::from_utf8_lossy(
         &tail.into_iter().collect::<Vec<_>>(),
     ));
-    Ok(crate::memory::cap_tool_result(&result))
+    Ok((
+        crate::memory::cap_tool_result(&result),
+        newlines + u64::from(last.is_some_and(|b| b != b'\n')),
+    ))
 }
 pub async fn read_file(path: &Path) -> Result<String> {
-    drain(tokio::fs::File::open(path).await?).await
+    Ok(read_file_observed(path).await?.0)
+}
+pub async fn read_file_observed(path: &Path) -> Result<(String, u64)> {
+    drain(tokio::fs::File::open(path).await?, None).await
 }
 #[cfg(unix)]
 struct ProcessGroup(u32);
@@ -202,6 +221,15 @@ pub async fn shell(
     command: &str,
     timeout: u64,
     cancel: &CancellationToken,
+) -> Result<String> {
+    shell_with_progress(workspace, command, timeout, cancel, None).await
+}
+pub(crate) async fn shell_with_progress(
+    workspace: &Path,
+    command: &str,
+    timeout: u64,
+    cancel: &CancellationToken,
+    progress: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 ) -> Result<String> {
     ensure!(!command.is_empty(), "empty command");
     let mut process = Command::new("bash");
@@ -220,8 +248,8 @@ pub async fn shell(
     let _group = ProcessGroup(child.id().context("shell missing process ID")?);
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
-    let out = tokio::spawn(drain(stdout));
-    let err = tokio::spawn(drain(stderr));
+    let out = tokio::spawn(drain(stdout, progress.clone()));
+    let err = tokio::spawn(drain(stderr, progress));
     let wait = tokio::select! {
         result=child.wait()=>Some(result?),
         _=tokio::time::sleep(Duration::from_secs(timeout))=>None,
@@ -246,12 +274,13 @@ pub async fn shell(
     .await;
     let (out, err) = streams.context("shell descendants still hold output pipes")??;
     Ok(format!(
-        "exit: {}\nstdout:\n{}\nstderr:\n{}",
+        "exit: {}\noutput_lines: {}\nstdout:\n{}\nstderr:\n{}",
         wait.unwrap()
             .code()
             .map_or("signal".into(), |c| c.to_string()),
-        out,
-        err
+        out.1 + err.1,
+        out.0,
+        err.0
     ))
 }
 pub fn schedule(text: &str) -> Result<(i64, Option<i64>)> {
@@ -379,5 +408,29 @@ mod tests {
         let c = CancellationToken::new();
         c.cancel();
         assert!(shell(d.path(), "sleep 30", 1, &c).await.is_err());
+    }
+    #[tokio::test]
+    async fn captured_lines_count_full_streams_even_when_text_is_capped() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("large");
+        tokio::fs::write(&path, "large line\n".repeat(40000) + "last partial")
+            .await
+            .unwrap();
+        let (text, n) = read_file_observed(&path).await.unwrap();
+        assert_eq!(n, 40001);
+        assert!(text.chars().count() <= 30000);
+        assert!(text.contains("omitted"));
+        let p = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let out = shell_with_progress(
+            d.path(),
+            "printf 'a\\nb'; printf 'err\\n' >&2",
+            2,
+            &CancellationToken::new(),
+            Some(p.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("output_lines: 3"));
+        assert_eq!(p.load(std::sync::atomic::Ordering::Relaxed), 3);
     }
 }

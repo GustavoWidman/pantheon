@@ -48,6 +48,7 @@ cargo run -- --config pantheon.toml run
 | Command | Behavior |
 |---|---|
 | `/context` | Square grids for recorded model-window usage and compacted memory; cache and token breakdown |
+| `/cache` | Measured cache reads/writes, recent root requests and fresh-view prefix stability |
 | `/status` | Active agent phases, shell jobs, message queues, schedules and delivery |
 | `/model id:provider/model` | Persist model selection for the next turn |
 | `/reasoning level:medium` | Persist reasoning effort for the next turn |
@@ -68,6 +69,11 @@ Idle workers and coordinators leave default agent listings after one hour (`agen
 Root and workers have [skill discovery/loading](docs/skills.md) and [MCP integrations](docs/mcp.md). Bundled guides cover product research, browser activities, learning and engineering. Configured SKILL.md libraries load on demand behind a small startup index. MCP supports stdio and Streamable HTTP tools, resources and prompts, with role/channel controls and durable retrieval of large results. Schemas stay fixed while external catalogs enter tool results. The shared behavior guide treats explicit requests about the user's own environment and authorized credential entry as ordinary work, carries tasks through to evidence, and scales process to everyday interactions.
 
 ## State and checks
+
+[Cache diagnostics](docs/cache.md) distinguish provider-reported reuse from local
+prefix stability. [Tool activity](docs/tool-activity.md) shows compact previews,
+line counts, exit codes and original-message updates for detached shells. Steering
+queues behind requested tool execution; `/stop` explicitly cancels work.
 
 Back up the state directory. `chats/<channel>/main/` and `tree/` contain immutable daily JSONL records; operational SQLite journals contain inbox/outbox, tasks and schedules; `subagents/` holds private child traces; `browsers/pantheon-shared/profile/` holds shared browser state, and the other browser directories hold viewer metadata and screenshots. State is never committed to this repository.
 
