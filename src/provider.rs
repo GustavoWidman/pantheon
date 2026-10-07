@@ -8,6 +8,7 @@ use std::time::Duration;
 #[derive(Clone)]
 pub struct Provider {
     http: reqwest::Client,
+    timeout_seconds: Option<u64>,
     codex: CodexAuth,
     catalog: std::sync::Arc<crate::models::Catalog>,
     #[cfg(test)]
@@ -44,6 +45,7 @@ impl Provider {
                 .timeout(Duration::from_secs(timeout_seconds))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
+            timeout_seconds: Some(timeout_seconds),
             codex: CodexAuth::new(AuthConfig::default()),
             catalog: std::sync::Arc::default(),
             #[cfg(test)]
@@ -54,6 +56,7 @@ impl Provider {
     pub fn mock(endpoint: String) -> Self {
         Self {
             http: reqwest::Client::new(),
+            timeout_seconds: None,
             codex: CodexAuth::new(AuthConfig::default()),
             catalog: std::sync::Arc::default(),
             endpoint: Some(endpoint),
@@ -531,21 +534,14 @@ impl Provider {
                 if let Some(residency) = &credentials.residency {
                     request = request.header("x-openai-internal-codex-residency", residency);
                 }
-                let pending = request.json(body).send();
-                if let Some(submitted) = submitted {
-                    submitted()?;
-                }
-                let response = pending.await.context("Codex transport failure")?;
-                if response.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+                let value = self
+                    .receive_model_response(request.json(body), model, attempt + 1, true, submitted)
+                    .await?;
+                if value.is_none() {
                     credentials = self.codex.credentials(Some(&credentials.access)).await?;
                     continue;
                 }
-                ensure!(
-                    response.status().is_success(),
-                    "codex returned HTTP {}",
-                    response.status()
-                );
-                return read_response(response, true).await;
+                return Ok(value.unwrap());
             }
             unreachable!();
         }
@@ -582,18 +578,51 @@ impl Provider {
                 .header("x-api-key", key)
                 .header("anthropic-version", "2023-06-01")
         };
-        let pending = req.json(body).send();
-        if let Some(submitted) = submitted {
-            submitted()?;
-        }
-        let response = pending.await.context("provider transport failure")?;
-        let status = response.status();
-        // Do not expose provider error bodies: they can echo prompts or credentials.
-        if !status.is_success() {
-            bail!("{vendor} returned HTTP {status}");
-        }
-        read_response(response, false).await
+        Ok(self
+            .receive_model_response(req.json(body), model, 1, false, submitted)
+            .await?
+            .unwrap())
     }
+    async fn receive_model_response(
+        &self,
+        request: reqwest::RequestBuilder,
+        model: &str,
+        attempt: usize,
+        streaming: bool,
+        submitted: Option<&(dyn Fn() -> Result<()> + Sync)>,
+    ) -> Result<Option<Value>> {
+        let mut diagnostic = crate::transport::Exchange::new(model, attempt, self.timeout_seconds);
+        let result = async {
+            let pending = request.send();
+            if let Some(submitted) = submitted {
+                submitted()?;
+            }
+            let response = pending
+                .await
+                .map_err(reqwest::Error::without_url)
+                .context("provider transport failure")?;
+            diagnostic.headers(&response);
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED
+                && model.starts_with("codex/")
+                && attempt == 1
+            {
+                return Ok(None);
+            }
+            // Do not expose provider error bodies: they can echo prompts or credentials.
+            ensure!(
+                response.status().is_success(),
+                "{} returned HTTP {}",
+                model.split('/').next().unwrap_or("provider"),
+                response.status()
+            );
+            read_response_observed(response, streaming, Some(&mut diagnostic))
+                .await
+                .map(Some)
+        }
+        .await;
+        diagnostic.finish(result)
+    }
+
     /// Search is an isolated, server-tool-only provider request, usable by any
     /// worker regardless of its inference provider. No harness tools are exposed.
     pub async fn search(
@@ -745,12 +774,12 @@ impl Provider {
         if vendor == "openai" {
             ensure!(
                 value["status"] == "completed",
-                "provider response incomplete; no tools executed"
+                "provider response incomplete; no tools from this response executed"
             );
         } else {
             ensure!(
                 value["stop_reason"] != "max_tokens" && value["stop_reason"] != "refusal",
-                "provider response incomplete or refused; no tools executed"
+                "provider response incomplete or refused; no tools from this response executed"
             );
         }
         let native = value[if vendor == "openai" {
@@ -897,6 +926,13 @@ fn add_usage(total: &mut Value, next: &Value) {
     }
 }
 async fn read_response(response: reqwest::Response, streaming: bool) -> Result<Value> {
+    read_response_observed(response, streaming, None).await
+}
+async fn read_response_observed(
+    response: reqwest::Response,
+    streaming: bool,
+    mut diagnostic: Option<&mut crate::transport::Exchange>,
+) -> Result<Value> {
     use futures_util::StreamExt;
     const MAX: usize = 32 * 1024 * 1024;
     let sse = streaming
@@ -909,25 +945,52 @@ async fn read_response(response: reqwest::Response, streaming: bool) -> Result<V
     let mut bytes = Vec::new();
     let mut decoder = SseDecoder::default();
     let mut received = 0;
+    if let Some(d) = diagnostic.as_deref_mut() {
+        d.streaming(sse);
+    }
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("provider response stream interrupted; no tools executed")?;
+        let chunk = chunk.map_err(reqwest::Error::without_url).context(
+            "provider response stream interrupted; no tools from this response executed",
+        )?;
+        if let Some(d) = diagnostic.as_deref_mut() {
+            d.chunk(chunk.len());
+            d.stage = "size_limit";
+        }
         received += chunk.len();
         ensure!(
             received <= MAX,
-            "provider response exceeded size limit; no tools executed"
+            "provider response exceeded size limit; no tools from this response executed"
         );
         if sse {
-            if let Some(value) = decoder.feed(&chunk)? {
+            let decoded = decoder.feed(&chunk);
+            if let Some(d) = diagnostic.as_deref_mut() {
+                d.stage = "sse_decode";
+                d.events(
+                    decoder.events,
+                    decoder.last_event,
+                    decoder.completed_items.len(),
+                );
+            }
+            if let Some(value) = decoded? {
                 return Ok(value);
             }
         } else {
             bytes.extend_from_slice(&chunk);
         }
+        if let Some(d) = diagnostic.as_deref_mut() {
+            d.stage = "body";
+        }
+    }
+    if let Some(d) = diagnostic.as_deref_mut() {
+        d.stage = "premature_eof";
     }
     ensure!(
         !sse,
-        "provider stream ended without a completed response; no tools executed"
+        "provider stream ended without a completed response; no tools from this response executed"
     );
+    if let Some(d) = diagnostic {
+        d.stage = "json_decode";
+    }
     serde_json::from_slice(&bytes).context("invalid provider JSON")
 }
 #[derive(Default)]
@@ -936,6 +999,8 @@ struct SseDecoder {
     data: Vec<String>,
     server_tools: Vec<Value>,
     completed_items: std::collections::BTreeMap<u64, Value>,
+    events: usize,
+    last_event: Option<&'static str>,
 }
 impl SseDecoder {
     fn feed(&mut self, bytes: &[u8]) -> Result<Option<Value>> {
@@ -959,6 +1024,27 @@ impl SseDecoder {
                 }
                 let event: Value =
                     serde_json::from_str(&payload).context("invalid provider SSE JSON")?;
+                self.events += 1;
+                // Never retain arbitrary event names, which could contain body content.
+                self.last_event = Some(match event["type"].as_str() {
+                    Some("response.created") => "response.created",
+                    Some("response.in_progress") => "response.in_progress",
+                    Some("response.output_item.added") => "response.output_item.added",
+                    Some("response.output_item.done") => "response.output_item.done",
+                    Some("response.output_text.delta") => "response.output_text.delta",
+                    Some("response.function_call_arguments.delta") => {
+                        "response.function_call_arguments.delta"
+                    }
+                    Some("response.reasoning_summary_text.delta") => {
+                        "response.reasoning_summary_text.delta"
+                    }
+                    Some("response.completed") => "response.completed",
+                    Some("response.done") => "response.done",
+                    Some("response.failed") => "response.failed",
+                    Some("response.incomplete") => "response.incomplete",
+                    Some("error") => "error",
+                    _ => "other",
+                });
                 match event["type"].as_str() {
                     Some("response.completed" | "response.done") => {
                         let mut response = event
@@ -973,7 +1059,7 @@ impl SseDecoder {
                                     .keys()
                                     .copied()
                                     .eq(0..self.completed_items.len() as u64),
-                                "provider stream has incomplete output indices; no tools executed"
+                                "provider stream has incomplete output indices; no tools from this response executed"
                             );
                             response["output"] =
                                 json!(self.completed_items.values().collect::<Vec<_>>());
@@ -1010,7 +1096,9 @@ impl SseDecoder {
                         self.completed_items.insert(index, item);
                     }
                     Some("error" | "response.failed" | "response.incomplete") => {
-                        bail!("provider stream failed or was incomplete; no tools executed")
+                        bail!(
+                            "provider stream failed or was incomplete; no tools from this response executed"
+                        )
                     }
                     _ => {}
                 }
@@ -1025,6 +1113,236 @@ impl SseDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[derive(Clone, Default)]
+    struct DiagnosticLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for DiagnosticLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl DiagnosticLog {
+        fn records(&self) -> (String, Vec<Value>) {
+            let text = String::from_utf8(self.0.lock().unwrap().clone()).unwrap();
+            let records = text
+                .lines()
+                .filter_map(|line| {
+                    line.split_once("diagnostic=")
+                        .map(|(_, json)| serde_json::from_str(json).unwrap())
+                })
+                .collect();
+            (text, records)
+        }
+    }
+    enum StreamEnding {
+        TruncatedBody,
+        CleanEof,
+        Stall,
+    }
+    async fn broken_stream(
+        ending: StreamEnding,
+        body: String,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut buf = [0; 4096];
+                let n = socket.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buf[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length = headers
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .map(|v| v.parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let length = body.len()
+                + if matches!(ending, StreamEnding::CleanEof) {
+                    0
+                } else {
+                    1000
+                };
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {length}\r\nX-Request-ID: req-test-123\r\nCF-Ray: ray-test-XYZ\r\nSet-Cookie: private-response-cookie\r\nX-Unknown: private-header\r\nConnection: close\r\n\r\n"
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            socket.write_all(body.as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if matches!(ending, StreamEnding::Stall) {
+                std::future::pending::<()>().await;
+            }
+            socket.shutdown().await.unwrap();
+        });
+        (
+            format!("http://{address}/?credential=private-url-token"),
+            server,
+        )
+    }
+    fn capture(log: &DiagnosticLog) -> impl tracing::Subscriber + Send + Sync + 'static {
+        let writer = log.clone();
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish()
+    }
+    #[tokio::test]
+    async fn interrupted_stream_reports_causes_progress_and_matching_id_without_payloads() {
+        use tracing::instrument::WithSubscriber;
+        let body = format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({"type":"response.created"}),
+            json!({"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","name":"shell","arguments":"private-tool-arguments"}})
+        );
+        let expected_bytes = body.len();
+        let (endpoint, server) = broken_stream(StreamEnding::TruncatedBody, body).await;
+        let provider = Provider::mock(endpoint);
+        let log = DiagnosticLog::default();
+        let error = provider
+            .step(
+                "openai/test",
+                "none",
+                "private-system-prompt",
+                &[json!({"role":"user","content":"private-user-message"})],
+                &[],
+            )
+            .with_subscriber(capture(&log))
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        let (text, records) = log.records();
+        assert_eq!(records.len(), 1, "{text}");
+        let r = &records[0];
+        assert!(error.to_string().contains(r["id"].as_str().unwrap()));
+        assert!(error.to_string().contains("stream interrupted"));
+        assert_eq!(r["stage"], "body");
+        assert_eq!(r["model"], "openai/test");
+        assert_eq!(r["status"], 200);
+        assert_eq!(r["http_version"], "HTTP/1.1");
+        assert_eq!(r["provider_request_id"], "req-test-123");
+        assert_eq!(r["cf_ray"], "ray-test-XYZ");
+        assert_eq!(r["bytes_received"], expected_bytes);
+        assert!(r["chunks_received"].as_u64().unwrap() > 0);
+        assert_eq!(r["sse_events"], 2);
+        assert_eq!(r["last_sse_event"], "response.output_item.done");
+        assert_eq!(r["completed_output_items"], 1);
+        assert!(r["first_byte_ms"].is_number());
+        assert!(r["since_last_byte_ms"].is_number());
+        assert_eq!(r["is_timeout"], false);
+        assert!(r["causes"].as_array().unwrap().len() >= 2);
+        for secret in [
+            "private-system-prompt",
+            "private-user-message",
+            "private-tool-arguments",
+            "private-response-cookie",
+            "private-header",
+            "private-url-token",
+            "mock-key",
+        ] {
+            assert!(!text.contains(secret), "leaked {secret}");
+        }
+    }
+    #[tokio::test]
+    async fn streaming_timeout_is_distinct_from_clean_incomplete_eof() {
+        use tracing::instrument::WithSubscriber;
+        for (ending, stage, timeout) in [
+            (StreamEnding::Stall, "body", true),
+            (StreamEnding::CleanEof, "premature_eof", false),
+        ] {
+            let (endpoint, server) = broken_stream(
+                ending,
+                "data: {\"type\":\"response.in_progress\"}\n\n".into(),
+            )
+            .await;
+            let mut provider = Provider::mock(endpoint);
+            provider.timeout_seconds = Some(1);
+            provider.http = reqwest::Client::builder()
+                .timeout(Duration::from_secs(1))
+                .build()
+                .unwrap();
+            let log = DiagnosticLog::default();
+            provider
+                .step("openai/test", "none", "", &[], &[])
+                .with_subscriber(capture(&log))
+                .await
+                .unwrap_err();
+            server.abort();
+            let (_, records) = log.records();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0]["stage"], stage);
+            if timeout {
+                assert_eq!(records[0]["is_timeout"], true);
+            } else {
+                assert!(records[0]["is_timeout"].is_null());
+            }
+            assert_eq!(records[0]["last_sse_event"], "response.in_progress");
+        }
+    }
+    #[tokio::test]
+    async fn connection_and_http_failures_have_diagnostics_without_error_bodies() {
+        use axum::{Router, routing::post};
+        use tracing::instrument::WithSubscriber;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/",
+            post(|| async {
+                (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    "private-provider-error",
+                )
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let log = DiagnosticLog::default();
+        let provider = Provider::mock(format!("http://{address}/"));
+        provider
+            .step("openai/test", "none", "", &[], &[])
+            .with_subscriber(capture(&log))
+            .await
+            .unwrap_err();
+        let (text, records) = log.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["stage"], "http_status");
+        assert_eq!(records[0]["status"], 429);
+        assert_eq!(records[0]["bytes_received"], 0);
+        assert!(!text.contains("private-provider-error"));
+        server.abort();
+        let port = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = port.local_addr().unwrap();
+        drop(port);
+        let log = DiagnosticLog::default();
+        Provider::mock(format!("http://{address}/?credential=private-url-token"))
+            .step("openai/test", "none", "", &[], &[])
+            .with_subscriber(capture(&log))
+            .await
+            .unwrap_err();
+        let (text, records) = log.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["stage"], "headers");
+        assert_eq!(records[0]["is_connect"], true);
+        assert!(records[0]["status"].is_null());
+        assert!(!text.contains("private-url-token"));
+    }
     #[tokio::test]
     async fn native_codex_catalog_uses_account_auth_and_preserves_the_cli_cache() {
         use axum::{Json, Router, extract::Query, http::HeaderMap, routing::get};

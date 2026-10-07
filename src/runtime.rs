@@ -18,6 +18,7 @@ use std::{
 };
 use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 pub struct Harness {
     pub config: Config,
@@ -477,7 +478,8 @@ impl Harness {
             let submitted_inputs = run.inputs.clone();
             let submitted = || self.store.submitted_inputs(&submitted_inputs);
             let response = tokio::select! {
-                r=self.provider.step_observed(&run.settings.0,&run.settings.1,system,&run.history,defs,Some(&submitted))=>r?,
+                r=self.provider.step_observed(&run.settings.0,&run.settings.1,system,&run.history,defs,Some(&submitted))
+                    .instrument(tracing::info_span!("provider_step", channel=run.channel, owner=%run.owner, run_id=%run_id, step))=>r?,
                 _=run.cancel.cancelled()=>bail!("cancelled"),
             };
             if !run.child {
@@ -1999,8 +2001,19 @@ impl Harness {
                 let model = self
                     .store
                     .compactor_model(channel, &self.config.agent.compactor_model)?;
-                workers
-                    .spawn(async move { (key, h.compress(&model, key, &context, &source).await) });
+                workers.spawn(async move {
+                    (
+                        key,
+                        h.compress(&model, key, &context, &source)
+                            .instrument(tracing::info_span!(
+                                "compaction",
+                                channel,
+                                level = key.level,
+                                index = key.index
+                            ))
+                            .await,
+                    )
+                });
             }
             tokio::select! {
                 Some(done)=workers.join_next(),if !workers.is_empty()=>{
