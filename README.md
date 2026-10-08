@@ -56,7 +56,7 @@ cargo run -- --config pantheon.toml run
 | `/subagents` | Named workers, settings and state; idle archived workers are hidden |
 | `/skills` | Task guide catalog; inspect one with `id:<name>` |
 | `/mcp` | Configured integrations available in this channel |
-| `/browser` | List owned live browser links; manage handoff/resume |
+| `/browser` | List owned browser health and viewer links; manage handoff/resume |
 | `/wakeup action:add schedule:in 10m prompt:…` | Durable one-shot or repeating wake |
 | `/monitor action:add command:… interval_seconds:30` | Wake when a bounded command's output changes |
 

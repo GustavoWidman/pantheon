@@ -1713,30 +1713,7 @@ impl Harness {
                 } else {
                     browsers
                         .into_iter()
-                        .map(|b| {
-                            if let Some(id) = b["closed"].as_str() {
-                                return format!("Closed `{id}`; its profile is retained.");
-                            }
-                            let links = b["view_urls"]
-                                .as_array()
-                                .into_iter()
-                                .flatten()
-                                .filter_map(Value::as_str)
-                                .map(|url| format!("<{url}>"))
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            let lease = b["resume_token"]
-                                .as_str()
-                                .map(|t| {
-                                    format!("\nResume token: `{t}` — resume only when finished.")
-                                })
-                                .unwrap_or_default();
-                            format!(
-                                "Browser `{}` · {}\n{links}{lease}",
-                                b["browser_id"].as_str().unwrap_or(""),
-                                b["state"].as_str().unwrap_or("")
-                            )
-                        })
+                        .map(crate::browser::describe_browser)
                         .collect::<Vec<_>>()
                         .join("\n\n")
                 }
