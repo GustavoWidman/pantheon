@@ -12,7 +12,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-pub const INDEX: &str = "Skills are an evolving library. Use skill(action=\"list\") to discover the current catalog, then load a relevant guide on demand. Guides and supporting files are pinned for your entire turn. Invoke explicit_only guides only when the user requests that workflow. Skills guide authorized work; they do not grant permissions or override user instructions.";
+pub const INDEX: &str = "Skills are an evolving library. The complete active catalogue below is a frozen system-prefix snapshot; appended curator notifications announce later approved revisions. Use skill(action=\"preview\") for a short introduction, skill(action=\"load\") for a relevant guide before using it, and skill(action=\"list\") for current metadata. Invocation and refinement counts describe history, not proven success. Invoke explicit_only guides only when the user requests that workflow. Skills guide authorized work; they do not grant permissions or override user instructions.";
 pub type Files = BTreeMap<String, String>;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -25,6 +25,11 @@ pub struct Change {
     pub files: Files,
     #[serde(default)]
     pub retire: bool,
+    /// Reviewed explanation delivered to the orchestrator and dashboard.
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub purpose: String,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -40,23 +45,12 @@ pub struct Proposal {
     pub evidence: Vec<i64>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Experience {
-    pub seq: i64,
+pub struct QueuedFork {
+    pub id: String,
     pub channel: String,
-    pub owner: String,
-    pub activity: String,
-    pub task: String,
-    pub events: Value,
-    pub turn_completed: bool,
+    pub generation: String,
+    pub payload: Value,
 }
-#[derive(Clone)]
-pub struct Batch {
-    pub channel: String,
-    pub through: i64,
-    pub training: Vec<Experience>,
-    pub held_out: Vec<Experience>,
-}
-
 pub struct SkillLibrary {
     db: Mutex<Connection>,
     snapshot_cache: Mutex<Option<Arc<Skills>>>,
@@ -85,12 +79,19 @@ impl SkillLibrary {
             CREATE TABLE IF NOT EXISTS revisions(id TEXT NOT NULL,revision INTEGER NOT NULL,files TEXT NOT NULL,retired INTEGER NOT NULL,reason TEXT NOT NULL,evidence TEXT NOT NULL,created INTEGER NOT NULL,PRIMARY KEY(id,revision));
             CREATE TABLE IF NOT EXISTS seed_baselines(id TEXT PRIMARY KEY,hash TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS seeds(id TEXT NOT NULL,hash TEXT NOT NULL,files TEXT NOT NULL,current INTEGER NOT NULL,PRIMARY KEY(id,hash));
-            CREATE TABLE IF NOT EXISTS experiences(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,channel TEXT NOT NULL,owner TEXT NOT NULL,activity TEXT NOT NULL,task TEXT NOT NULL,events TEXT NOT NULL,successful INTEGER NOT NULL,created INTEGER NOT NULL,reviewed INTEGER NOT NULL DEFAULT 0);
-            CREATE INDEX IF NOT EXISTS experiences_pending ON experiences(channel,seq) WHERE reviewed=0;
             CREATE TABLE IF NOT EXISTS attempts(id TEXT PRIMARY KEY,channel TEXT NOT NULL,status TEXT NOT NULL,proposal TEXT,report TEXT NOT NULL DEFAULT '',usage TEXT NOT NULL DEFAULT '[]',review_context TEXT NOT NULL DEFAULT '',created INTEGER NOT NULL,finished INTEGER);
-            CREATE TABLE IF NOT EXISTS reviewed_activities(channel TEXT NOT NULL,activity TEXT NOT NULL,PRIMARY KEY(channel,activity));
             CREATE INDEX IF NOT EXISTS attempts_created ON attempts(created);
-            CREATE TABLE IF NOT EXISTS curator_state(key TEXT PRIMARY KEY,value INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS curator_forks(id TEXT PRIMARY KEY,channel TEXT NOT NULL,generation TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL,phase TEXT NOT NULL,reviewers_spawned INTEGER NOT NULL DEFAULT 0,reviewers_running INTEGER NOT NULL DEFAULT 0,reviewers_finished INTEGER NOT NULL DEFAULT 0,created INTEGER NOT NULL,finished INTEGER,UNIQUE(channel,generation));
+            CREATE UNIQUE INDEX IF NOT EXISTS curator_one_active ON curator_forks(channel) WHERE status='active';
+            CREATE UNIQUE INDEX IF NOT EXISTS curator_one_pending ON curator_forks(channel) WHERE status='queued';
+            CREATE TABLE IF NOT EXISTS curator_fork_settings(id TEXT PRIMARY KEY,model TEXT NOT NULL,reasoning TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS curator_fork_controls(id TEXT PRIMARY KEY,requested INTEGER NOT NULL DEFAULT 0,cancelled INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS skill_notifications(id TEXT PRIMARY KEY,channel TEXT NOT NULL,payload TEXT NOT NULL,created INTEGER NOT NULL,acknowledged INTEGER NOT NULL DEFAULT 0,presented INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS skill_counters(id TEXT PRIMARY KEY,invocations INTEGER NOT NULL DEFAULT 0,refinements INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS skill_invocations(skill TEXT NOT NULL,owner TEXT NOT NULL,PRIMARY KEY(skill,owner));
+            CREATE TABLE IF NOT EXISTS skill_catalogues(channel TEXT PRIMARY KEY,text TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS skill_channel_settled(channel TEXT PRIMARY KEY,settled INTEGER NOT NULL);
+            UPDATE curator_forks SET status='interrupted',phase='interrupted',reviewers_running=0,finished=strftime('%s','now') WHERE status='active';
             UPDATE attempts SET status='interrupted',report='Process stopped before curation completed',finished=strftime('%s','now') WHERE status='running';")?;
         let seeds = Skills::load(config)?;
         let tx = db.transaction()?;
@@ -137,18 +138,20 @@ impl SkillLibrary {
             return Ok(snapshot.clone());
         }
         let db = self.db.lock().unwrap();
-        let mut query = db.prepare("SELECT h.id,h.revision,h.origin,r.files FROM heads h JOIN revisions r USING(id,revision) WHERE h.retired=0 ORDER BY h.id")?;
+        let mut query = db.prepare("SELECT h.id,h.revision,h.origin,r.files,COALESCE(c.invocations,0),COALESCE(c.refinements,0) FROM heads h JOIN revisions r USING(id,revision) LEFT JOIN skill_counters c ON c.id=h.id WHERE h.retired=0 ORDER BY h.id")?;
         let rows = query.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, i64>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
             ))
         })?;
         let mut skills = Skills::empty();
         for row in rows {
-            let (id, revision, origin, files) = row?;
+            let (id, revision, origin, files, invocations, refinements) = row?;
             let files: Files = serde_json::from_str(&files)?;
             skills.insert(
                 &id,
@@ -162,10 +165,362 @@ impl SkillLibrary {
             skill.resources = Some(files);
             skill.revision = revision;
             skill.origin = origin;
+            skill.invocations = invocations;
+            skill.refinements = refinements;
         }
         let skills = Arc::new(skills);
         *cache = Some(skills.clone());
         Ok(skills)
+    }
+    /// One durable pending snapshot per channel; superseded generations remain deduplicated.
+    pub fn enqueue_fork(&self, channel: &str, generation: &str, payload: &Value) -> Result<bool> {
+        ensure!(
+            !channel.is_empty()
+                && channel.len() <= 128
+                && !generation.is_empty()
+                && generation.len() <= 256,
+            "invalid fork identity"
+        );
+        let payload = serde_json::to_string(payload)?;
+        ensure!(
+            payload.len() <= 16_000_000,
+            "fork exceeds durable context budget"
+        );
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM curator_forks WHERE channel=?1 AND generation=?2)",
+            params![channel, generation],
+            |r| r.get(0),
+        )?;
+        if exists {
+            return Ok(false);
+        }
+        let requested: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM curator_forks f JOIN curator_fork_controls c USING(id) WHERE f.channel=?1 AND f.status='queued' AND c.requested=1)",[channel],|r|r.get(0))?;
+        tx.execute("UPDATE curator_forks SET status='superseded',payload='null',finished=?2 WHERE channel=?1 AND status='queued'",params![channel,crate::store::now()])?;
+        let id = uuid::Uuid::new_v4().to_string();
+        tx.execute("INSERT INTO curator_forks(id,channel,generation,payload,status,phase,created) VALUES(?1,?2,?3,?4,'queued','waiting',?5)",params![id,channel,generation,payload,crate::store::now()])?;
+        if requested {
+            tx.execute(
+                "INSERT INTO curator_fork_controls(id,requested,cancelled) VALUES(?1,1,0)",
+                [&id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+    /// Manual requests refer to an existing eligible snapshot; they cannot invent work.
+    pub fn request_channel_fork(&self, channel: &str) -> Result<bool> {
+        let changed = self.db.lock().unwrap().execute(
+            "INSERT INTO curator_fork_controls(id,requested,cancelled) SELECT id,1,0 FROM curator_forks WHERE channel=?1 AND status='queued' ON CONFLICT(id) DO UPDATE SET requested=1",
+            [channel],
+        )?;
+        Ok(changed > 0)
+    }
+    pub fn fork_requested(&self, channel: &str) -> Result<bool> {
+        Ok(self.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM curator_forks f JOIN curator_fork_controls c USING(id) WHERE f.channel=?1 AND f.status='queued' AND c.requested=1)",[channel],|r|r.get(0))?)
+    }
+    /// Pending snapshots are discarded. Active jobs keep ownership until their
+    /// cancellation token finishes, but publication is immediately forbidden.
+    pub fn cancel_channel_forks(&self, channel: &str) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        tx.execute("INSERT INTO curator_fork_controls(id,requested,cancelled) SELECT id,0,1 FROM curator_forks WHERE channel=?1 AND status IN ('active','queued') ON CONFLICT(id) DO UPDATE SET requested=0,cancelled=1",[channel])?;
+        tx.execute("UPDATE curator_forks SET status='cancelled',phase='cancelled',payload='null',finished=?2 WHERE channel=?1 AND status='queued'",params![channel,crate::store::now()])?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn queued_channels(&self) -> Result<Vec<String>> {
+        let db = self.db.lock().unwrap();
+        let mut q = db.prepare("SELECT channel FROM curator_forks f WHERE status='queued' AND NOT EXISTS(SELECT 1 FROM curator_forks a WHERE a.channel=f.channel AND a.status='active') ORDER BY created,rowid")?;
+        Ok(q.query_map([], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?)
+    }
+    pub fn take_fork(&self, channel: &str) -> Result<Option<QueuedFork>> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let active: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM curator_forks WHERE channel=?1 AND status='active')",
+            [channel],
+            |r| r.get(0),
+        )?;
+        if active {
+            return Ok(None);
+        }
+        let raw = tx.query_row("SELECT id,generation,payload FROM curator_forks WHERE channel=?1 AND status='queued' ORDER BY created,rowid LIMIT 1",[channel],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()?;
+        let Some((id, generation, payload)) = raw else {
+            return Ok(None);
+        };
+        tx.execute("UPDATE curator_forks SET status='active',phase='drafting',reviewers_spawned=0,reviewers_running=0,reviewers_finished=0 WHERE id=?1",[&id])?;
+        tx.execute("INSERT INTO attempts(id,channel,status,created) VALUES(?1,?2,'running',?3) ON CONFLICT(id) DO UPDATE SET status='running',finished=NULL",params![id,channel,crate::store::now()])?;
+        tx.execute(
+            "UPDATE curator_fork_controls SET requested=0 WHERE id=?1",
+            [&id],
+        )?;
+        tx.commit()?;
+        Ok(Some(QueuedFork {
+            id,
+            channel: channel.into(),
+            generation,
+            payload: serde_json::from_str(&payload)?,
+        }))
+    }
+    /// Resolve once before provider work; later configuration changes cannot
+    /// rewrite the durable identity of an already-running job or its reviewers.
+    pub fn pin_fork_settings(&self, id: &str, model: &str, reasoning: &str) -> Result<()> {
+        ensure!(
+            !model.trim().is_empty()
+                && model.len() <= 256
+                && !reasoning.trim().is_empty()
+                && reasoning.len() <= 64,
+            "invalid pinned curator settings"
+        );
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let active: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM curator_forks WHERE id=?1 AND status='active')",
+            [id],
+            |r| r.get(0),
+        )?;
+        ensure!(active, "curation fork is no longer active");
+        let old = tx
+            .query_row(
+                "SELECT model,reasoning FROM curator_fork_settings WHERE id=?1",
+                [id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((old_model, old_reasoning)) = old {
+            ensure!(
+                old_model == model && old_reasoning == reasoning,
+                "curation fork settings are already pinned"
+            );
+        } else {
+            tx.execute(
+                "INSERT INTO curator_fork_settings(id,model,reasoning) VALUES(?1,?2,?3)",
+                params![id, model, reasoning],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn update_fork_phase(
+        &self,
+        id: &str,
+        phase: &str,
+        spawned: usize,
+        running: usize,
+        finished: usize,
+    ) -> Result<()> {
+        ensure!(
+            matches!(phase, "drafting" | "review")
+                && running + finished <= spawned
+                && spawned <= 64,
+            "invalid review phase/counters"
+        );
+        let changed = self.db.lock().unwrap().execute("UPDATE curator_forks SET phase=?2,reviewers_spawned=?3,reviewers_running=?4,reviewers_finished=?5 WHERE id=?1 AND status='active'",params![id,phase,spawned as i64,running as i64,finished as i64])?;
+        ensure!(changed == 1, "curation fork is no longer active");
+        Ok(())
+    }
+    pub fn finish_fork(
+        &self,
+        id: &str,
+        status: &str,
+        report: &Value,
+        usage: &[Value],
+    ) -> Result<()> {
+        ensure!(
+            matches!(
+                status,
+                "denied"
+                    | "no_change"
+                    | "failed"
+                    | "interrupted"
+                    | "rejected"
+                    | "completed"
+                    | "cancelled"
+            ),
+            "invalid final curator status"
+        );
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        ensure!(tx.execute("UPDATE curator_forks SET status=?2,phase=?2,payload='null',reviewers_running=0,finished=?3 WHERE id=?1 AND status='active'",params![id,status,crate::store::now()])? == 1,"curation fork is no longer active");
+        tx.execute(
+            "UPDATE attempts SET status=?2,report=?3,usage=?4,finished=?5 WHERE id=?1",
+            params![
+                id,
+                status,
+                serde_json::to_string(report)?,
+                serde_json::to_string(usage)?,
+                crate::store::now()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+    /// Registry updates, completed attempt and notification outbox commit together.
+    pub fn publish_fork(
+        &self,
+        id: &str,
+        proposal: &Proposal,
+        report: &Value,
+        usage: &[Value],
+    ) -> Result<()> {
+        validate_proposal(proposal)?;
+        ensure!(
+            proposal
+                .changes
+                .iter()
+                .all(|c| !c.summary.trim().is_empty() && !c.purpose.trim().is_empty()),
+            "publication requires a summary and purpose for each skill change"
+        );
+        let mut cache = self.snapshot_cache.lock().unwrap();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let channel: String = tx
+            .query_row(
+                "SELECT channel FROM curator_forks f WHERE id=?1 AND status='active' AND NOT EXISTS(SELECT 1 FROM curator_fork_controls c WHERE c.id=f.id AND c.cancelled=1)",
+                [id],
+                |r| r.get(0),
+            )
+            .context("curation fork is no longer active")?;
+        apply_changes(&tx, proposal, Some(id))?;
+        for change in &proposal.changes {
+            let revision = change.expected_revision + 1;
+            let kind = if change.retire {
+                "retire"
+            } else if change.expected_revision == 0 {
+                "add"
+            } else {
+                "modify"
+            };
+            let note = json!({"id":format!("{id}:{}",change.id),"attempt":id,"channel":channel,"skill":change.id,"revision":revision,"kind":kind,"summary":change.summary,"purpose":change.purpose});
+            tx.execute(
+                "INSERT INTO skill_notifications(id,channel,payload,created) VALUES(?1,?2,?3,?4)",
+                params![
+                    note["id"].as_str().unwrap(),
+                    channel,
+                    note.to_string(),
+                    crate::store::now()
+                ],
+            )?;
+        }
+        tx.execute("UPDATE curator_forks SET status='published',phase='finished',payload='null',reviewers_running=0,finished=?2 WHERE id=?1",params![id,crate::store::now()])?;
+        tx.execute("UPDATE attempts SET status='published',proposal=?2,report=?3,usage=?4,finished=?5 WHERE id=?1",params![id,serde_json::to_string(proposal)?,serde_json::to_string(report)?,serde_json::to_string(usage)?,crate::store::now()])?;
+        tx.commit()?;
+        *cache = None;
+        Ok(())
+    }
+    pub fn notifications(&self, channel: &str) -> Result<Vec<Value>> {
+        self.notification_rows(channel, false)
+    }
+    pub fn notification_channels(&self) -> Result<Vec<String>> {
+        let db = self.db.lock().unwrap();
+        let mut q = db.prepare(
+            "SELECT DISTINCT channel FROM skill_notifications WHERE presented=0 ORDER BY channel",
+        )?;
+        Ok(q.query_map([], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?)
+    }
+    pub fn pending_skill_events(&self, channel: &str) -> Result<Vec<Value>> {
+        self.notification_rows(channel, true)
+    }
+    fn notification_rows(&self, channel: &str, events: bool) -> Result<Vec<Value>> {
+        let db = self.db.lock().unwrap();
+        let mut q=db.prepare(if events {"SELECT payload FROM skill_notifications WHERE channel=?1 AND presented=0 ORDER BY created,rowid"}else{"SELECT payload FROM skill_notifications WHERE channel=?1 AND acknowledged=0 ORDER BY created,rowid"})?;
+        let raw = q
+            .query_map([channel], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        raw.into_iter()
+            .map(|s| Ok(serde_json::from_str(&s)?))
+            .collect()
+    }
+    pub fn acknowledge_notifications(&self, channel: &str, ids: &[String]) -> Result<()> {
+        self.mark_notifications(channel, ids, false)
+    }
+    pub fn mark_skill_events_presented(&self, channel: &str, ids: &[String]) -> Result<()> {
+        self.mark_notifications(channel, ids, true)
+    }
+    fn mark_notifications(&self, channel: &str, ids: &[String], presented: bool) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        db.execute(if presented {"UPDATE skill_notifications SET presented=1 WHERE channel=?1 AND id IN (SELECT value FROM json_each(?2))"}else{"UPDATE skill_notifications SET acknowledged=1 WHERE channel=?1 AND id IN (SELECT value FROM json_each(?2))"},params![channel,serde_json::to_string(ids)?])?;
+        Ok(())
+    }
+    /// Freeze exact system catalogue bytes until the caller's idle refresh boundary.
+    pub fn note_channel_settled(&self, channel: &str, timestamp: i64) -> Result<()> {
+        self.db.lock().unwrap().execute("INSERT INTO skill_channel_settled(channel,settled) VALUES(?1,?2) ON CONFLICT(channel) DO UPDATE SET settled=max(settled,excluded.settled)",params![channel,timestamp])?;
+        Ok(())
+    }
+    pub fn last_settled(&self, channel: &str) -> Result<Option<i64>> {
+        Ok(self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT settled FROM skill_channel_settled WHERE channel=?1",
+                [channel],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+    pub fn catalogue_refresh_due(
+        &self,
+        channel: &str,
+        idle_seconds: u64,
+        now: i64,
+    ) -> Result<bool> {
+        Ok(self.last_settled(channel)?.is_some_and(|last| {
+            now.saturating_sub(last) >= i64::try_from(idle_seconds).unwrap_or(i64::MAX)
+        }))
+    }
+    pub fn cache_catalogue(&self, channel: &str, candidate: &str, refresh: bool) -> Result<String> {
+        ensure!(candidate.len() <= 1_000_000, "catalogue exceeds budget");
+        let db = self.db.lock().unwrap();
+        db.execute("INSERT INTO skill_catalogues(channel,text) VALUES(?1,?2) ON CONFLICT(channel) DO UPDATE SET text=excluded.text WHERE ?3",params![channel,candidate,refresh])?;
+        Ok(db.query_row(
+            "SELECT text FROM skill_catalogues WHERE channel=?1",
+            [channel],
+            |r| r.get(0),
+        )?)
+    }
+    pub fn catalogue(&self, description_chars: usize) -> Result<String> {
+        self.snapshot()?.catalogue(description_chars)
+    }
+    pub fn record_invocation(&self, skill_id: &str, owner_turn_id: &str) -> Result<()> {
+        ensure!(
+            !owner_turn_id.is_empty() && owner_turn_id.len() <= 256,
+            "invalid invocation owner"
+        );
+        let mut cache = self.snapshot_cache.lock().unwrap();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM heads WHERE id=?1)",
+            [skill_id],
+            |r| r.get(0),
+        )?;
+        ensure!(exists, "unknown skill invocation");
+        if tx.execute(
+            "INSERT OR IGNORE INTO skill_invocations(skill,owner) VALUES(?1,?2)",
+            params![skill_id, owner_turn_id],
+        )? > 0
+        {
+            tx.execute("INSERT INTO skill_counters(id,invocations,refinements) VALUES(?1,1,0) ON CONFLICT(id) DO UPDATE SET invocations=invocations+1",[skill_id])?;
+            *cache = None;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn channel_status(&self, channel: &str) -> Result<Value> {
+        let db = self.db.lock().unwrap();
+        let queued: i64 = db.query_row(
+            "SELECT count(*) FROM curator_forks WHERE channel=?1 AND status='queued'",
+            [channel],
+            |r| r.get(0),
+        )?;
+        let requested: bool=db.query_row("SELECT EXISTS(SELECT 1 FROM curator_forks f JOIN curator_fork_controls c USING(id) WHERE f.channel=?1 AND f.status='queued' AND c.requested=1)",[channel],|r|r.get(0))?;
+        let latest=db.query_row("SELECT f.id,f.generation,f.status,f.phase,f.reviewers_spawned,f.reviewers_running,f.reviewers_finished,f.created,f.finished,a.report,a.usage,s.model,s.reasoning FROM curator_forks f LEFT JOIN attempts a USING(id) LEFT JOIN curator_fork_settings s USING(id) WHERE f.channel=?1 ORDER BY (f.status='active') DESC,f.created DESC,f.rowid DESC LIMIT 1",[channel],|r|Ok(json!({"id":r.get::<_,String>(0)?,"generation":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?,"phase":r.get::<_,String>(3)?,"reviewers_spawned":r.get::<_,i64>(4)?,"reviewers_running":r.get::<_,i64>(5)?,"reviewers_finished":r.get::<_,i64>(6)?,"created":r.get::<_,i64>(7)?,"finished":r.get::<_,Option<i64>>(8)?,"report":r.get::<_,Option<String>>(9)?,"usage":r.get::<_,Option<String>>(10)?,"model":r.get::<_,Option<String>>(11)?,"reasoning":r.get::<_,Option<String>>(12)?}))).optional()?;
+        Ok(json!({"channel":channel,"queued_count":queued,"requested":requested,"latest":latest}))
     }
     pub fn history(&self, id: &str, offset: usize) -> Result<Value> {
         ensure!(offset <= 100_000, "history offset too large");
@@ -191,8 +546,8 @@ impl SkillLibrary {
     }
     pub fn heads(&self) -> Result<Value> {
         let db = self.db.lock().unwrap();
-        let mut q = db.prepare("SELECT id,revision,retired,origin FROM heads ORDER BY id")?;
-        let rows = q.query_map([], |r| Ok(json!({"id":r.get::<_,String>(0)?,"revision":r.get::<_,i64>(1)?,"retired":r.get::<_,bool>(2)?,"origin":r.get::<_,String>(3)?})))?;
+        let mut q = db.prepare("SELECT h.id,revision,retired,origin,COALESCE(c.invocations,0),COALESCE(c.refinements,0) FROM heads h LEFT JOIN skill_counters c ON c.id=h.id ORDER BY h.id")?;
+        let rows = q.query_map([], |r| Ok(json!({"id":r.get::<_,String>(0)?,"revision":r.get::<_,i64>(1)?,"retired":r.get::<_,bool>(2)?,"origin":r.get::<_,String>(3)?,"invocations":r.get::<_,i64>(4)?,"refinements":r.get::<_,i64>(5)?})))?;
         Ok(Value::Array(rows.collect::<std::result::Result<_, _>>()?))
     }
     pub fn seed_offers(&self) -> Result<Value> {
@@ -225,40 +580,6 @@ impl SkillLibrary {
         *cache = None;
         Ok(())
     }
-    pub fn publish_attempt(
-        &self,
-        proposal: &Proposal,
-        id: &str,
-        report: &Value,
-        usage: &[Value],
-        batch: &Batch,
-    ) -> Result<()> {
-        validate_proposal(proposal)?;
-        let mut cache = self.snapshot_cache.lock().unwrap();
-        let mut db = self.db.lock().unwrap();
-        let tx = db.transaction()?;
-        let running: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM attempts WHERE id=?1 AND status='running')",
-            [id],
-            |r| r.get(0),
-        )?;
-        ensure!(running, "curation attempt is no longer active");
-        apply_changes(&tx, proposal, Some(id))?;
-        tx.execute(
-            "UPDATE attempts SET status='published',report=?2,usage=?3,finished=?4 WHERE id=?1",
-            params![
-                id,
-                serde_json::to_string(report)?,
-                serde_json::to_string(usage)?,
-                crate::store::now()
-            ],
-        )?;
-        mark_batch(&tx, batch)?;
-        tx.execute("DELETE FROM curator_state WHERE key='requested'", [])?;
-        tx.commit()?;
-        *cache = None;
-        Ok(())
-    }
     pub fn rollback(&self, id: &str, revision: i64) -> Result<()> {
         let heads = self.heads()?;
         let head = heads
@@ -282,6 +603,8 @@ impl SkillLibrary {
                 expected_revision: head["revision"].as_i64().unwrap(),
                 files,
                 retire: retired,
+                summary: String::new(),
+                purpose: String::new(),
             }],
             task_family: "User-requested rollback".into(),
             triggers: "Explicit rollback request".into(),
@@ -292,79 +615,6 @@ impl SkillLibrary {
             reason: format!("User rollback to revision {revision}"),
             evidence: vec![],
         })
-    }
-    pub fn record(
-        &self,
-        id: &str,
-        channel: u64,
-        owner: &str,
-        task: &str,
-        events: &Value,
-        successful: bool,
-    ) -> Result<()> {
-        // Bounded excerpts are evidence, never a replacement for the original journal.
-        let task: String = task.chars().take(8000).collect();
-        let activity = events["activity"].as_str().unwrap_or(id).to_owned();
-        let events = serde_json::to_string(events)?;
-        ensure!(events.len() <= 64_000, "experience exceeds capture budget");
-        let mut db = self.db.lock().unwrap();
-        let tx = db.transaction()?;
-        tx.execute("INSERT OR IGNORE INTO experiences(id,channel,owner,activity,task,events,successful,created) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![id,channel.to_string(),owner,activity,task,events,successful,crate::store::now()])?;
-        tx.execute("DELETE FROM experiences WHERE seq NOT IN (SELECT seq FROM experiences ORDER BY seq DESC LIMIT 256)", [])?;
-        tx.commit()?;
-        Ok(())
-    }
-    pub fn batch(&self, minimum: usize) -> Result<Option<Batch>> {
-        let db = self.db.lock().unwrap();
-        // Root turns supply independent cases; worker turns remain supporting evidence.
-        let channel: Option<String> = db.query_row("SELECT channel FROM experiences WHERE reviewed=0 AND owner LIKE 'channel:%' AND NOT EXISTS(SELECT 1 FROM reviewed_activities a WHERE a.channel=experiences.channel AND a.activity=experiences.activity) GROUP BY channel HAVING count(DISTINCT activity)>=?1 ORDER BY min(seq) LIMIT 1", [minimum as i64], |r|r.get(0)).optional()?;
-        let Some(channel) = channel else {
-            return Ok(None);
-        };
-        let mut q = db.prepare("SELECT seq,channel,owner,activity,task,events,successful FROM experiences WHERE channel=?1 AND reviewed=0 AND owner LIKE 'channel:%' AND NOT EXISTS(SELECT 1 FROM reviewed_activities a WHERE a.channel=experiences.channel AND a.activity=experiences.activity) AND seq IN (SELECT max(seq) FROM experiences WHERE channel=?1 AND owner LIKE 'channel:%' GROUP BY activity) ORDER BY seq DESC LIMIT 8")?;
-        let rows = q.query_map([&channel], experience_row)?;
-        let mut items: Vec<Experience> = rows.collect::<std::result::Result<_, _>>()?;
-        // Rehearsal starts from the original task, including when the last turn
-        // merely delivered a background worker report.
-        for case in &mut items {
-            case.task=db.query_row("SELECT task FROM experiences WHERE channel=?1 AND activity=?2 AND owner LIKE 'channel:%' ORDER BY seq LIMIT 1",params![case.channel,case.activity],|r|r.get(0))?;
-        }
-        let through: i64 = db.query_row(
-            "SELECT max(seq) FROM experiences WHERE channel=?1",
-            [&channel],
-            |r| r.get(0),
-        )?;
-        let mut held_out = vec![items.remove(0)];
-        let activities: Vec<_> = items.iter().map(|e| e.activity.clone()).collect();
-        let representative_ids: Vec<_> = items.iter().map(|e| e.seq).collect();
-        let mut q=db.prepare("SELECT seq,channel,owner,activity,task,events,successful FROM experiences WHERE channel=?1 AND activity IN (SELECT value FROM json_each(?2)) AND seq NOT IN (SELECT value FROM json_each(?3)) ORDER BY seq DESC LIMIT 8")?;
-        let supporting = q
-            .query_map(
-                params![
-                    channel,
-                    serde_json::to_string(&activities)?,
-                    serde_json::to_string(&representative_ids)?
-                ],
-                experience_row,
-            )?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        items.extend(supporting);
-        // All records from the withheld activity stay out of drafting, including
-        // private worker traces and earlier root turns from that same task.
-        let mut q=db.prepare("SELECT seq,channel,owner,activity,task,events,successful FROM experiences WHERE channel=?1 AND activity=?2 AND seq<>?3 ORDER BY seq DESC LIMIT 4")?;
-        let supporting = q
-            .query_map(
-                params![channel, held_out[0].activity, held_out[0].seq],
-                experience_row,
-            )?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        held_out[0].events = json!({"root":held_out[0].events,"supporting":supporting.iter().map(|e|json!({"seq":e.seq,"owner":e.owner,"events":bounded_json(&e.events,6000)})).collect::<Vec<_>>()});
-        Ok(Some(Batch {
-            channel,
-            through,
-            training: items,
-            held_out,
-        }))
     }
     pub fn proposals(&self, channel: &str) -> Result<Value> {
         let db = self.db.lock().unwrap();
@@ -380,7 +630,7 @@ impl SkillLibrary {
         for row in rows {
             let (id, status, proposal) = row?;
             let p: Proposal = serde_json::from_str(&proposal)?;
-            proposals.push(json!({"id":id,"status":status,"task_family":p.task_family,"reason":p.reason,"changes":p.changes.iter().map(|c|json!({"id":c.id,"expected_revision":c.expected_revision,"retire":c.retire})).collect::<Vec<_>>()}));
+            proposals.push(json!({"id":id,"status":status,"task_family":p.task_family,"reason":p.reason,"changes":p.changes.iter().map(|c|json!({"id":c.id,"expected_revision":c.expected_revision,"retire":c.retire,"summary":c.summary,"purpose":c.purpose})).collect::<Vec<_>>()}));
         }
         Ok(json!(proposals))
     }
@@ -407,33 +657,6 @@ impl SkillLibrary {
         args["id"] = json!(id);
         skills.execute(&args)
     }
-    pub fn request_pass(&self) -> Result<()> {
-        self.db.lock().unwrap().execute("INSERT INTO curator_state VALUES('requested',1) ON CONFLICT(key) DO UPDATE SET value=1",[])?;
-        Ok(())
-    }
-    pub fn pass_requested(&self) -> Result<bool> {
-        Ok(self
-            .db
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT value FROM curator_state WHERE key='requested'",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .optional()?
-            .unwrap_or(0)
-            != 0)
-    }
-    pub fn begin_attempt(&self, id: &str, channel: &str) -> Result<()> {
-        let db = self.db.lock().unwrap();
-        db.execute(
-            "INSERT INTO attempts(id,channel,status,created) VALUES(?1,?2,'running',?3)",
-            params![id, channel, crate::store::now()],
-        )?;
-        db.execute("INSERT INTO curator_state VALUES('last_attempt',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [crate::store::now()])?;
-        Ok(())
-    }
     pub fn save_proposal(&self, id: &str, proposal: &Proposal) -> Result<()> {
         validate_proposal(proposal)?;
         self.db.lock().unwrap().execute(
@@ -453,60 +676,6 @@ impl SkillLibrary {
             params![id, context],
         )?;
         Ok(())
-    }
-    pub fn finish_attempt(
-        &self,
-        id: &str,
-        status: &str,
-        report: &Value,
-        usage: &[Value],
-        batch: Option<&Batch>,
-    ) -> Result<()> {
-        let mut db = self.db.lock().unwrap();
-        let tx = db.transaction()?;
-        tx.execute(
-            "UPDATE attempts SET status=?2,report=?3,usage=?4,finished=?5 WHERE id=?1",
-            params![
-                id,
-                status,
-                serde_json::to_string(report)?,
-                serde_json::to_string(usage)?,
-                crate::store::now()
-            ],
-        )?;
-        if let Some(batch) = batch {
-            mark_batch(&tx, batch)?;
-        }
-        if status != "interrupted" {
-            tx.execute("DELETE FROM curator_state WHERE key='requested'", [])?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-    pub fn status(&self) -> Result<Value> {
-        let db = self.db.lock().unwrap();
-        let latest = db.query_row("SELECT id,status,created,finished,report,usage,proposal IS NOT NULL FROM attempts ORDER BY created DESC,rowid DESC LIMIT 1", [], |r| Ok(json!({"id":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,"created":r.get::<_,i64>(2)?,"finished":r.get::<_,Option<i64>>(3)?,"report":r.get::<_,String>(4)?,"usage":r.get::<_,String>(5)?,"has_proposal":r.get::<_,bool>(6)?}))).optional()?;
-        let pending: i64 = db.query_row(
-            "SELECT count(DISTINCT channel||':'||activity) FROM experiences WHERE reviewed=0 AND owner LIKE 'channel:%' AND NOT EXISTS(SELECT 1 FROM reviewed_activities a WHERE a.channel=experiences.channel AND a.activity=experiences.activity)",
-            [],
-            |r| r.get(0),
-        )?;
-        let last: i64 = db
-            .query_row(
-                "SELECT value FROM curator_state WHERE key='last_attempt'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?
-            .unwrap_or(0);
-        let settled: i64 = db.query_row(
-            "SELECT COALESCE(max(created),0) FROM experiences",
-            [],
-            |r| r.get(0),
-        )?;
-        Ok(
-            json!({"pending_tasks":pending,"last_attempt":last,"last_settled":settled,"latest":latest}),
-        )
     }
 }
 impl Drop for SkillLibrary {
@@ -537,6 +706,10 @@ pub fn validate_proposal(p: &Proposal) -> Result<()> {
     ensure!(p.evidence.len() <= 16, "too many evidence references");
     let mut ids = std::collections::HashSet::new();
     for change in &p.changes {
+        ensure!(
+            change.summary.chars().count() <= 1000 && change.purpose.chars().count() <= 1000,
+            "change summary/purpose exceeds 1000 characters"
+        );
         ensure!(ids.insert(&change.id), "duplicate change for a skill");
         ensure!(
             change.expected_revision >= 0,
@@ -661,6 +834,9 @@ fn apply_changes(
                 change.id
             );
         }
+        if attempt.is_some() && actual > 0 && !change.retire {
+            tx.execute("INSERT INTO skill_counters(id,invocations,refinements) VALUES(?1,0,1) ON CONFLICT(id) DO UPDATE SET refinements=refinements+1",[&change.id])?;
+        }
         let revision = actual.checked_add(1).context("revision overflow")?;
         tx.execute(
             "INSERT INTO revisions VALUES(?1,?2,?3,?4,?5,?6,?7)",
@@ -680,42 +856,11 @@ fn apply_changes(
     Ok(())
 }
 
-fn mark_batch(tx: &rusqlite::Transaction<'_>, batch: &Batch) -> Result<()> {
-    let activities: std::collections::BTreeSet<_> = batch
-        .training
-        .iter()
-        .chain(&batch.held_out)
-        .map(|e| &e.activity)
-        .collect();
-    for activity in &activities {
-        tx.execute(
-            "INSERT OR IGNORE INTO reviewed_activities VALUES(?1,?2)",
-            params![batch.channel, activity],
-        )?;
-    }
-    tx.execute("UPDATE experiences SET reviewed=1 WHERE channel=?1 AND activity IN (SELECT value FROM json_each(?2)) AND seq<=?3",params![batch.channel,serde_json::to_string(&activities)?,batch.through])?;
-    Ok(())
-}
 fn validate_library(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     let (count,bytes):(i64,i64)=tx.query_row("SELECT count(*),COALESCE(sum(length(r.files)),0) FROM heads h JOIN revisions r USING(id,revision) WHERE h.retired=0",[],|r|Ok((r.get(0)?,r.get(1)?)))?;
     ensure!(count <= 256, "skill library exceeds 256 active entries");
     ensure!(bytes <= 32_000_000, "active skill library exceeds 32 MB");
     Ok(())
-}
-fn experience_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Experience> {
-    let raw: String = r.get(5)?;
-    let events = serde_json::from_str(&raw).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(error))
-    })?;
-    Ok(Experience {
-        seq: r.get(0)?,
-        channel: r.get(1)?,
-        owner: r.get(2)?,
-        activity: r.get(3)?,
-        task: r.get(4)?,
-        events,
-        turn_completed: r.get(6)?,
-    })
 }
 /// Preserve valid JSON and explicit truncation instead of cutting a JSON object.
 pub fn bounded_json(value: &Value, limit: usize) -> Value {
@@ -757,6 +902,8 @@ mod tests {
                 expected_revision: expected,
                 files: files(method),
                 retire: false,
+                summary: "Updated reusable deployment checks.".into(),
+                purpose: "Improve deployment verification.".into(),
             }],
             task_family: "Service deployment".into(),
             triggers: "Replacing an existing service".into(),
@@ -939,6 +1086,8 @@ mod tests {
             expected_revision: 99,
             files: files("stale"),
             retire: false,
+            summary: "Updated reusable deployment checks.".into(),
+            purpose: "Improve deployment verification.".into(),
         });
         assert!(library.publish(&change).is_err());
         assert!(
@@ -960,32 +1109,261 @@ mod tests {
         assert!(SkillLibrary::open(&SkillsConfig::default(), dir.path()).is_err());
     }
     #[test]
-    fn interrupted_proposals_survive_without_advancing_the_review_cursor() {
+    fn queues_serialize_per_channel_coalesce_and_survive_restart() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = SkillsConfig::default();
         let library = SkillLibrary::open(&cfg, dir.path()).unwrap();
-        for n in 1..=4 {
+        assert!(
             library
-                .record(
-                    &format!("turn-{n}"),
-                    7,
-                    "channel:7",
-                    "deploy",
-                    &json!({"events":[]}),
-                    true,
-                )
-                .unwrap();
-        }
-        library.begin_attempt("attempt", "7").unwrap();
+                .enqueue_fork("a", "1", &json!({"context":"a1"}))
+                .unwrap()
+        );
+        assert!(
+            library
+                .enqueue_fork("a", "2", &json!({"context":"a2"}))
+                .unwrap()
+        );
+        assert!(
+            !library
+                .enqueue_fork("a", "1", &json!({"context":"duplicate"}))
+                .unwrap()
+        );
+        let a = library.take_fork("a").unwrap().unwrap();
+        assert_eq!(a.generation, "2");
+        assert_eq!(a.payload["context"], "a2");
+        assert!(library.enqueue_fork("a", "3", &json!({})).unwrap());
+        assert!(library.take_fork("a").unwrap().is_none());
+        library.enqueue_fork("b", "1", &json!({})).unwrap();
+        let b = library.take_fork("b").unwrap().unwrap();
+        library.update_fork_phase(&a.id, "review", 2, 1, 1).unwrap();
+        assert_eq!(
+            library.channel_status("a").unwrap()["latest"]["phase"],
+            "review"
+        );
+        assert_eq!(
+            library.channel_status("a").unwrap()["latest"]["reviewers_spawned"],
+            2
+        );
+        assert!(library.queued_channels().unwrap().is_empty());
         library
-            .save_proposal("attempt", &proposal("fresh", 0, "checks"))
+            .finish_fork(&b.id, "no_change", &json!({}), &[])
             .unwrap();
+        library.note_channel_settled("a", 100).unwrap();
+        assert!(!library.catalogue_refresh_due("a", 300, 399).unwrap());
+        assert!(library.catalogue_refresh_due("a", 300, 400).unwrap());
         drop(library);
         let library = SkillLibrary::open(&cfg, dir.path()).unwrap();
-        assert_eq!(library.status().unwrap()["latest"]["status"], "interrupted");
-        assert_eq!(library.status().unwrap()["pending_tasks"], 4);
+        assert_eq!(
+            library.channel_status("a").unwrap()["latest"]["status"],
+            "queued"
+        );
+        assert_eq!(library.last_settled("a").unwrap(), Some(100));
+        assert_eq!(library.queued_channels().unwrap(), vec!["a"]);
+        assert_eq!(library.take_fork("a").unwrap().unwrap().generation, "3");
+        assert!(!library.enqueue_fork("a", "2", &json!({})).unwrap());
+    }
+    #[test]
+    fn fork_publication_notifications_and_counters_are_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = SkillsConfig::default();
+        let library = SkillLibrary::open(&cfg, dir.path()).unwrap();
+        library.enqueue_fork("a", "1", &json!({})).unwrap();
+        let fork = library.take_fork("a").unwrap().unwrap();
+        let mut stale = proposal("engineering", 1, "new engineering");
+        stale
+            .changes
+            .push(proposal("research", 99, "new research").changes.remove(0));
+        assert!(
+            library
+                .publish_fork(&fork.id, &stale, &json!({}), &[])
+                .is_err()
+        );
+        assert_eq!(
+            library.snapshot().unwrap().entries["engineering"].revision,
+            1
+        );
+        assert!(library.notifications("a").unwrap().is_empty());
+        assert_eq!(
+            library.channel_status("a").unwrap()["latest"]["status"],
+            "active"
+        );
+        let p = proposal("engineering", 1, "new engineering");
+        library
+            .publish_fork(&fork.id, &p, &json!({"approved":true}), &[])
+            .unwrap();
+        let notes = library.notifications("a").unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0]["kind"], "modify");
+        assert_eq!(notes[0]["revision"], 2);
+        assert_eq!(notes[0]["purpose"], p.changes[0].purpose);
+        assert!(library.notifications("b").unwrap().is_empty());
+        let ids = vec![notes[0]["id"].as_str().unwrap().to_owned()];
+        library.mark_skill_events_presented("a", &ids).unwrap();
+        assert!(library.pending_skill_events("a").unwrap().is_empty());
+        assert_eq!(library.notifications("a").unwrap().len(), 1);
+        library.acknowledge_notifications("b", &ids).unwrap();
+        assert_eq!(library.notifications("a").unwrap().len(), 1);
+        drop(library);
+        let library = SkillLibrary::open(&cfg, dir.path()).unwrap();
+        assert_eq!(library.notifications("a").unwrap(), notes);
+        assert_eq!(
+            library
+                .heads()
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|h| h["id"] == "engineering")
+                .unwrap()["refinements"],
+            1
+        );
+        library.acknowledge_notifications("a", &ids).unwrap();
+        assert!(library.notifications("a").unwrap().is_empty());
+        assert!(library.publish_fork(&fork.id, &p, &json!({}), &[]).is_err());
+    }
+    #[test]
+    fn full_catalogue_and_counts_remain_frozen_until_idle_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = SkillLibrary::open(&SkillsConfig::default(), dir.path()).unwrap();
+        for n in 0..20 {
+            library
+                .publish(&proposal(&format!("guide-{n}"), 0, "checks"))
+                .unwrap();
+        }
+        let before = library.catalogue(180).unwrap();
+        assert!(before.contains("guide-19"));
+        assert!(before.contains("guide-9"));
+        assert!(before.contains("browser-activities"));
+        let pinned = library.snapshot().unwrap();
+        assert_eq!(
+            library.cache_catalogue("a", &before, false).unwrap(),
+            before
+        );
+        library.record_invocation("engineering", "turn-1").unwrap();
+        library.record_invocation("engineering", "turn-1").unwrap();
+        library.record_invocation("engineering", "turn-2").unwrap();
+        assert_eq!(pinned.entries["engineering"].invocations, 0);
+        assert_eq!(
+            library.snapshot().unwrap().entries["engineering"].invocations,
+            2
+        );
+        let after = library.catalogue(180).unwrap();
+        assert_ne!(before, after);
+        assert_eq!(library.cache_catalogue("a", &after, false).unwrap(), before);
+        assert_eq!(library.cache_catalogue("a", &after, true).unwrap(), after);
+        drop(library);
+        let library = SkillLibrary::open(&SkillsConfig::default(), dir.path()).unwrap();
+        assert_eq!(
+            library
+                .cache_catalogue("a", "should not replace", false)
+                .unwrap(),
+            after
+        );
+        assert_eq!(
+            library.snapshot().unwrap().entries["engineering"].invocations,
+            2
+        );
+    }
+    #[test]
+    fn manual_requests_and_cancellation_are_channel_scoped_and_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = SkillsConfig::default();
+        let library = SkillLibrary::open(&cfg, dir.path()).unwrap();
+        assert!(!library.request_channel_fork("a").unwrap());
+        library.enqueue_fork("a", "1", &json!({})).unwrap();
+        assert!(library.request_channel_fork("a").unwrap());
+        library.enqueue_fork("a", "2", &json!({})).unwrap();
+        assert!(library.fork_requested("a").unwrap());
+        drop(library);
+        let library = SkillLibrary::open(&cfg, dir.path()).unwrap();
+        assert!(library.fork_requested("a").unwrap());
+        let a = library.take_fork("a").unwrap().unwrap();
+        assert_eq!(a.generation, "2");
+        assert!(!library.fork_requested("a").unwrap());
+        library
+            .save_proposal(&a.id, &proposal("fresh", 0, "fresh procedure"))
+            .unwrap();
+        library.update_fork_phase(&a.id, "review", 2, 2, 0).unwrap();
+        library
+            .save_review_context(&a.id, &json!({"phase":"review"}))
+            .unwrap();
+        library.enqueue_fork("a", "3", &json!({})).unwrap();
+        library.enqueue_fork("b", "1", &json!({})).unwrap();
+        library.cancel_channel_forks("a").unwrap();
+        assert_eq!(library.channel_status("a").unwrap()["queued_count"], 0);
+        assert_eq!(library.queued_channels().unwrap(), vec!["b"]);
+        assert!(
+            library
+                .publish_fork(
+                    &a.id,
+                    &proposal("fresh", 0, "fresh procedure"),
+                    &json!({}),
+                    &[]
+                )
+                .is_err()
+        );
+        assert!(library.notifications("a").unwrap().is_empty());
+        library
+            .finish_fork(&a.id, "cancelled", &json!({}), &[])
+            .unwrap();
+        assert!(library.take_fork("a").unwrap().is_none());
+        assert_eq!(
+            library.channel_status("a").unwrap()["latest"]["reviewers_running"],
+            0
+        );
+        assert!(!library.enqueue_fork("a", "3", &json!({})).unwrap());
+        let b = library.take_fork("b").unwrap().unwrap();
+        library
+            .publish_fork(
+                &b.id,
+                &proposal("fresh", 0, "fresh procedure"),
+                &json!({}),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(library.notification_channels().unwrap(), vec!["b"]);
+        let note = library.pending_skill_events("b").unwrap().remove(0);
+        library
+            .mark_skill_events_presented("b", &[note["id"].as_str().unwrap().into()])
+            .unwrap();
+        assert!(library.notification_channels().unwrap().is_empty());
+        assert_eq!(library.snapshot().unwrap().entries["fresh"].refinements, 0);
+    }
+    #[test]
+    fn interrupted_fork_proposals_survive_privately_without_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = SkillsConfig::default();
+        let library = SkillLibrary::open(&cfg, dir.path()).unwrap();
+        library
+            .enqueue_fork("7", "generation", &json!({"memory":"snapshot"}))
+            .unwrap();
+        let fork = library.take_fork("7").unwrap().unwrap();
+        library
+            .save_proposal(&fork.id, &proposal("fresh", 0, "checks"))
+            .unwrap();
+        library
+            .update_fork_phase(&fork.id, "review", 2, 2, 0)
+            .unwrap();
+        library
+            .save_review_context(&fork.id, &json!({"recorded":"evidence"}))
+            .unwrap();
+        assert_eq!(
+            library.proposal("7", &fork.id).unwrap().changes[0].id,
+            "fresh"
+        );
+        drop(library);
+        let library = SkillLibrary::open(&cfg, dir.path()).unwrap();
+        assert_eq!(
+            library.channel_status("7").unwrap()["latest"]["status"],
+            "interrupted"
+        );
+        assert_eq!(
+            library.channel_status("7").unwrap()["latest"]["reviewers_running"],
+            0
+        );
         assert_eq!(library.proposals("7").unwrap().as_array().unwrap().len(), 1);
-        assert!(library.proposal("8", "attempt").is_err());
+        assert!(library.proposal("8", &fork.id).is_err());
+        assert!(library.notifications("7").unwrap().is_empty());
         assert!(
             library
                 .snapshot()
@@ -993,145 +1371,51 @@ mod tests {
                 .execute(&json!({"action":"load","id":"fresh"}))
                 .is_err()
         );
+        assert!(
+            library
+                .publish_fork(&fork.id, &proposal("fresh", 0, "checks"), &json!({}), &[])
+                .is_err()
+        );
     }
     #[test]
-    fn task_activities_keep_worker_evidence_private_and_do_not_count_wakeups_as_new_cases() {
+    fn job_model_and_reasoning_are_pinned_durably() {
         let dir = tempfile::tempdir().unwrap();
-        let library = SkillLibrary::open(&SkillsConfig::default(), dir.path()).unwrap();
-        for n in 0..4 {
-            library
-                .record(
-                    &format!("same-task-{n}"),
-                    1,
-                    "channel:1",
-                    "Continue the original task",
-                    &json!({"activity":"one-task"}),
-                    true,
-                )
-                .unwrap();
-        }
-        assert!(library.batch(4).unwrap().is_none());
-        assert_eq!(library.status().unwrap()["pending_tasks"], 1);
-        for n in 2..=4 {
-            library
-                .record(
-                    &format!("root-{n}"),
-                    1,
-                    "channel:1",
-                    &format!("Distinct task {n}"),
-                    &json!({"activity":format!("task-{n}")}),
-                    true,
-                )
-                .unwrap();
-        }
-        library
-            .record(
-                "training-worker",
-                1,
-                "worker",
-                "training task",
-                &json!({"activity":"task-2","observation":"TRAINING_PRIVATE_RESULT"}),
-                true,
-            )
-            .unwrap();
-        library
-            .record(
-                "withheld-worker",
-                1,
-                "worker",
-                "withheld task",
-                &json!({"activity":"task-4","observation":"WITHHELD_PRIVATE_RESULT"}),
-                true,
-            )
-            .unwrap();
-        let batch = library.batch(4).unwrap().unwrap();
+        let cfg = SkillsConfig::default();
+        let library = SkillLibrary::open(&cfg, dir.path()).unwrap();
+        library.enqueue_fork("a", "1", &json!({})).unwrap();
         assert!(
-            serde_json::to_string(&batch.training)
-                .unwrap()
-                .contains("TRAINING_PRIVATE_RESULT")
+            library
+                .pin_fork_settings("missing", "gpt-6-luna", "low")
+                .is_err()
         );
-        assert!(
-            !serde_json::to_string(&batch.training)
-                .unwrap()
-                .contains("WITHHELD_PRIVATE_RESULT")
-        );
-        assert!(
-            serde_json::to_string(&batch.held_out)
-                .unwrap()
-                .contains("WITHHELD_PRIVATE_RESULT")
-        );
-        library.begin_attempt("pass", "1").unwrap();
+        let fork = library.take_fork("a").unwrap().unwrap();
         library
-            .finish_attempt("pass", "no_change", &json!({}), &[], Some(&batch))
+            .pin_fork_settings(&fork.id, "gpt-6-luna", "low")
             .unwrap();
         library
-            .record(
-                "late-wakeup",
-                1,
-                "channel:1",
-                "Same task woke again",
-                &json!({"activity":"one-task"}),
-                true,
-            )
+            .pin_fork_settings(&fork.id, "gpt-6-luna", "low")
             .unwrap();
-        assert_eq!(library.status().unwrap()["pending_tasks"], 0);
-        assert!(library.batch(4).unwrap().is_none());
-    }
-    #[test]
-    fn publication_and_cursor_commit_together_and_workers_do_not_supply_held_out_cases() {
-        let dir = tempfile::tempdir().unwrap();
-        let library = SkillLibrary::open(&SkillsConfig::default(), dir.path()).unwrap();
-        for n in 0..5 {
-            library
-                .record(
-                    &format!("worker-{n}"),
-                    7,
-                    "worker",
-                    "private supporting task",
-                    &json!({}),
-                    true,
-                )
-                .unwrap();
-        }
-        assert!(library.batch(4).unwrap().is_none());
-        for n in 1..=4 {
-            library
-                .record(
-                    &format!("root-{n}"),
-                    7,
-                    "channel:7",
-                    "deploy",
-                    &json!({}),
-                    true,
-                )
-                .unwrap();
-        }
-        let batch = library.batch(4).unwrap().unwrap();
-        assert_eq!(batch.training.len(), 3);
-        assert_eq!(batch.held_out.len(), 1);
         assert!(
-            !batch
-                .training
-                .iter()
-                .any(|e| e.seq == batch.held_out[0].seq)
+            library
+                .pin_fork_settings(&fork.id, "gpt-6.1-sol", "high")
+                .is_err()
         );
-        library.begin_attempt("attempt", "7").unwrap();
-        let p = proposal("fresh", 0, "checks");
-        library.save_proposal("attempt", &p).unwrap();
         library
-            .publish_attempt(
-                &p,
-                "attempt",
-                &json!({"review":"accepted"}),
-                &[json!({"input_tokens":10})],
-                &batch,
-            )
+            .update_fork_phase(&fork.id, "review", 2, 2, 0)
             .unwrap();
-        assert_eq!(library.status().unwrap()["latest"]["status"], "published");
-        assert_eq!(library.status().unwrap()["pending_tasks"], 0);
+        let status = library.channel_status("a").unwrap();
+        assert_eq!(status["latest"]["model"], "gpt-6-luna");
+        assert_eq!(status["latest"]["reasoning"], "low");
+        assert_eq!(status["requested"], false);
+        drop(library);
+        let library = SkillLibrary::open(&cfg, dir.path()).unwrap();
+        let status = library.channel_status("a").unwrap();
+        assert_eq!(status["latest"]["status"], "interrupted");
+        assert_eq!(status["latest"]["model"], "gpt-6-luna");
+        assert_eq!(status["latest"]["reasoning"], "low");
         assert!(
             library
-                .publish_attempt(&p, "attempt", &json!({}), &[], &batch)
+                .pin_fork_settings(&fork.id, "gpt-6-luna", "low")
                 .is_err()
         );
     }

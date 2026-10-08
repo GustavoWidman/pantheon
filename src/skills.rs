@@ -35,10 +35,12 @@ struct Frontmatter {
 }
 #[derive(Clone)]
 pub(crate) struct Skill {
-    name: String,
-    description: String,
-    explicit_only: bool,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) explicit_only: bool,
     text: String,
+    pub(crate) invocations: i64,
+    pub(crate) refinements: i64,
     pub(crate) root: Option<PathBuf>,
     pub(crate) resources: Option<BTreeMap<String, String>>,
     pub(crate) revision: i64,
@@ -146,6 +148,8 @@ impl Skills {
                 description: meta.description,
                 explicit_only: meta.explicit_only,
                 text,
+                invocations: 0,
+                refinements: 0,
                 root,
                 resources: None,
                 revision: 0,
@@ -162,23 +166,60 @@ impl Skills {
     pub(crate) fn main_text(&self, id: &str) -> Result<&str> {
         Ok(&self.entries.get(id).context("unknown skill")?.text)
     }
+    pub fn catalogue(&self, description_chars: usize) -> Result<String> {
+        ensure!(
+            (1..=1024).contains(&description_chars),
+            "description_chars must be 1–1024"
+        );
+        let entries: Vec<_> = self
+            .entries
+            .iter()
+            .map(|(id, s)| {
+                json!({
+                    "id":id,"name":s.name,"revision":s.revision,"invocations":s.invocations,
+                    "refinements":s.refinements,"explicit_only":s.explicit_only,
+                    "description":elide(&s.description, description_chars)
+                })
+            })
+            .collect();
+        Ok(format!(
+            "Complete active skill catalogue (description limit {description_chars} Unicode characters; invocation/refinement counts are historical snapshots, not success measures). Load a relevant guide before using it. Explicit-only guides require a user request.\n{}",
+            json!(entries)
+        ))
+    }
     pub fn index(&self) -> String {
-        let summaries: Vec<_> = self.entries.iter().filter(|(_,skill)|!skill.explicit_only)
-            .take(16).map(|(id,skill)|json!({"id":id,"description":skill.description.chars().take(180).collect::<String>()})).collect();
-        format!(
-            "Skill catalog preview ({} total; skill list discovers all pages). Load a relevant guide on demand before using it:\n{}",
-            self.entries.len(),
-            json!(summaries)
-        )
+        self.catalogue(180).expect("valid description bound")
     }
     pub fn execute(&self, args: &Value) -> Result<Value> {
         match crate::tools::string(args, "action")? {
             "list" => {
                 let offset = integer(args, "offset", 0, 256)?;
-                let entries: Vec<_> = self.entries.iter().skip(offset).take(8).map(|(id,s)|json!({"id":id,"name":s.name,"description":s.description,"explicit_only":s.explicit_only,"revision":s.revision,"origin":s.origin})).collect();
+                let entries: Vec<_> = self.entries.iter().skip(offset).take(8).map(|(id,s)|json!({"id":id,"name":s.name,"description":s.description,"explicit_only":s.explicit_only,"revision":s.revision,"origin":s.origin,"invocations":s.invocations,"refinements":s.refinements})).collect();
                 let next = offset + entries.len();
                 Ok(
                     json!({"skills":entries,"next_offset":if next<self.entries.len(){Some(next)}else{None}}),
+                )
+            }
+            "preview" => {
+                let id = crate::tools::string(args, "id")?;
+                let skill = self
+                    .entries
+                    .get(id)
+                    .context("unknown skill ID; use skill list")?;
+                let max = integer(args, "max_chars", 1200, 4000)?;
+                ensure!(max > 0, "max_chars must be positive");
+                let body = skill
+                    .text
+                    .strip_prefix("---\n")
+                    .or_else(|| skill.text.strip_prefix("---\r\n"))
+                    .and_then(|rest| rest.split_once("\n---"))
+                    .map(|(_, body)| body.trim_start())
+                    .unwrap_or(&skill.text);
+                Ok(
+                    json!({"id":id,"name":skill.name,"description":skill.description,
+                    "text":elide(body,max),"total_chars":body.chars().count(),"revision":skill.revision,
+                    "origin":skill.origin,"explicit_only":skill.explicit_only,
+                    "invocations":skill.invocations,"refinements":skill.refinements}),
                 )
             }
             "load" => {
@@ -252,6 +293,16 @@ pub(crate) fn read_bounded(path: &Path) -> Result<String> {
     ensure!(bytes.len() <= 512_000, "skill file exceeds 512000 bytes");
     String::from_utf8(bytes).context("skill file is not UTF-8 text")
 }
+fn elide(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_owned()
+    } else {
+        text.chars()
+            .take(max.saturating_sub(1))
+            .chain(std::iter::once('…'))
+            .collect()
+    }
+}
 fn integer(args: &Value, key: &str, default: usize, max: usize) -> Result<usize> {
     let n = args
         .get(key)
@@ -319,7 +370,7 @@ mod tests {
         );
     }
     #[test]
-    fn explicit_only_skills_are_discoverable_without_implicit_indexing() {
+    fn explicit_only_skills_are_catalogued_with_invocation_restriction() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("special");
         std::fs::create_dir(&root).unwrap();
@@ -329,7 +380,8 @@ mod tests {
             directories: vec![dir.path().into()],
         })
         .unwrap();
-        assert!(!library.index().contains("Special workflow"));
+        assert!(library.index().contains("Special workflow"));
+        assert!(library.index().contains("explicit_only"));
         assert_eq!(
             library.execute(&json!({"action":"list"})).unwrap()["skills"][0]["explicit_only"],
             true
@@ -374,6 +426,39 @@ mod tests {
                 directories: vec![dir.path().into(), dir.path().into()]
             })
             .is_err()
+        );
+    }
+    #[test]
+    fn previews_and_catalogue_bounds_preserve_unicode_without_loading_full_body() {
+        let mut skills = Skills::empty();
+        skills
+            .insert(
+                "unicode",
+                "---\nname: Guide\ndescription: αβγδεζη\n---\nαβγδεζη procedure".into(),
+                None,
+            )
+            .unwrap();
+        let catalogue = skills.catalogue(4).unwrap();
+        assert!(catalogue.contains("αβγ…"));
+        assert!(!catalogue.contains("αβγδε"));
+        let preview = skills
+            .execute(&json!({"action":"preview","id":"unicode","max_chars":4}))
+            .unwrap();
+        assert_eq!(preview["text"], "αβγ…");
+        assert_eq!(preview["invocations"], 0);
+        assert!(!preview["text"].as_str().unwrap().contains("---"));
+        assert!(
+            skills
+                .execute(&json!({"action":"preview","id":"unicode","max_chars":0}))
+                .is_err()
+        );
+        assert!(
+            skills
+                .execute(&json!({"action":"load","id":"unicode"}))
+                .unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .contains("procedure")
         );
     }
 }

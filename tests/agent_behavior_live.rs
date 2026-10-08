@@ -1,6 +1,133 @@
 //! Opt-in behavior evaluations: real inference, controlled results, no tool execution.
 use pantheon::{provider::Provider, tools};
 
+/// Five greeting-only requests: fixed catalogue, changed counters, appended
+/// publication notice, its exact repeat, then a refreshed catalogue. No tools run.
+#[tokio::test]
+#[ignore = "requires a Codex login; five bounded greeting requests (defaults to gpt-6-luna)"]
+async fn curator_catalogue_cache_probe() {
+    let model =
+        std::env::var("PANTHEON_TEST_CODEX_MODEL").unwrap_or_else(|_| "codex/gpt-6-luna".into());
+    assert!(model.starts_with("codex/"));
+    let d = tempfile::tempdir().unwrap();
+    let library =
+        pantheon::skill_library::SkillLibrary::open(&Default::default(), &d.path().join("skills"))
+            .unwrap();
+    let store = pantheon::store::Store::open(&d.path().join("runtime.sqlite")).unwrap();
+    let affinity = store.cache_affinity("channel:curator-cache-probe").unwrap();
+    let frozen = library
+        .cache_catalogue("probe", &library.catalogue(240).unwrap(), false)
+        .unwrap();
+    let make_system = |catalogue: &str| {
+        pantheon::runtime::system_prompt(
+            false,
+            false,
+            &format!("{}\n{catalogue}", pantheon::skill_library::INDEX),
+            "This is a greeting-only cache probe. Never run tools. Reply with exactly hi.",
+        )
+    };
+    let system = make_system(&frozen);
+    let mut history = Provider::start(
+        "openai",
+        "0+1|user: For this controlled probe, only reply hi.",
+        "Say exactly hi. Do not run tools.",
+    );
+    let defs = tools::definitions(false, false);
+    for (index, phase) in [
+        "cold",
+        "counter update with frozen catalogue",
+        "publication note appended",
+        "idle catalogue refresh",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let system = if index == 3 {
+            history = Provider::start(
+                "openai",
+                "0+1|user: For this controlled probe, only reply hi.",
+                "A new fresh turn follows the controlled idle refresh. Say exactly hi. Do not run tools.",
+            );
+            make_system(
+                &library
+                    .cache_catalogue("probe", &library.catalogue(240).unwrap(), true)
+                    .unwrap(),
+            )
+        } else {
+            system.clone()
+        };
+        let provider = Provider::new(90).unwrap().with_cache_affinity(affinity);
+        let response = provider
+            .step(&model, "low", &system, &history, &defs)
+            .await
+            .unwrap();
+        assert!(
+            response.calls.is_empty(),
+            "cache probe never executes tools"
+        );
+        eprintln!(
+            "CURATOR CACHE PROBE {phase}: {}",
+            serde_json::to_string(&pantheon::cache::Usage::parse(&response.usage)).unwrap()
+        );
+        if index == 2 {
+            // Repeat the identical prepared request, including native history,
+            // to distinguish server reuse variability from an appended prefix.
+            let repeated = provider
+                .step(&model, "low", &system, &history, &defs)
+                .await
+                .unwrap();
+            assert!(
+                repeated.calls.is_empty(),
+                "cache probe never executes tools"
+            );
+            eprintln!(
+                "CURATOR CACHE PROBE publication note exact repeat: {}",
+                serde_json::to_string(&pantheon::cache::Usage::parse(&repeated.usage)).unwrap()
+            );
+        }
+        Provider::append_response("openai", &mut history, &response);
+        if index == 0 {
+            library
+                .record_invocation("engineering", "probe-turn")
+                .unwrap();
+            assert_eq!(
+                library
+                    .cache_catalogue("probe", &library.catalogue(240).unwrap(), false)
+                    .unwrap(),
+                frozen
+            );
+            history.push(Provider::user(
+                "openai",
+                "Say exactly hi again. Do not run tools.",
+            ));
+        } else if index == 1 {
+            let p:pantheon::skill_library::Proposal=serde_json::from_value(serde_json::json!({
+                "changes":[{"id":"cache-probe","expected_revision":0,"files":{"SKILL.md":"---\nname: cache-probe\ndescription: Inspect provider-reported cache counters in controlled greeting probes.\n---\nKeep the system prefix fixed, append only new inputs, record native usage and compare cold and warm requests. These observations do not establish a provider cache TTL."},"summary":"Added a controlled cache-counter inspection procedure.","purpose":"Use when diagnosing prompt-prefix cache reuse."}],
+                "task_family":"Cache inspection","triggers":"Cache diagnostics","procedure":"Keep prefixes fixed and record native usage","variables":"Provider and model","verification":"Compare provider-reported counters","limits":"Cache hits are provider decisions","reason":"Controlled local fixture","evidence":[]
+            })).unwrap();
+            library
+                .enqueue_fork("probe", "probe-generation", &serde_json::json!({}))
+                .unwrap();
+            let job = library.take_fork("probe").unwrap().unwrap();
+            library
+                .publish_fork(&job.id, &p, &serde_json::json!({"test_fixture":true}), &[])
+                .unwrap();
+            assert_eq!(
+                library
+                    .cache_catalogue("probe", &library.catalogue(240).unwrap(), false)
+                    .unwrap(),
+                frozen
+            );
+            history.push(Provider::user("openai","<system-notification><curator-skill-add name=\"cache-probe\" revision=\"1\">Added a controlled cache-counter inspection procedure. Use when diagnosing prompt-prefix cache reuse.</curator-skill-add></system-notification>\nSay exactly hi; do not use the skill or run tools."));
+        } else if index == 2 {
+            history.push(Provider::user(
+                "openai",
+                "The controlled idle refresh now starts. Say exactly hi; do not run tools.",
+            ));
+        }
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires a Codex ChatGPT login and uses subscription quota"]
 async fn fresh_turn_cache_probe_reports_real_provider_counters() {

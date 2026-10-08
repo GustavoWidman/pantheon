@@ -90,7 +90,7 @@ in
     skillCurator = lib.mkOption {
       type = lib.types.bool;
       default = true;
-      description = "Enable bounded background skill curation during idle time. Configure budgets, model and cadence through settings.curator. Chat memory is never rewritten.";
+      description = "Enable bounded background skill curation during idle time. Configure budgets, model, debounce and review parallelism through settings.curator. Curator research never modifies chat memory; approved changes enter normal context as harness notices.";
     };
     bundledSkills = lib.mkOption {
       type = lib.types.bool;

@@ -11,6 +11,7 @@ pub mod models;
 mod pricing;
 pub mod provider;
 pub mod runtime;
+pub mod skill_dashboard;
 pub mod skill_library;
 pub mod skills;
 pub mod store;

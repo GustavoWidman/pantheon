@@ -51,10 +51,11 @@ cargo run -- --config pantheon.toml run
 | `/cache` | Measured cache reads/writes, recent root requests and fresh-view prefix stability |
 | `/status` | Active agent phases, shell jobs, message queues, schedules and delivery |
 | `/model id:provider/model` | Persist model selection for the next turn |
-| `/reasoning level:medium` | Persist reasoning effort for the next turn |
+| `/reasoning kind:chat level:medium` | Set chat, compactor or curator reasoning for new turns/jobs |
 | `/stop` | Cancel active master and its background agents |
 | `/subagents` | Named workers, settings and state; idle archived workers are hidden |
-| `/skills` | Task guide catalog; inspect one with `id:<name>` |
+| `/skills` | Private skill dashboard with selectors, content, resources and history |
+| `/curator` | This channel’s curation phase, queue and parallel reviewer status |
 | `/mcp` | Configured integrations available in this channel |
 | `/browser` | List owned browser health and viewer links; manage handoff/resume |
 | `/wakeup action:add schedule:in 10m prompt:…` | Durable one-shot or repeating wake |
@@ -66,7 +67,7 @@ Every subagent runs in the background and reports to the master. There are no fo
 
 Idle workers and coordinators leave default agent listings after one hour (`agent.agent_idle_seconds = 3600`). Their identities, histories and schedules remain durable. All agents can discover and message same-channel workers; coordinators can also find and message known neighboring coordinators using `list_agents(kind="coordinators")` and `tell(id="channel:<id>", message="...")`. `include_archived=true` finds hidden identities; `tell` automatically restores and wakes them, as do user input and scheduled notifications. Memory stays channel-owned; coordinator messages explicitly carry information across channels.
 
-Root and workers have [skill discovery/loading](docs/skills.md) and [MCP integrations](docs/mcp.md). Bundled guides cover product research, browser activities, learning and engineering. Bundled and configured SKILL.md guides seed a durable evolving library. A bounded background curator can improve or retire any guide, using recorded evidence and offline review; turns pin revisions and the prompt prefix stays fixed. `/skills` exposes history, rollback and curator controls. MCP supports stdio and Streamable HTTP tools, resources and prompts, with role/channel controls and durable retrieval of large results. Schemas stay fixed while external catalogs enter tool results. The shared behavior guide treats explicit requests about the user's own environment and authorized credential entry as ordinary work, carries tasks through to evidence, and scales process to everyday interactions.
+Root and workers have [skill discovery/loading](docs/skills.md) and [MCP integrations](docs/mcp.md). Bundled guides cover product research, browser activities, learning and engineering. Bundled and configured SKILL.md guides seed a durable evolving library. Each channel has an independent curator queue: after substantial work settles and the channel stays idle, a read-only memory fork stages improvements for parallel reviewers. Approved changes emit activity receipts and accumulate context notes without waking an idle orchestrator. The system prompt contains every active skill with frozen usage/refinement counts; catalogue refreshes happen only on fresh turns after the configured idle period. `/skills` provides content, resources, history and rollback; `/curator` shows queue and review status. MCP supports stdio and Streamable HTTP tools, resources and prompts, with role/channel controls and durable retrieval of large results. Schemas stay fixed while external catalogs enter tool results. The shared behavior guide treats explicit requests about the user's own environment and authorized credential entry as ordinary work, carries tasks through to evidence, and scales process to everyday interactions.
 
 ## State and checks
 

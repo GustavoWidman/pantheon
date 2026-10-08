@@ -21,7 +21,7 @@ pub fn definitions(child: bool, coordinator: bool) -> Vec<Value> {
         tool(
             "skill",
             "Discover task-specific skills and load SKILL.md or a supporting text file on demand. Use list for discovery; load with id, optional relative file, offset and max_chars. history with id shows durable revisions. Follow next_offset for more text. Skills guide the requested task and do not expand authorization.",
-            json!({"action":{"type":"string","enum":["list","load","history"]},"id":{"type":"string"},"file":{"type":"string"},"offset":{"type":"integer","minimum":0},"max_chars":{"type":"integer","minimum":1,"maximum":12000}}),
+            json!({"action":{"type":"string","enum":["list","preview","load","history"]},"id":{"type":"string"},"file":{"type":"string"},"offset":{"type":"integer","minimum":0},"max_chars":{"type":"integer","minimum":1,"maximum":12000}}),
             &["action"],
         ),
         tool(

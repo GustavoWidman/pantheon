@@ -38,12 +38,29 @@ impl Model {
 pub struct Catalog {
     entries: RwLock<BTreeMap<String, Vec<Model>>>,
     chats: RwLock<(String, BTreeMap<u64, String>)>,
+    kinds: RwLock<KindModels>,
     prices: crate::pricing::Prices,
+}
+#[derive(Default)]
+struct KindModels {
+    defaults: BTreeMap<String, String>,
+    overrides: BTreeMap<(u64, String), String>,
 }
 impl Catalog {
     pub fn initialize(&self, config: &Config) {
         self.prices.initialize(&config.state_dir);
         self.chats.write().unwrap().0 = config.agent.model.clone();
+        {
+            let mut kinds = self.kinds.write().unwrap();
+            kinds
+                .defaults
+                .insert("compact".into(), config.agent.compactor_model.clone());
+            if let Some(model) = &config.curator.model {
+                kinds.defaults.insert("curator".into(), model.clone());
+            } else {
+                kinds.defaults.remove("curator");
+            }
+        }
         let cached = std::fs::File::open(config.state_dir.join("model-catalog.json"))
             .ok()
             .and_then(|f| {
@@ -63,6 +80,7 @@ impl Catalog {
             if models.is_empty() {
                 for full in [&config.agent.model, &config.agent.compactor_model]
                     .into_iter()
+                    .chain(config.curator.model.iter())
                     .chain(config.agent.context_windows.keys())
                 {
                     if let Some(id) = full.strip_prefix(&format!("{provider}/")) {
@@ -137,11 +155,17 @@ impl Catalog {
             .find(|o| o["name"] == "provider")
             .and_then(|o| o["value"].as_str())
             .filter(|s| !s.is_empty());
+        let kind = options
+            .iter()
+            .find(|o| o["name"] == "kind")
+            .and_then(|o| o["value"].as_str())
+            .unwrap_or("chat");
         let entries = self.entries.read().unwrap();
         let mut choices: Vec<(String, String)> = match focused["name"].as_str() {
             Some("kind") => vec![
                 ("chat".into(), "chat".into()),
                 ("compact".into(), "compact".into()),
+                ("curator".into(), "curator".into()),
             ],
             Some("provider") => entries.keys().map(|p| (p.clone(), p.clone())).collect(),
             Some("model") => entries
@@ -158,15 +182,27 @@ impl Catalog {
         };
         if focused["name"] == "model" {
             choices.push((
-                "Config default · clear this chat's override".into(),
+                format!("Config default · clear {kind} model override"),
                 "default".into(),
             ));
+            if kind == "curator" {
+                choices.push((
+                    "Inherit main model · clear curator override".into(),
+                    "none".into(),
+                ));
+            }
         }
         choices.retain(|(name, value)| {
             value.chars().count() <= 100
                 && (value.to_lowercase().contains(&query) || name.to_lowercase().contains(&query))
         });
-        choices.sort_by_key(|(_, v)| (!v.to_lowercase().starts_with(&query), v.clone()));
+        choices.sort_by_key(|(_, v)| {
+            (
+                !v.to_lowercase().starts_with(&query),
+                !matches!(v.as_str(), "default" | "none"),
+                v.clone(),
+            )
+        });
         choices
             .into_iter()
             .take(25)
@@ -234,29 +270,95 @@ impl Catalog {
     pub fn set_chat_model(&self, channel: u64, model: &str) {
         self.chats.write().unwrap().1.insert(channel, model.into());
     }
+    /// Mirror durable channel model selections for deadline-safe autocomplete.
+    /// None removes an override: compact uses configuration; curator inherits
+    /// its configured fallback, or the current main model when unconfigured.
+    pub fn set_kind_model(&self, channel: u64, kind: &str, model: Option<&str>) -> Result<()> {
+        ensure!(
+            ["chat", "compact", "curator"].contains(&kind),
+            "invalid model kind"
+        );
+        if kind == "chat" {
+            let mut chats = self.chats.write().unwrap();
+            if let Some(model) = model {
+                chats.1.insert(channel, model.into());
+            } else {
+                chats.1.remove(&channel);
+            }
+        } else {
+            let mut kinds = self.kinds.write().unwrap();
+            let key = (channel, kind.into());
+            if let Some(model) = model {
+                kinds.overrides.insert(key, model.into());
+            } else {
+                kinds.overrides.remove(&key);
+            }
+        }
+        Ok(())
+    }
+    pub fn kind_model(&self, channel: u64, kind: &str) -> Option<String> {
+        if !["chat", "compact", "curator"].contains(&kind) {
+            return None;
+        }
+        let chats = self.chats.read().unwrap();
+        let main = chats.1.get(&channel).unwrap_or(&chats.0).clone();
+        if kind == "chat" {
+            return Some(main);
+        }
+        let kinds = self.kinds.read().unwrap();
+        match kinds.overrides.get(&(channel, kind.into())) {
+            Some(model) if kind == "curator" && model == "none" => Some(main),
+            Some(model) => Some(model.clone()),
+            None => Some(kinds.defaults.get(kind).cloned().unwrap_or(main)),
+        }
+    }
     pub fn effort_choices(&self, channel: u64, options: &Value) -> Vec<Value> {
-        let query = options
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|o| o["focused"] == true)
-            .and_then(|o| o["value"].as_str())
-            .unwrap_or("")
-            .to_lowercase();
-        let model = {
-            let chats = self.chats.read().unwrap();
-            chats.1.get(&channel).unwrap_or(&chats.0).clone()
+        let options = options.as_array().map(Vec::as_slice).unwrap_or(&[]);
+        let Some(focused) = options.iter().find(|o| o["focused"] == true) else {
+            return vec![];
         };
-        self.metadata(&model)
-            .map(|m| {
-                m.efforts
+        let query = focused["value"].as_str().unwrap_or("").to_lowercase();
+        if focused["name"] == "kind" {
+            return ["chat", "compact", "curator"]
+                .into_iter()
+                .filter(|kind| kind.contains(&query))
+                .map(|kind| json!({"name":kind,"value":kind}))
+                .collect();
+        }
+        if focused["name"] != "level" {
+            return vec![];
+        }
+        let kind = options
+            .iter()
+            .find(|o| o["name"] == "kind")
+            .and_then(|o| o["value"].as_str())
+            .unwrap_or("chat");
+        let Some(model) = self.kind_model(channel, kind) else {
+            return vec![];
+        };
+        let mut choices: Vec<(String, String)> = match kind {
+            "curator" => vec![
+                ("Inherit main reasoning".into(), "inherit".into()),
+                ("Default curator reasoning".into(), "default".into()),
+            ],
+            "compact" => vec![("Default compactor reasoning".into(), "default".into())],
+            _ => vec![],
+        };
+        if let Some(model) = self.metadata(&model) {
+            choices.extend(
+                model
+                    .efforts
                     .into_iter()
-                    .filter(|e| crate::config::validate_reasoning(e).is_ok() && e.contains(&query))
-                    .take(25)
-                    .map(|e| json!({"name":e,"value":e}))
-                    .collect()
-            })
-            .unwrap_or_default()
+                    .filter(|e| crate::config::validate_reasoning(e).is_ok())
+                    .map(|e| (e.clone(), e)),
+            );
+        }
+        choices
+            .into_iter()
+            .filter(|(name, value)| value.contains(&query) || name.to_lowercase().contains(&query))
+            .take(25)
+            .map(|(name, value)| json!({"name":name,"value":value}))
+            .collect()
     }
     pub fn validate_effort(&self, model: &str, effort: &str) -> Result<()> {
         crate::config::validate_reasoning(effort)?;
@@ -393,6 +495,87 @@ fn codex_cache(auth: &AuthConfig) -> Vec<Model> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn curator_model_and_kind_choices_offer_inheritance_with_bounded_results() {
+        let c = Catalog::default();
+        c.replace(
+            "codex",
+            (0..40)
+                .map(|i| Model::plain(&format!("gpt-{i:02}")))
+                .collect(),
+        );
+        let kinds = c.choices(&json!([{"name":"kind","value":"cur","focused":true}]));
+        assert_eq!(kinds, vec![json!({"name":"curator","value":"curator"})]);
+        let choices = c.choices(
+            &json!([{"name":"kind","value":"curator"},{"name":"model","value":"","focused":true}]),
+        );
+        assert_eq!(choices.len(), 25);
+        assert!(choices.iter().any(|v| v["value"] == "none"));
+        assert!(choices.iter().any(|v| v["value"] == "default"));
+        let choices = c.choices(&json!([{"name":"kind","value":"compact"},{"name":"model","value":"none","focused":true}]));
+        assert!(choices.is_empty());
+    }
+    #[test]
+    fn effort_choices_follow_kind_models_and_curator_inheritance_without_hiding_none() {
+        let c = Catalog::default();
+        let mut main = Model::plain("main");
+        main.efforts = vec!["none".into(), "low".into()];
+        let mut compact = Model::plain("compact");
+        compact.efforts = vec!["medium".into()];
+        let mut curator = Model::plain("curator");
+        curator.efforts = vec!["high".into()];
+        c.replace("codex", vec![main, compact, curator]);
+        c.chats.write().unwrap().0 = "codex/main".into();
+        c.kinds
+            .write()
+            .unwrap()
+            .defaults
+            .insert("compact".into(), "codex/compact".into());
+        c.kinds
+            .write()
+            .unwrap()
+            .defaults
+            .insert("curator".into(), "codex/curator".into());
+        let options =
+            |kind| json!([{"name":"kind","value":kind},{"name":"level","value":"","focused":true}]);
+        assert_eq!(
+            c.effort_choices(1, &options("compact"))
+                .iter()
+                .map(|v| v["value"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["default", "medium"]
+        );
+        assert_eq!(
+            c.effort_choices(1, &options("curator"))
+                .iter()
+                .map(|v| v["value"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["inherit", "default", "high"]
+        );
+        c.set_kind_model(1, "curator", Some("none")).unwrap();
+        assert_eq!(c.kind_model(1, "curator").as_deref(), Some("codex/main"));
+        assert_eq!(
+            c.effort_choices(1, &options("curator"))
+                .iter()
+                .map(|v| v["value"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["inherit", "default", "none", "low"]
+        );
+        assert_eq!(c.kind_model(2, "curator").as_deref(), Some("codex/curator"));
+        c.set_chat_model(1, "codex/curator");
+        assert_eq!(c.kind_model(1, "curator").as_deref(), Some("codex/curator"));
+        c.set_kind_model(1, "curator", None).unwrap();
+        c.set_kind_model(1, "compact", Some("codex/main")).unwrap();
+        assert_eq!(c.kind_model(1, "compact").as_deref(), Some("codex/main"));
+        c.set_kind_model(1, "compact", None).unwrap();
+        assert_eq!(c.kind_model(1, "compact").as_deref(), Some("codex/compact"));
+        assert!(c.set_kind_model(1, "unknown", None).is_err());
+        assert!(c.effort_choices(1, &options("unknown")).is_empty());
+        assert_eq!(
+            c.effort_choices(1, &json!([{"name":"kind","value":"cur","focused":true}]))[0]["value"],
+            "curator"
+        );
+    }
     #[test]
     fn provider_filtered_choices_are_bounded_and_unambiguous() {
         let c = Catalog::default();

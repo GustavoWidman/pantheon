@@ -1,32 +1,154 @@
-# Skills
+# Evolving skills and private curation
 
-Pantheon starts with four task guides: `research`, `browser-activities`, `learning`
-and `engineering`. They seed one **evolving library** shared by root and workers.
-The curator can revise, merge, split or retire them just like guides it creates.
-Origin (`seed` or `curator`) records provenance, not authority. Ordinary conversation
-and simple requests need no workflow ceremony. Skills never grant permissions or
-override the user's instructions.
+Pantheon starts with `research`, `browser-activities`, `learning` and `engineering`.
+These are editable starting seeds in one instance-wide library: the curator can
+revise, merge, split or retire them just like guides it creates. Origin records
+provenance, not authority. Skills never grant permissions or override user requests.
 
-A skill is a directory containing `SKILL.md` with YAML frontmatter:
+## Catalogue and cache generations
 
-```markdown
----
-name: product-comparison
-description: Compare purchases using current prices, relevant constraints and primary sources.
----
-Use when choosing between products with identifiable constraints. Discover the
-criteria, compare like-for-like prices and specifications from primary sources,
-and check that the recommendation satisfies those criteria. Prices, products and
-budgets are inputs to discover for each task.
+The orchestrator and workers receive every active skill in their system catalogue,
+including explicit-only guides. Each entry contains ID, name, revision, invocation
+count, curator refinement count, explicit-only status and a bounded description.
+`curator.description_chars` defaults to **240 Unicode characters**, including the
+ellipsis when elided. Curators and reviewers receive this exact limit so they can
+put useful invocation conditions first. There is no 16-skill preview cutoff.
+
+Invocation count means a successful main-guide load, once per skill per ordinary
+agent turn; pagination and repeated loads do not inflate it. Previews, supporting
+resources and curator/reviewer inspection do not count. Refinements count approved
+curator modifications, excluding initial creation, seed import and manual rollback.
+These are historical usage/refinement counts, **not success rates or proof of
+battle-tested behavior**.
+
+The exact catalogue text and counter values are frozen per channel and persisted
+across restart. Continuous turns keep these bytes unchanged. On the next fresh
+orchestrator turn after the configurable idle period (300 seconds by default),
+once memory has settled, the complete catalogue refreshes. The catalogue appears
+last in the system prompt so changing it preserves the earlier constant prefix.
+Five minutes is our refresh policy, not a measurement of provider cache expiry.
+Within a turn, the system and tool schemas never change.
+
+`skill(action="list")` still provides paged discovery. `preview` returns a bounded
+introduction; `load` returns the main guide or a supporting text resource with
+`file`, `offset` and `max_chars`; `history` exposes durable revisions. Published
+notifications refresh available skill revisions at steering boundaries, leaving
+the system text unchanged. This makes an announced new guide immediately loadable.
+
+## Private forks and per-channel queues
+
+Each channel has its **own durable queue and one active curation job**, including
+review. Different channels can curate concurrently. Repeated eligible settles
+coalesce into the latest pending work in that channel; there can be one active job
+plus one pending job. A processed, superseded or cancelled generation cannot be
+automatically queued again.
+
+An ordinary orchestrator turn must complete at least `minimum_steps` model
+iterations (default three) before it is eligible. These are successful model loop
+iterations, not Discord messages, transport retries, or curator/reviewer requests.
+Separate single-response chats never accumulate into eligibility. Worker-only
+turns do not enqueue curator jobs. Eligible work waits for the channel to have no
+ordinary queued/running roots, workers or shells, settled memory, and five minutes
+of idle time since its last orchestrator turn settled. Other channels do not gate
+this one. `/curator action:run` bypasses the idle debounce for already eligible
+queued work; it cannot manufacture eligibility or bypass memory settlement.
+
+At startup the job captures an immutable, read-only copy of the orchestrator's
+settled memory view and original messages/summary nodes. `zoom` and `date` read
+that frozen snapshot, including after the main conversation resumes. Private
+model conversations are constructed from this same settled context under curator
+or reviewer instructions. Cross-model forks do not replay another model's opaque
+native reasoning/signatures. They inherit the service's operator constraints.
+Model and effort are pinned for the entire job and all its reviewers.
+
+New conversation never waits for, cancels, or receives the private transcript of
+a running curator. Curators and reviewers use separate cache affinities and do
+not occupy ordinary worker slots or overwrite main usage accounting. They cannot
+write memory, tell the orchestrator, continue its task or create background work.
+
+## Tools and publication
+
+The drafting fork receives only:
+
+- `zoom`, `date`, `read`, `web_search`, `web_fetch`;
+- `skill`: list, preview, load, history, immutable revision and package seed offers;
+- `create_skill`, `edit_skill`, `retire_skill`: private staged changes.
+
+Create/edit requires ID, name, description, body, a factual change summary and a
+purpose explaining when it helps. Optional supporting files replace only supplied
+paths; other resources and YAML metadata remain intact. Repeated edits collapse
+into one final before/after change. Retirements require summary and purpose.
+At most four related guides can change together, bounded to 48 KB of staged JSON.
+Drafting uses the pinned source revisions, so concurrent publications cause a
+stale-head rejection rather than silently overwriting a newer guide.
+
+When the curator finishes normally, no changes is a successful outcome. Otherwise
+the harness starts parallel private reviewer loops (two by default), sharing the
+same frozen memory, model and effort. They receive read-only tools and `decide`,
+not skill mutation or messaging tools. One focuses on procedure and evidence;
+another focuses on transfer, duplication and preservation. All reviewers must
+approve the complete atomic change set with observed evidence and transferable
+scope. A denial, missing verdict, timeout, stale head or cancellation cannot publish.
+One difficult task can teach a useful technique; there is no arbitrary repeat-count
+requirement or unrelated withheld-task gate.
+
+This is **model-based evidence review**, not executed sandbox practice or an
+empirical improvement benchmark. Recorded tool checks are evidence; an agent's
+claimed success is not proof. Research may add current information but reviewers
+must distinguish it from what the original work established. Private proposals,
+review context (including the frozen rendered memory view), verdicts and usage are
+retained for inspection. Failed/interrupted work is not silently published or
+replayed after restart; saved proposals survive.
+
+## Notifications and controls
+
+Approved publication atomically records revisions and channel notifications in
+`skills.sqlite`. Independent delivery ledgers track Discord receipts and main
+context admission. The bridge into `runtime.sqlite` and memory uses deterministic
+IDs and durable acknowledgements, rather than claiming a transaction across two
+WAL databases.
+
+Activity receipts use the existing chronological fence accumulation:
+
+```text
+✦ curator · created skill deployment-verification
+↻ curator · modified skill engineering
+⊖ curator · retired skill legacy-browser-handoff
 ```
 
-Descriptions guide discovery; the body supplies the method. Supporting UTF-8 text,
-including references and scripts, may live alongside the guide. Import snapshots
-all supporting text with the main guide. Scripts are returned as text; loading them
-does not execute them. Materialize a loaded script in the workspace only when its
-execution is authorized. Binary assets are not supported by the text skill loader.
+Receipts never admit a main-thread prompt. While the orchestrator is idle, change
+notes wait for the next real user, wakeup, monitor or worker input. The incoming
+message is prefixed after the unchanged memory blocks:
 
-Configure seed libraries or individual directories:
+```xml
+<system-notification>
+  <curator-skill-modify name="engineering" revision="7">Added executable and
+  gateway verification. Use for deployment work.</curator-skill-modify>
+</system-notification>
+```
+
+During an active turn, notes append at an ordinary steering boundary after every
+outstanding tool result. Notifications arriving after the final steering boundary
+remain pending for the next real input. Only approved procedural change metadata
+enters the main journal; private research/reviewer transcripts do not. Journal
+provenance deduplicates admissions if a crash occurs before the notification ack.
+
+`/skills` opens a private dashboard with a home page, paginated skill selector,
+metadata/counters, complete guide pages, supporting resources, history and revision
+comparisons. Large content is paginated rather than clipped to one embed. Controls
+are bound to the originating channel and user and checked before interaction
+updates. Existing `action:history`, `action:rollback`, `action:proposals` and
+`action:proposal` remain available.
+
+`/curator` shows this channel's phase, queue, pinned/current settings, spawned,
+running and finished reviewers, and verdict. `action:run` requests queued work;
+`action:cancel` cancels this channel's pending/active job without stopping its main
+conversation. `/model kind:curator model:none` explicitly inherits the main model;
+`model:default` restores the configured default. `/reasoning kind:curator
+level:inherit` explicitly inherits main effort; `level:default` restores config.
+Chat/compact/curator selections are channel-local and survive restart.
+
+## Configuration and durability
 
 ```toml
 [skills]
@@ -35,129 +157,39 @@ directories = ["/var/lib/pantheon/seed-skills"]
 
 [curator]
 enabled = true
-# Omit model to use the source channel's selected chat model.
-reasoning = "low"
-interval_seconds = 3600
-idle_seconds = 120
-minimum_tasks = 4
+# model = "codex/YOUR_MODEL"  # omitted means main model
+# reasoning = "low"          # omitted means main effort
+idle_seconds = 300
+minimum_steps = 3
+description_chars = 240
+reviewers = 2
 timeout_seconds = 300
-max_steps = 6
-max_input_chars = 128000
+max_steps = 8
+review_steps = 4
+max_input_chars = 256000
 token_budget = 100000
+max_research_calls = 4
 ```
 
-For NixOS use `services.pantheon.skillDirectories`, `bundledSkills` and
-`skillCurator`. Other curator settings belong in `services.pantheon.settings.curator`.
-Store-backed seed paths work. No libraries download at runtime. Duplicate seed IDs
-fail startup; disable `bundled` if importing a separate seed library with those IDs.
+Defaults bound the whole pass to five minutes, eight drafting steps, four steps
+per reviewer, 256,000 characters per request and four hosted-search calls shared
+across the job. Each hosted search allows at most two provider continuations and
+accounts usage before admitting another continuation. Reported tokens are checked
+before and after requests. Parallel reviewers can overshoot the threshold by their
+already in-flight requests (up to configured reviewer concurrency); missing usage
+cannot establish an exact cost. An exhausted budget blocks publication.
 
-On first import, seeds become revision 1 in `state_dir/skills.sqlite`, a separate
-SQLite WAL database with full synchronization and an exclusive writer lock. Learned
-revisions and retirements survive restarts. Changing `bundled` or `directories`
-changes which seeds are offered on subsequent startups; it does not erase existing
-heads. Changed package seeds are available to the curator for reconciliation and
-never overwrite learned heads or resurrect retired guides. Preserve this database
-alongside the rest of the service state. Existing chat logs, summary trees and views
-are never rewritten by the curator. No memory wipe or migration is required.
+For NixOS use `services.pantheon.skillDirectories`, `bundledSkills`, `skillCurator`
+and `settings.curator`. Seed files include `SKILL.md` with YAML name/description
+and supporting UTF-8 text. Scripts are returned as text, never executed implicitly.
+Binary resources and symlinks are unsupported. Import bounds: 512,000 bytes/file,
+64 files/2 MB per guide, 256 active skills/32 MB active serialized content and 64
+configured seed directories. All active skills appear in the catalogue; request
+budgets fail explicitly instead of silently dropping entries.
 
-Every revision contains its complete main guide and supporting text. Publication
-atomically compares the expected head of every changed skill, records new revisions,
-updates the heads, saves the review/usage and advances the reviewed-experience cursor.
-A stale head rolls back the entire proposal. Interrupted drafts remain saved; their
-source records stay pending. Rollback restores an older revision as a new head,
-preserving the intervening history. The active catalog is cached in memory and
-invalidated only after a durable publication.
-
-Each root or worker turn pins a snapshot, including supporting files. Later turns
-see new heads without a service restart. The system prompt contains fixed discovery
-instructions rather than a changing catalog. Skill bodies and metadata enter ordinary
-tool results, keeping the system/tool prefix stable throughout a turn.
-
-## Discovery and controls
-
-`skill(action="list")` returns eight entries with origin and revision, plus
-`next_offset`. `skill(action="load", id="product-comparison")` loads the guide.
-Use a relative `file` for supporting text, and `offset`/`next_offset` for paged reads.
-`skill(action="history", id="product-comparison")` shows revision history, including
-retirements. Absolute paths, traversal and links escaping seed directories are
-rejected; supporting-resource symlinks are rejected during import. IDs are lowercase
-letters/digits/hyphens, at most 64 bytes. Text files are bounded to 512,000 bytes,
-64 files/2 MB per skill, 256 active skills/32 MB of serialized active content, and
-64 configured seed directories. Unknown YAML metadata remains in the guide text.
-`disable-model-invocation: true` marks an explicit-only workflow; it is guidance,
-not a security boundary.
-
-`/skills` and `/skills id:<name>` show private catalog/guide previews. Additional
-`action` choices provide:
-
-- `history id:<name>`: recent revisions and their rationale.
-- `rollback id:<name> revision:<number>`: restore a recorded revision.
-- `curator`: enabled state, pending task count and latest pass state.
-- `curate`: request an idle background pass, retaining the evidence minimum.
-- `proposals`: list recent proposals from this channel.
-- `proposal id:<attempt-id>`: inspect a proposal's scope, method and limits.
-
-Full drafts, the bounded evidence/guide/plan context sent to the reviewer, review
-observations and provider usage remain in `skills.sqlite`.
-Proposal previews are channel-scoped. Final procedural guides are instance-wide,
-so the curator must omit credentials, account facts and incident-specific details.
-
-## Background curation
-
-The default curator waits for four new task activities in one channel and two
-minutes of service idle time, and starts automatic passes at most once per hour. A manual request bypasses the
-cadence gate but still waits for idle time and enough evidence. Multiple root turns
-and worker wakeups from one activity count as one task. This is a scheduling gate,
-not a requirement that a workflow recur four times. A single difficult experience
-may reveal useful technique; its claimed scope still needs evidence.
-
-It examines bounded excerpts of recent tasks, their tool observations and supporting
-worker traces. At most 256 turn excerpts are retained, each up to 64 KB; source chat
-journals remain complete and untouched. Capture starts after this feature is enabled,
-without importing or editing historical memory. Each pass considers up to eight
-root task activities plus bounded supporting records. It withholds the newest
-activity, including that activity's workers and earlier turns, from drafting.
-
-The curator uses the same startup operator instructions as the root agent.
-The drafting agent has only skill/history/seed/draft reads, reads of the supplied
-training cases, and `propose`. It must explain a recognizable task family, triggers,
-concrete procedure, variable inputs, observable verification, limits and inspected
-evidence. It should improve existing guides before creating duplicates, parameterize
-incidental details, and leave unexplained workarounds in experience. A completed
-model turn is not proof that the task succeeded. **No change is a successful outcome.**
-Saved proposals can be reconsidered in later passes with fresh evidence.
-
-For a proposal, two fresh provider requests rehearse baseline and candidate plans
-on the withheld task without exposing its recorded outcome. A separate reviewer
-then compares those plans against the actual recorded observations and the drafting
-evidence. Automatic publication requires an explicit approval, a concrete improvement
-on a relevant withheld case, an explicit finding that the scope is transferable
-rather than too vague/specific or unsupported, observed meaningful variation and
-added procedural information, and no regression or insufficient evidence on other
-relevant cases. An unrelated or equivalent case alone cannot justify publication.
-One logical proposal can atomically change up to four guides, allowing consolidation
-or splitting without half-published changes.
-
-**This first evaluator performs offline model-based plan rehearsal, not executable
-sandbox practice or an empirical success benchmark.** Its judgement can be wrong;
-scoped guidance, durable rationale and rollback are necessary. It must not claim
-that a proposed fix was executed or verified when the records do not establish it.
-Uncertain drafts remain inactive rather than becoming new rules automatically.
-
-There is one curator globally. Chat prompts and agent work cancel an in-flight pass;
-read-only slash commands do not interrupt it. Queued/running roots, workers and shells
-prevent startup. It has no shell, browser,
-MCP, messaging, scheduler or memory-write capabilities. Defaults bound drafting to
-six provider steps, plus two rehearsals and up to two review steps, a five-minute
-whole-pass deadline, 128,000 characters per request, and a 100,000 reported-token
-budget. The token threshold is checked after each response and before further work
-or publication, so a single request can overshoot it; provider-native usage omissions
-cannot establish an exact cost. Proposals are limited to 48 KB. Failed/preempted
-passes never promote a draft or consume its experience cursor.
-
-The engineering seed draws on concepts reviewed in
-[pstack](https://github.com/cursor/plugins/tree/e5a8186d7b43be8d6ac4452440fbead5f1a51c70/pstack).
-The curator design draws on incremental procedural refinement in
-[ACE](https://arxiv.org/abs/2510.04618) and reusable skills with practice in
-[Voyager](https://arxiv.org/abs/2305.16291). These inform the design; their benchmark
-results do not establish Pantheon's curator quality.
+Seeds initialize revision one in separate SQLite WAL state with full sync and an
+exclusive writer lock. Changed package seeds become reconciliation offers, never
+overwrite learned heads or revive retirements. Publication compares expected
+revisions and commits all changes together. Rollback restores old content as a
+new revision, retaining history. Preserve `skills.sqlite` with the service state.
+Existing memory journals, trees and cached views are never rewritten or wiped.

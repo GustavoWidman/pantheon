@@ -169,6 +169,106 @@ pub struct Memory {
     poisoned: bool,
 }
 
+/// A settled, immutable view and its exact read-only expansion data.
+/// Private research can retain this across later main-session compaction without
+/// opening another writer or reading future messages from the live session.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct MemorySnapshot {
+    root: Vec<Message>,
+    #[serde(with = "snapshot_nodes")]
+    nodes: BTreeMap<NodeKey, String>,
+    view: Vec<NodeKey>,
+}
+
+mod snapshot_nodes {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        nodes: &BTreeMap<NodeKey, String>,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        nodes.iter().collect::<Vec<_>>().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<BTreeMap<NodeKey, String>, D::Error> {
+        Ok(Vec::<(NodeKey, String)>::deserialize(deserializer)?
+            .into_iter()
+            .collect())
+    }
+}
+
+impl MemorySnapshot {
+    pub fn message_count(&self) -> u64 {
+        self.root.len() as u64
+    }
+
+    pub fn render(&self) -> String {
+        let mut out = String::from("<chat>\n");
+        for &key in &self.view {
+            out.push_str(&self.render_line(key));
+            out.push('\n');
+        }
+        out.push_str("</chat>");
+        out
+    }
+
+    pub fn zoom(&self, id: u64, n: u64) -> Result<String> {
+        ensure!(
+            n.is_power_of_two()
+                && id.is_multiple_of(n)
+                && id
+                    .checked_add(n)
+                    .is_some_and(|end| end <= self.message_count()),
+            "No line {id}+{n}."
+        );
+        if n == 1 {
+            let message = &self.root[id as usize];
+            return Ok(format!(
+                "{id}+0|{}: {}",
+                message.kind.as_str(),
+                message.text
+            ));
+        }
+        let key = NodeKey {
+            level: n.ilog2(),
+            index: id / n,
+        };
+        let [left, right] = key.children();
+        ensure!(
+            self.nodes.contains_key(&left) && self.nodes.contains_key(&right),
+            "No line {id}+{n}."
+        );
+        Ok(format!(
+            "{}\n{}",
+            self.render_line(left),
+            self.render_line(right)
+        ))
+    }
+
+    pub fn date(&self, id: u64) -> Result<String> {
+        Ok(self
+            .root
+            .get(id as usize)
+            .with_context(|| format!("No message {id}."))?
+            .date
+            .clone())
+    }
+
+    fn render_line(&self, key: NodeKey) -> String {
+        format!(
+            "{}+{}|{}",
+            key.start(),
+            key.count(),
+            self.nodes
+                .get(&key)
+                .map_or_else(|| PLACEHOLDER.to_owned(), |text| flatten(text))
+        )
+    }
+}
+
 impl Drop for Memory {
     fn drop(&mut self) {
         // Closing the parent descriptor alone can retain flock briefly if a
@@ -330,6 +430,10 @@ impl Memory {
         }
         self.append_entry(kind, text, Some(source_id))
     }
+    /// Read-only admission lookup for durable cross-database delivery bridges.
+    pub fn has_source(&self, source_id: &str) -> bool {
+        self.sources.contains_key(source_id)
+    }
 
     pub fn lookup_source(&self, source_id: &str) -> Option<u64> {
         self.sources.get(source_id).copied()
@@ -374,6 +478,19 @@ impl Memory {
         }
         out.push_str("</chat>");
         out
+    }
+
+    pub fn snapshot(&self) -> Result<MemorySnapshot> {
+        self.healthy()?;
+        ensure!(
+            self.is_settled(),
+            "memory snapshot requires settled summaries"
+        );
+        Ok(MemorySnapshot {
+            root: self.root.clone(),
+            nodes: self.nodes.clone(),
+            view: self.view.clone(),
+        })
     }
 
     /// A cacheable, ID-free prefix for the compactor, containing summaries only.
@@ -1016,6 +1133,67 @@ pub fn cap_tool_result(text: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn read_only_snapshot_roundtrips_and_preserves_original_bounds_after_live_changes() {
+        let directory = TempDir::new().unwrap();
+        let mut memory = Memory::open(directory.path(), 128000).unwrap();
+        memory.append(Kind::User, "remember λ\nexactly").unwrap();
+        memory.append(Kind::Talk, "settled answer").unwrap();
+        let snapshot = memory.snapshot().unwrap();
+        let before = memory.export_html();
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        let decoded: MemorySnapshot = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.render(), memory.render());
+        assert_eq!(decoded.zoom(0, 1).unwrap(), memory.zoom(0, 1).unwrap());
+        assert_eq!(decoded.zoom(0, 2).unwrap(), memory.zoom(0, 2).unwrap());
+        assert_eq!(decoded.date(0).unwrap(), memory.date(0).unwrap());
+        assert_eq!(
+            memory.export_html(),
+            before,
+            "reading must not mutate live logs"
+        );
+        memory.append(Kind::User, "new main conversation").unwrap();
+        assert_eq!(snapshot.render(), decoded.render());
+        assert_eq!(snapshot.message_count(), 2);
+        for (id, n) in [(2, 1), (1, 2), (0, 3), (u64::MAX, 1)] {
+            assert!(snapshot.zoom(id, n).is_err());
+        }
+        assert!(snapshot.date(2).is_err());
+        drop(memory);
+        assert_eq!(
+            snapshot.zoom(0, 1).unwrap(),
+            "0+0|user: remember λ\nexactly"
+        );
+        let reopened = Memory::open(directory.path(), 128000).unwrap();
+        assert_eq!(reopened.stats()["messages"], 3);
+    }
+
+    #[test]
+    fn snapshot_requires_settlement_and_retains_expanded_summaries() {
+        let directory = TempDir::new().unwrap();
+        let mut memory = Memory::open(directory.path(), 1800).unwrap();
+        memory
+            .append(Kind::User, &"long original ".repeat(100))
+            .unwrap();
+        assert!(memory.snapshot().is_err());
+        drain(&mut memory);
+        for index in 0..10 {
+            memory
+                .append(
+                    Kind::Talk,
+                    &format!("message {index} {}", "evidence ".repeat(80)),
+                )
+                .unwrap();
+            drain(&mut memory);
+        }
+        let snapshot = memory.snapshot().unwrap();
+        let decoded: MemorySnapshot =
+            serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+        assert_eq!(decoded.render(), memory.render());
+        assert_eq!(decoded.zoom(0, 8).unwrap(), memory.zoom(0, 8).unwrap());
+        assert_eq!(decoded.zoom(0, 1).unwrap(), memory.zoom(0, 1).unwrap());
+    }
 
     fn key(level: u32, index: u64) -> NodeKey {
         NodeKey { level, index }

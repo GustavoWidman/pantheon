@@ -58,16 +58,21 @@ directories = []
 
 [curator]
 enabled = true
-# Omit model to use the source channel's selected chat model.
+# Omit model/reasoning to inherit this channel's main model and effort.
+# /model kind:curator model:none forces main-model inheritance.
 # model = "codex/YOUR_MODEL"
-reasoning = "low"
-interval_seconds = 3600
-idle_seconds = 120
-minimum_tasks = 4
+# reasoning = "low"
+idle_seconds = 300
+minimum_steps = 3
+# Unicode characters shown for each description in the complete system catalogue.
+description_chars = 240
+reviewers = 2
 timeout_seconds = 300
-max_steps = 6
-max_input_chars = 128000
+max_steps = 8
+review_steps = 4
+max_input_chars = 256000
 token_budget = 100000
+max_research_calls = 4
 
 # MCP servers are optional; executable packages and credentials are configured
 # by the operator. Full transport/access details are in docs/mcp.md.

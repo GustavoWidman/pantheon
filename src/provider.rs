@@ -85,6 +85,21 @@ impl Provider {
         self.cache_affinity = identity;
         self
     }
+    /// Derive an independent stable routing scope from a durable parent identity.
+    /// Used by private research so hosted-search prompts cannot share a reviewer
+    /// or drafting loop's affinity. This does not retain provider conversations.
+    pub(crate) fn with_cache_subscope(&self, scope: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"pantheon-private-cache-scope-v1\0");
+        hash.update(self.cache_affinity.as_bytes());
+        hash.update(scope.as_bytes());
+        let digest = hash.finalize();
+        let mut bytes = [0; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        self.clone()
+            .with_cache_affinity(uuid::Uuid::from_bytes(bytes))
+    }
     pub(crate) async fn pricing_document(&self, source: &str) -> Result<String> {
         use futures_util::StreamExt;
         ensure!(
@@ -658,6 +673,28 @@ impl Provider {
         limit: usize,
         domains: &[String],
     ) -> Result<Value> {
+        self.search_limited(model, query, limit, domains, 8, |_| Ok(()))
+            .await
+    }
+    /// Private maintenance can limit hosted-search continuations and account each
+    /// response before admitting another request, rather than only the final sum.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_limited<F>(
+        &self,
+        model: &str,
+        query: &str,
+        limit: usize,
+        domains: &[String],
+        rounds: usize,
+        on_usage: F,
+    ) -> Result<Value>
+    where
+        F: Fn(&Value) -> Result<()> + Send + Sync,
+    {
+        ensure!(
+            (1..=8).contains(&rounds),
+            "invalid hosted search round limit"
+        );
         ensure!(
             !query.trim().is_empty() && query.len() <= 8000,
             "search query must contain 1–8000 bytes"
@@ -701,7 +738,7 @@ impl Provider {
         }
         let mut native = Vec::new();
         let mut usage = json!({});
-        for round in 0..8 {
+        for round in 0..rounds {
             let value = self.send_body(model, &body).await?;
             let response = Self::parse(vendor, value.clone())?;
             ensure!(
@@ -709,6 +746,7 @@ impl Provider {
                 "hosted search returned an unexpected client tool call"
             );
             add_usage(&mut usage, &response.usage);
+            on_usage(&response.usage)?;
             native.extend(response.native.clone());
             // Some Codex gateways omit server-tool items from the final output
             // array while emitting their completed items on the SSE stream.
@@ -720,7 +758,10 @@ impl Provider {
                     .cloned(),
             );
             if vendor == "anthropic" && value["stop_reason"] == "pause_turn" {
-                ensure!(round < 7, "hosted search exceeded its continuation budget");
+                ensure!(
+                    round + 1 < rounds,
+                    "hosted search exceeded its continuation budget"
+                );
                 body["messages"]
                     .as_array_mut()
                     .unwrap()
@@ -1139,6 +1180,70 @@ impl SseDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn private_search_affinity_is_stable_and_separate_from_its_parent() {
+        let parent = uuid::Uuid::new_v4();
+        let provider = Provider::mock("http://unused/".into()).with_cache_affinity(parent);
+        let search = provider.with_cache_subscope("hosted-search");
+        assert_ne!(search.cache_affinity, parent);
+        assert_eq!(
+            search.cache_affinity,
+            provider.with_cache_subscope("hosted-search").cache_affinity
+        );
+        assert_ne!(
+            search.cache_affinity,
+            provider.with_cache_subscope("other").cache_affinity
+        );
+        assert_ne!(
+            search.cache_affinity,
+            provider
+                .with_cache_affinity(uuid::Uuid::new_v4())
+                .with_cache_subscope("hosted-search")
+                .cache_affinity
+        );
+    }
+    #[tokio::test]
+    async fn private_search_accounts_usage_before_any_continuation_and_honors_limits() {
+        use axum::{Json, Router, routing::post};
+        use std::{
+            future::IntoFuture,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::new(AtomicUsize::new(0));
+        let server_calls = calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let server=tokio::spawn(axum::serve(listener,Router::new().route("/",post(move||{let calls=server_calls.clone();async move{calls.fetch_add(1,Ordering::SeqCst);Json(json!({"stop_reason":"pause_turn","content":[],"usage":{"input_tokens":100,"output_tokens":10}}))}}))).into_future());
+        for budget_failure in [false, true] {
+            calls.store(0, Ordering::SeqCst);
+            observed.store(0, Ordering::SeqCst);
+            let result = Provider::mock(endpoint.clone())
+                .search_limited(
+                    "anthropic/test",
+                    "docs",
+                    1,
+                    &[],
+                    if budget_failure { 2 } else { 1 },
+                    |usage| {
+                        assert_eq!(usage["input_tokens"], 100);
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        if budget_failure {
+                            bail!("test budget exhausted");
+                        }
+                        Ok(())
+                    },
+                )
+                .await;
+            assert!(result.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(observed.load(Ordering::SeqCst), 1);
+        }
+        server.abort();
+    }
     #[tokio::test]
     async fn codex_affinity_matches_body_and_header_across_fresh_and_appended_requests() {
         use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
