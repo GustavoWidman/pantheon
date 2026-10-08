@@ -1,6 +1,6 @@
 # Durable memory and cache layout
 
-Pantheon implements the [OptChat specification](https://gist.githubusercontent.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449/raw/f51fe5c910427fd6f384d22823140b1693c76207/optchat.md). Every completed master entry becomes permanent history. Reasoning is displayed and replayed in the live provider conversation, but never enters this log. Subagent internals stay outside the main history; their reports enter as `user` messages beginning `[id] `.
+Pantheon implements the [OptChat specification](https://gist.githubusercontent.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449/raw/3c190e06f34aba0c69f49042c526093269604935/optchat.md). Every completed master entry becomes permanent history. Reasoning is displayed and replayed in the live provider conversation, but never enters this log. Subagent internals stay outside the main history; their reports enter as `user` messages beginning `[id] `.
 
 Each conversation owns a directory:
 
@@ -9,6 +9,7 @@ chat/
   lock
   main/YYYY-MM-DD.jsonl
   tree/YYYY-MM-DD.jsonl
+  view.json
 ```
 
 The `main` stream stores `{i, kind, text, size, date}`, plus an optional `source_id` for externally admitted messages. IDs are global, zero-based, and permanent. Dates include the local UTC offset. Size counts UTF-8 bytes of `kind + ": " + text`; provenance metadata never enters summaries or changes that count. The `tree` stream stores `{l, i, text, size}`, with `(l, i)` covering `[i·2^l, (i+1)·2^l)`.
@@ -31,7 +32,35 @@ Compactor requests use `src/compact.txt`, the reference prompt with the agent na
 
 The view covers every message oldest first, using `id+n|text` lines and no dates. It stores only summaries, with a placeholder for an unbuilt leaf. The model never receives that placeholder: master turns and subagent spawns wait until the view settles. Cancellation may end this wait while leaving the user's message in history.
 
-The live view only appends and merges. While its text size exceeds the default 128,000-byte budget, it chooses the eligible adjacent pair with the greatest `(T - start) / 2^(level+2)` age. Parents must already be built. Comparisons use exact integer arithmetic, with the chronologically earliest pair winning ties. A maintained set of mergeable pairs avoids scanning an entire unsummarized tail when no parent is available; fits with no candidates take constant time. The view may temporarily exceed the budget while a parent is missing; it never splits a part, substitutes cut original text, or retiles on a read. Startup reconstructs the view by replaying `append + fit` from message zero using each replay step's length in the age rule. This matches the reference fold rather than saving transient live layouts or renumbering summaries.
+The live view only appends and merges. Between merge batches, each completed
+summary extends its tail; earlier lines remain byte-for-byte unchanged. Once the
+rendered view exceeds `agent.view_bytes` (128,000 bytes by default), a batch merges
+eligible sibling pairs until it reaches half that budget (64,000 bytes by default).
+The count includes IDs, separators, newlines and `<chat>` tags. A batch can remain
+unfinished while parents are missing; new completions resume it toward the low
+watermark rather than stopping just below the high watermark.
+
+Pairs are ranked by `(T - last) / 2^level`, where `last` is the pair's last message
+ID. This corrects the original recipe's first-message formula, which churned old
+prefixes. Comparisons use exact integer arithmetic, with the chronologically
+earliest pair winning ties. Parents must already be built. A maintained set of
+mergeable pairs avoids scanning an entire unsummarized tail when no parent is
+available; fits with no candidates take constant time. The view never splits a
+part, substitutes cut original text, or retiles on a read.
+
+`view.json` saves the exact partition, covered message count and unfinished-batch
+flag. Changed layouts are written to a temporary file, synced, atomically renamed,
+and followed by a directory sync before the mutation returns. Completions that do
+not affect the view need no checkpoint write. Restart restores this partition and
+adds only journal entries committed after the checkpoint; it does not fold the
+whole history again. A torn temporary file is ignored. A malformed committed
+checkpoint is rejected instead of silently changing cached context. Checkpoint
+write failures poison further mutations just like journal failures.
+
+Older installations lack `view.json`. Their first upgraded open performs a
+one-time fold with the corrected batched rule and writes a checkpoint; that
+migration can change the prefix once. Original logs and tree nodes are retained
+unchanged, and later restarts preserve the new layout.
 
 A fresh turn renders the settled view **before** appending its new user input. It sends that input whole in the next block. All subsequent talk, tool calls, capped tool results, and consumed steering messages are committed as they finish. `zoom(id, n)` opens a binary node into its two children; `zoom(id, 1)` returns the original message and newlines verbatim. `date(id)` returns its recorded local ISO timestamp. HTML export escapes untrusted text and contains the view, all original messages, and all tree levels with ranges, time spans, and byte sizes.
 
@@ -45,15 +74,15 @@ Request prefixes remain ordered: constant tools, constant system prompt, view, w
 
 `cap_tool_result` retains equal head/tail portions with an omission notice, keeping the complete returned string at or below 30,000 Unicode characters. The cap is applied before provider replay and before the permanent `echo` append. It never splits UTF-8 characters; original user messages are not capped.
 
-Memory tests exercise restart without new summaries, repeated admission across restart, torn UTF-8 recovery, writer exclusion, ordered compression, exact binary zoom, free nodes, coarsening without splits, exact startup equivalence with the reference age rule, a large unsummarized import frontier, Unicode cache cuts and result caps, and HTML escaping. Unit tests use actual filesystem journals and locks.
+Memory tests exercise restart without new summaries, repeated admission across restart, torn UTF-8 recovery, writer exclusion, ordered compression, exact binary zoom, free nodes, coarsening without splits, the published ten-message merge-order counterexample, batched growth, exact view restoration, interrupted-batch recovery, and checkpoint crash recovery, a large unsummarized import frontier, Unicode cache cuts and result caps, and HTML escaping. Unit tests use actual filesystem journals and locks.
 
-`cargo run --release --example memory_bench -- 10000 20000` measures startup with prewritten valid original messages and no synthetic summaries. Fixture construction is outside the timer. Each size reports the minimum, median, and maximum of five `Memory::open` calls, covering lock acquisition, JSON parsing and validation, view replay, and frontier construction. The benchmark verifies that no summary was manufactured and only the first missing leaf becomes eligible. `fit` reads a cached byte count, maintained on replay appends, live appends, node completion, and merging; it does not sum the complete view on every fit.
+`cargo run --release --example memory_bench -- 10000 20000` measures startup with prewritten valid original messages and no synthetic summaries. Fixture construction is outside the timer. Each size reports the minimum, median, and maximum of five `Memory::open` calls, covering lock acquisition, JSON parsing and validation, checkpoint restoration (or first-open migration), and frontier construction. The benchmark verifies that no summary was manufactured and only the first missing leaf becomes eligible. `fit` reads a cached byte count, maintained on recovered appends, live appends, node completion, and merging; it does not sum the complete view on every fit.
 
 ## Channel scope and conversational turns
 
-Runtime memory lives under `chats/<channel>/`. Each channel owns its immutable log, tree, stable message addresses and incrementally folded view. Workers read their channel's memory snapshot and `zoom` that tree; their private execution traces stay in `subagents/<id>/`. A coordinator message across channels is recorded as work input only in the destination's log. It neither combines logs nor changes another channel's view implicitly. Archiving an agent from the directory does not remove memory.
+Runtime memory lives under `chats/<channel>/`. Each channel owns its immutable log, tree, stable message addresses and persisted incremental view. Workers read their channel's memory snapshot and `zoom` that tree; their private execution traces stay in `subagents/<id>/`. A coordinator message across channels is recorded as work input only in the destination's log. It neither combines logs nor changes another channel's view implicitly. Archiving an agent from the directory does not remove memory.
 
-Ordinary conversation follows OptChat section 7 exactly as task turns do: take a settled view, render it before appending new input, and start a fresh provider conversation. A short user message or reply whose kind-prefixed source fits 512 bytes becomes a verbatim free leaf immediately; it does not require a summarizer call. Larger leaves and merges still compact in the background, with the next fresh turn waiting only for its view to settle. No agent needs to spawn a worker or call a tool just to converse. Input received while the provider is busy remains durable and is injected at the next safe boundary, including after a final response with no tools; multiple queued inputs can share one turn. Already submitted provider requests cannot be retroactively edited.
+Ordinary conversation follows the same fresh-turn loop as task turns: take a settled view, render it before appending new input, and start a fresh provider conversation. A short user message or reply whose kind-prefixed source fits 512 bytes becomes a verbatim free leaf immediately; it does not require a summarizer call. Larger leaves and merges still compact in the background, with the next fresh turn waiting only for its view to settle. No agent needs to spawn a worker or call a tool just to converse. Input received while the provider is busy remains durable and is injected at the next safe boundary, including after a final response with no tools; multiple queued inputs can share one turn. Already submitted provider requests cannot be retroactively edited.
 
 Shared memory is not automatically enabled. A cache-friendly extension would be a separately scoped shared notebook with explicit retrieval and coordinator-approved writes: retrieve a relevant snapshot as a tool result instead of prepending a continually changing global chat view ahead of every channel's context. That keeps local cache prefixes stable, preserves provenance and leaves each channel's message IDs unambiguous. Today's coordinator messaging can transfer a selected fact without creating a global memory stream.
 

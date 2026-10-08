@@ -1,10 +1,12 @@
 # Runtime invariants
 
-Pantheon implements [OptChat's pinned specification](https://gist.githubusercontent.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449/raw/f51fe5c910427fd6f384d22823140b1693c76207/optchat.md) as a native Rust service. Thoth's interaction design informed the command surface; its Prime Agent runtime is not a dependency.
+Pantheon uses the memory design in the [updated OptChat recipe](https://gist.githubusercontent.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449/raw/3c190e06f34aba0c69f49042c526093269604935/optchat.md) as a native Rust service. Thoth's interaction design informed the command surface; its Prime Agent runtime is not a dependency.
 
 One channel has one endless memory and one serialized master actor. Different channels run concurrently. Discord ingress, model calls, compaction, background subagents, browser RPC, scheduled checks and outbound delivery have independent workers. One daemon-level lifetime lock protects all operational state, and each memory journal also holds its own lock. Systemd owns restart and process cleanup.
 
 ## Memory and request layout
+
+The root view grows by appending until it exceeds 128,000 rendered bytes by default, then batches sibling merges down to 64,000 bytes. Merge priority measures age from the pair's last message. An atomic `view.json` checkpoint preserves the exact partition and unfinished batch across restart; only legacy chats without a checkpoint require a one-time fold. See [memory durability](memory.md).
 
 Every master turn takes a settled summary view **before** appending its new input. System instructions and sorted tool definitions are frozen at startup. No date, status, browser URL or task ID enters these fixed prefixes. The provider conversation is fresh per turn. Within a turn, native OpenAI output items (including encrypted reasoning), or Anthropic thinking blocks/signatures, are replayed without reconstructing them. Reasoning is never written to the chat, subagent trace, database or logs. Optional reasoning display is best-effort and bypasses the durable Discord outbox.
 
@@ -55,6 +57,8 @@ Rust handles all orchestration. A packaged Python subprocess is the browser driv
 ## Deliberate differences from the reference
 
 - One endless chat per Discord channel rather than a single terminal chat globally.
+- Compactions retain a separate prompt, the channel view through their cutoff and no tools. They do not yet use the updated recipe's separate 16–32 KB view or shared turn/compactor prefix.
+- API view blocks retain the existing character breakpoints rather than the updated recipe's four-line Anthropic blocks.
 - Subagents can be used by default for useful independent work, as requested; every invocation remains background-only.
 - Kernel file locks replace Unix socket locks. They release on crash without stale lock stealing or PID inference.
 - SQLite operational journals replace the reference's post-turn git commit. Canonical log/tree writes retain individual fsync barriers.
