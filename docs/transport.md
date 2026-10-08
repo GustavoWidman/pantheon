@@ -17,3 +17,41 @@ Failure stages distinguish `headers`, `http_status`, `body`, `premature_eof`, `s
 Request bodies, response bodies, tool arguments, reasoning, credentials, account IDs, cookies and arbitrary headers are excluded. Only selected opaque response identifiers and recognized event names are recorded. URLs are removed from reqwest errors and redacted in transport causes. Payload-decoding errors never render their underlying error strings into the diagnostic record. Cause chains and fields are bounded to keep failures from generating unbounded logs.
 
 These diagnostics do not add inference retries or change tool dispatch: tools are still dispatched only after a complete provider response. “No tools from this response executed” refers to that failed response; earlier steps can already have completed tool effects.
+
+## Linux TCP timeout policy and local reproduction
+
+The provider client aligns Linux `TCP_USER_TIMEOUT` with
+`agent.request_timeout_seconds`, instead of inheriting reqwest 0.12's independent
+30-second default. Reqwest's overall request deadline still bounds the entire
+request (including streaming), and `/stop` still cancels it immediately. TCP
+keepalive remains enabled. No inference retry or partial-tool dispatch is added.
+Other platforms retain their existing TCP configuration.
+
+`TCP_USER_TIMEOUT` bounds unacknowledged transmitted traffic, including failed
+keepalive probes; it is **not** an SSE inactivity timer. A healthy connection may
+legitimately have a long gap between SSE events. HTTP 200 followed by OS error 110
+near 30 seconds is consistent with a lower-level TCP timeout, but logs alone do
+not locate the original network fault.
+
+To exercise the actual kernel behavior without credentials or external traffic:
+
+```sh
+# Linux: requires cargo, Python 3, unshare, ip and tc; user namespaces must be enabled.
+# The slow test is ignored by normal cargo/Nix checks.
+scripts/reproduce-provider-timeout.sh
+```
+
+The script creates an unprivileged, isolated user/network namespace. A loopback
+mock sends HTTP 200 and `response.created`, then drops all packets in **that
+namespace only** for 40 seconds before restoring connectivity and completing the
+same response. The provider request budget is 70 seconds. The pre-fix client
+fails with kernel `ETIMEDOUT`; the aligned client completes without retrying.
+The test verifies isolation before changing the loopback qdisc and cleans it up
+on exit. It never contacts a real provider, changes the host network, or submits
+a tool. A fast Linux test also reads `TCP_USER_TIMEOUT` from the real client
+socket; normal tests retain stalled-stream deadline, cancellation and rejection
+of incomplete tool-bearing responses.
+
+This reproduces the transport failure mechanism, not proof of the packet-level
+cause of a particular production incident. Retain correlation IDs and capture
+TCP telemetry if a production connection continues to fail.

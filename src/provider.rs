@@ -41,11 +41,18 @@ pub fn model_parts(model: &str) -> Result<(&str, &str)> {
 }
 impl Provider {
     pub fn new(timeout_seconds: u64) -> Result<Self> {
+        let timeout = Duration::from_secs(timeout_seconds);
+        let http = reqwest::Client::builder()
+            .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none());
+        // Reqwest 0.12 defaults to a separate 30s TCP_USER_TIMEOUT on Linux.
+        // Lost keepalive ACKs can therefore kill an otherwise recoverable SSE
+        // request well before our configured deadline. Keep both budgets aligned;
+        // the overall request timeout and runtime cancellation still bound work.
+        #[cfg(target_os = "linux")]
+        let http = http.tcp_user_timeout(timeout);
         Ok(Self {
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(timeout_seconds))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?,
+            http: http.build()?,
             timeout_seconds: Some(timeout_seconds),
             codex: CodexAuth::new(AuthConfig::default()),
             catalog: std::sync::Arc::default(),
@@ -1371,6 +1378,153 @@ mod tests {
             assert!(!text.contains(secret), "leaked {secret}");
         }
     }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn provider_socket_uses_configured_deadline_not_reqwest_default() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let provider = Provider::new(70).unwrap();
+        let response = provider
+            .http
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .unwrap();
+        let mut observed = None;
+        for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
+            let entry = entry.unwrap();
+            let Some(fd) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<libc::c_int>().ok())
+            else {
+                continue;
+            };
+            // SAFETY: initialized sockaddr storage and correct lengths; libc
+            // only inspects the descriptor, which remains owned by reqwest.
+            unsafe {
+                let mut peer: libc::sockaddr_in = std::mem::zeroed();
+                let mut length = std::mem::size_of_val(&peer) as libc::socklen_t;
+                if libc::getpeername(
+                    fd,
+                    (&mut peer as *mut libc::sockaddr_in).cast(),
+                    &mut length,
+                ) != 0
+                    || peer.sin_family as libc::c_int != libc::AF_INET
+                    || u16::from_be(peer.sin_port) != port
+                {
+                    continue;
+                }
+                let mut milliseconds: libc::c_uint = 0;
+                let mut length = std::mem::size_of_val(&milliseconds) as libc::socklen_t;
+                assert_eq!(
+                    libc::getsockopt(
+                        fd,
+                        libc::IPPROTO_TCP,
+                        libc::TCP_USER_TIMEOUT,
+                        (&mut milliseconds as *mut libc::c_uint).cast(),
+                        &mut length
+                    ),
+                    0
+                );
+                observed = Some(milliseconds);
+                break;
+            }
+        }
+        drop(response);
+        server.abort();
+        assert_eq!(observed, Some(70_000));
+    }
+
+    /// Run only via scripts/reproduce-provider-timeout.sh: all packet loss is
+    /// confined to a new unprivileged user/network namespace.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires isolated Linux network namespace and tc; takes about 42 seconds"]
+    async fn transient_packet_loss_does_not_override_provider_request_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        assert_eq!(
+            std::env::var("PANTHEON_ISOLATED_TRANSPORT_TEST").as_deref(),
+            Ok("1")
+        );
+        let uid_map = std::fs::read_to_string("/proc/self/uid_map").unwrap();
+        let mapping: Vec<_> = uid_map.split_whitespace().collect();
+        assert_eq!(mapping.len(), 3);
+        assert_eq!(mapping[0], "0");
+        assert_eq!(mapping[2], "1", "must use a private single-user namespace");
+        assert_ne!(
+            std::fs::read_link("/proc/self/ns/net").unwrap(),
+            std::path::PathBuf::from(std::env::var("PANTHEON_PARENT_NETNS").unwrap()),
+            "must not modify the host network namespace"
+        );
+        struct PacketLoss;
+        impl Drop for PacketLoss {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("tc")
+                    .args(["qdisc", "del", "dev", "lo", "root"])
+                    .output();
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 16384];
+            let _ = socket.read(&mut request).await.unwrap();
+            let body = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
+            let start = "data: {\"type\":\"response.created\"}\n\n";
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{start}", start.len() + body.len()).as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+            // Let headers and the first SSE event reach the client before loss.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let status = std::process::Command::new("tc")
+                .args(["qdisc", "add", "dev", "lo", "root", "netem", "loss", "100%"])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let loss = PacketLoss;
+            tokio::time::sleep(Duration::from_secs(40)).await;
+            drop(loss);
+            let _ = socket.write_all(body.as_bytes()).await;
+        });
+        let mut provider = Provider::new(70).unwrap();
+        provider.endpoint = Some(endpoint);
+        let started = std::time::Instant::now();
+        let log = DiagnosticLog::default();
+        use tracing::instrument::WithSubscriber;
+        let result = provider
+            .step("openai/test", "none", "", &[], &[])
+            .with_subscriber(capture(&log))
+            .await;
+        let elapsed = started.elapsed();
+        let (text, _) = log.records();
+        eprintln!(
+            "elapsed={elapsed:?} result={:?}\n{text}",
+            result
+                .as_ref()
+                .map(|_| "completed")
+                .map_err(|e| format!("{e:#}"))
+        );
+        // Always restore the qdisc, including on baseline failure.
+        server.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "transient loss within 70s deadline: {result:?}"
+        );
+        assert!(elapsed < Duration::from_secs(70));
+    }
+
     #[tokio::test]
     async fn streaming_timeout_is_distinct_from_clean_incomplete_eof() {
         use tracing::instrument::WithSubscriber;
@@ -1380,16 +1534,15 @@ mod tests {
         ] {
             let (endpoint, server) = broken_stream(
                 ending,
-                "data: {\"type\":\"response.in_progress\"}\n\n".into(),
+                format!("data: {}\n\ndata: {}\n\n",
+                    json!({"type":"response.in_progress"}),
+                    json!({"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","name":"shell","call_id":"pending","arguments":"{}"}})),
             )
             .await;
-            let mut provider = Provider::mock(endpoint);
-            provider.timeout_seconds = Some(1);
-            provider.http = reqwest::Client::builder()
-                .timeout(Duration::from_secs(1))
-                .build()
-                .unwrap();
+            let mut provider = Provider::new(1).unwrap();
+            provider.endpoint = Some(endpoint);
             let log = DiagnosticLog::default();
+            let started = std::time::Instant::now();
             provider
                 .step("openai/test", "none", "", &[], &[])
                 .with_subscriber(capture(&log))
@@ -1404,9 +1557,38 @@ mod tests {
             } else {
                 assert!(records[0]["is_timeout"].is_null());
             }
-            assert_eq!(records[0]["last_sse_event"], "response.in_progress");
+            assert_eq!(records[0]["last_sse_event"], "response.output_item.done");
+            assert_eq!(records[0]["completed_output_items"], 1);
+            assert_eq!(records[0]["attempt"], 1);
+            assert!(started.elapsed() < Duration::from_secs(3));
         }
     }
+    #[tokio::test]
+    async fn cancelled_stalled_stream_does_not_wait_for_transport_deadline() {
+        let (endpoint, server) = broken_stream(
+            StreamEnding::Stall,
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"name\":\"shell\",\"call_id\":\"pending\",\"arguments\":\"{}\"}}\n\n".into(),
+        ).await;
+        let mut provider = Provider::new(70).unwrap();
+        provider.endpoint = Some(endpoint);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            trigger.cancel();
+        });
+        let started = std::time::Instant::now();
+        // Same select boundary as runtime: partial tool items are not a Response
+        // and cancellation drops the request instead of retrying or dispatching.
+        let response = tokio::select! {
+            result = provider.step("openai/test", "none", "", &[], &[]) => Some(result),
+            _ = cancel.cancelled() => None,
+        };
+        server.abort();
+        assert!(response.is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
     #[tokio::test]
     async fn connection_and_http_failures_have_diagnostics_without_error_bodies() {
         use axum::{Router, routing::post};
