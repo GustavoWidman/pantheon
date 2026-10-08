@@ -12,11 +12,13 @@ import ctypes.util
 import math
 import errno
 import fcntl
+import hashlib
 import json
 import logging
 import os
 from pathlib import Path
 import socket
+import stat
 import io
 import re
 import shlex
@@ -26,6 +28,39 @@ import uuid
 
 
 MAX_TRANSFER_BYTES = 50 * 1024 * 1024
+
+
+def unix_socket_path(state_path):
+    # Linux sockaddr_un allows at most 107 pathname bytes. Neither the state
+    # root nor TMPDIR is length-bounded; keep both RPC endpoints under /tmp.
+    # Canonical paths distinguish workspaces, windows and endpoint purposes.
+    digest = hashlib.sha256(os.fsencode(state_path.resolve())).hexdigest()[:32]
+    return Path("/tmp") / f"pantheon-sock-{os.getuid()}-{digest}" / "rpc.sock"
+
+
+def prepare_unix_socket(state_path):
+    path = unix_socket_path(state_path)
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    info = path.parent.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise PermissionError("browser socket directory must be a private, user-owned directory (0700)")
+    # Only after verifying the directory may we remove a stale endpoint. The
+    # backend's profile lock excludes another server for the same state root.
+    path.unlink(missing_ok=True)
+    return path
+
+
+def remove_unix_socket(path):
+    if path is not None:
+        try:
+            path.unlink(missing_ok=True)
+            path.parent.rmdir()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # Never remove unexpected contents recursively, and do not let a
+            # cleanup failure skip viewer/process/profile-lock teardown.
+            logging.warning("could not remove browser socket directory %s", path.parent)
 
 
 def workspace_file(workspace, value, writing=False):
@@ -203,7 +238,7 @@ async def run(args):
     writer = None
     disconnect_server = None
     disconnect_tasks = set()
-    disconnect_path = args.profile / "clipboard-disconnect.sock"
+    disconnect_path = None
     token_file = args.profile / "viewer.tokens"
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -224,7 +259,7 @@ async def run(args):
         else:
             raise RuntimeError("browser port range exhausted by existing listeners")
         listener.listen(128)
-        reader, writer = await asyncio.open_unix_connection(str(args.shared_root / "backend.sock"))
+        reader, writer = await asyncio.open_unix_connection(str(unix_socket_path(args.shared_root / "backend.sock")))
         rpc_lock = asyncio.Lock()
         async def rpc(request):
             async with rpc_lock:
@@ -263,7 +298,7 @@ async def run(args):
             task = asyncio.create_task(disconnected(reader, event_writer))
             disconnect_tasks.add(task)
             task.add_done_callback(disconnect_tasks.discard)
-        disconnect_path.unlink(missing_ok=True)
+        disconnect_path = prepare_unix_socket(args.profile / "clipboard-disconnect.sock")
         disconnect_server = await asyncio.start_unix_server(start_disconnected, path=str(disconnect_path))
         disconnect_path.chmod(0o600)
         gone = shlex.join([sys.executable, __file__, "--clipboard-disconnect", str(disconnect_path), "--web", str(args.web)])
@@ -333,7 +368,7 @@ async def run(args):
     finally:
         if disconnect_server:
             await close_connections(disconnect_server, disconnect_tasks)
-        disconnect_path.unlink(missing_ok=True)
+        remove_unix_socket(disconnect_path)
         listener.close()
         for child in reversed(children):
             with contextlib.suppress(ProcessLookupError):
@@ -488,8 +523,7 @@ async def backend(args):
     args.shared_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     profile_lock = (args.shared_root / "backend.lock").open("a+")
     fcntl.flock(profile_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    socket_path = args.shared_root / "backend.sock"
-    socket_path.unlink(missing_ok=True)
+    socket_path = None
     capacity = min(args.capacity, 256)
     columns = math.ceil(math.sqrt(capacity + 1))
     rows = math.ceil((capacity + 1) / columns)
@@ -719,6 +753,7 @@ async def backend(args):
                     connections.discard(task)
 
     try:
+        socket_path = prepare_unix_socket(args.shared_root / "backend.sock")
         number = await asyncio.wait_for(asyncio.to_thread(display_server.stdout.readline), 15)
         if not number.strip().isdigit():
             raise RuntimeError("Xvfb failed to allocate shared display")
@@ -790,7 +825,7 @@ async def backend(args):
         if display_server.poll() is None:
             display_server.kill()
             await asyncio.to_thread(display_server.wait)
-        socket_path.unlink(missing_ok=True)
+        remove_unix_socket(socket_path)
         profile_lock.close()
 
 
