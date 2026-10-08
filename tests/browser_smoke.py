@@ -209,8 +209,12 @@ def main():
     processes = []
     viewers = []
     with tempfile.TemporaryDirectory(prefix="pantheon-browser-test-") as state:
-        state = Path(state)
+        # Exercise both backend and clipboard sockets beyond sockaddr_un's
+        # byte limit, including a multibyte state-root component.
+        state = Path(state) / ("long-state-" + "é" * 48) / ("nested-" + "x" * 48)
+        state.mkdir(parents=True)
         shared = state / "pantheon-shared"
+        assert len(os.fsencode(shared / "backend.sock")) > 107
         log = (state / "worker.log").open("w+")
 
         def process(arguments):
@@ -483,7 +487,7 @@ def main():
             backend.stdin.write("shutdown\n")
             backend.stdin.flush()
             assert backend.wait(timeout=20) == 0
-            print("PASS: Full HD framebuffers, real-window viewport, separated window edges, shared live cookies/storage/logout, private viewer pixels, tab ownership, scoped handoff and receive-only lease clipboard/paste/disconnect cleanup, independent close, screenshot, authenticated file download/upload bytes and confirmed receipt, restart durability, isolated Firefox death, fatal health under handoff, explicit recovery")
+            print("PASS: long/multibyte state-root Unix sockets, Full HD framebuffers, real-window viewport, separated window edges, shared live cookies/storage/logout, private viewer pixels, tab ownership, scoped handoff and receive-only lease clipboard/paste/disconnect cleanup, independent close, screenshot, authenticated file download/upload bytes and confirmed receipt, restart durability, isolated Firefox death, fatal health under handoff, explicit recovery")
         except Exception:
             log.flush()
             log.seek(0)
