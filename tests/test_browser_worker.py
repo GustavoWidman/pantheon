@@ -29,6 +29,46 @@ class BrowserHealthTests(unittest.TestCase):
 
 
 class BrowserTeardownTests(unittest.IsolatedAsyncioTestCase):
+    async def test_deadline_includes_stalled_client_cancellation_cleanup(self):
+        started, cleanup, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def connection():
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cleanup.set()
+                await release.wait()
+
+        task = asyncio.create_task(connection())
+        await started.wait()
+        try:
+            # The former gather waited for release forever, before reaching
+            # the server timeout. A hung cleanup must not stop browser teardown.
+            with self.assertLogs(level="WARNING"):
+                await asyncio.wait_for(worker.close_connections(None, {task}, timeout=0.05), 0.5)
+            self.assertTrue(cleanup.is_set())
+        finally:
+            release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_stalled_server_closure_is_aborted_and_returns_at_deadline(self):
+        class Server:
+            closed, aborted = False, False
+            def close(self):
+                self.closed = True
+            def abort_clients(self):
+                self.aborted = True
+            async def wait_closed(self):
+                await asyncio.Future()
+
+        server = Server()
+        with self.assertLogs(level="WARNING"):
+            await asyncio.wait_for(worker.close_connections(server, set(), timeout=0.05), 0.5)
+        self.assertTrue(server.closed)
+        self.assertTrue(server.aborted)
+
     async def test_server_closes_clients_before_waiting_for_server_closure(self):
         connections = set()
         accepted = asyncio.Event()

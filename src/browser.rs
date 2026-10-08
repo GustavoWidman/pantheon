@@ -417,7 +417,9 @@ impl BrowserManager {
                 )
             }
             "navigate" | "snapshot" | "click" | "type" | "screenshot" | "tabs" | "new_tab"
-            | "select_tab" | "close_tab" | "upload" | "download" => session.request(&request, deadline).await,
+            | "select_tab" | "close_tab" | "upload" | "download" => {
+                session.request(&request, deadline).await
+            }
             _ => bail!("unknown browser action: {action}"),
         }
     }
@@ -947,6 +949,7 @@ for line in sys.stdin:
                 worker,
                 ..Default::default()
             },
+            directory.path().to_path_buf(),
         );
         let browser = manager
             .execute("child", json!({"action":"open"}))
@@ -1045,6 +1048,7 @@ for line in sys.stdin:
                 worker,
                 ..Default::default()
             },
+            directory.path().to_path_buf(),
         );
         let browser = manager
             .execute("root", json!({"action":"open"}))
@@ -1102,6 +1106,7 @@ for line in sys.stdin:
                 worker,
                 ..Default::default()
             },
+            directory.path().to_path_buf(),
         );
         let browser = manager
             .execute("root", json!({"action":"open"}))

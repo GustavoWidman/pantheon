@@ -332,14 +332,7 @@ async def run(args):
                 emit({"error": str(error)[:2000], "fatal": isinstance(error, BrowserUnavailable)})
     finally:
         if disconnect_server:
-            disconnect_server.close()
-            # Python 3.13+ waits for accepted transports too. Cancel hooks before
-            # waiting, especially if a dead backend left one waiting for RPC.
-            pending = list(disconnect_tasks)
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            await disconnect_server.wait_closed()
+            await close_connections(disconnect_server, disconnect_tasks)
         disconnect_path.unlink(missing_ok=True)
         listener.close()
         for child in reversed(children):
@@ -455,7 +448,8 @@ class WindowGroup:
         return self.pages
 
 
-async def close_connections(server, connections):
+async def close_connections(server, connections, timeout=5):
+    deadline = asyncio.get_running_loop().time() + timeout
     if server:
         server.close()
     # Python 3.13+ Server.wait_closed waits for active client connections.
@@ -463,10 +457,30 @@ async def close_connections(server, connections):
     # blocked forever with its profile lock held and viewers falsely alive.
     tasks = list(connections)
     for task in tasks:
+        task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
         task.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
+    # A cancelled task can still block in its finally clause. asyncio.wait
+    # bounds that cleanup without awaiting another round of cancellation.
+    pending = set()
+    if tasks:
+        _, pending = await asyncio.wait(tasks, timeout=max(0, deadline - asyncio.get_running_loop().time()))
+    if pending:
+        logging.warning("browser client cleanup exceeded deadline (%d tasks)", len(pending))
+        for task in pending:
+            task.cancel()
     if server:
-        await asyncio.wait_for(server.wait_closed(), 5)
+        # Python 3.13+ can abort accepted transports even if a client's
+        # cancellation cleanup did not finish. Older versions still return at
+        # the deadline instead of preventing browser/process cleanup.
+        abort = getattr(server, "abort_clients", None)
+        if pending and abort:
+            abort()
+        try:
+            await asyncio.wait_for(server.wait_closed(), max(0, deadline - asyncio.get_running_loop().time()))
+        except asyncio.TimeoutError:
+            if abort:
+                abort()
+            logging.warning("browser server closure exceeded teardown deadline")
 
 
 async def backend(args):
@@ -693,12 +707,16 @@ async def backend(args):
                 if request.get("action") == "close":
                     break
         finally:
-            if group:
-                await close_group(group)
-            writer.close()
-            with contextlib.suppress(Exception):
-                await writer.wait_closed()
-            connections.discard(task)
+            try:
+                if group:
+                    await close_group(group)
+            finally:
+                writer.close()
+                try:
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(writer.wait_closed(), 3)
+                finally:
+                    connections.discard(task)
 
     try:
         number = await asyncio.wait_for(asyncio.to_thread(display_server.stdout.readline), 15)

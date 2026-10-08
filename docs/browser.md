@@ -133,3 +133,12 @@ viewer even when its backend no longer responds. The shared profile is retained;
 new viewer tokens are issued. Tabs and unsaved state may be lost in a crash.
 No navigation, click, typing, or other mutation is automatically replayed.
 Check the site's persisted state before repeating an uncertain action.
+
+Backend teardown uses one five-second deadline for client cancellation cleanup and
+server closure. A stalled client's `finally` block cannot hold cleanup indefinitely;
+remaining tasks are cancelled again and accepted transports are aborted when the
+Python runtime supports it. Clipboard disconnect hooks use the same bound, and
+connection writers close even if window cleanup fails. The deadline covers that
+client/server phase; browser closure and Playwright shutdown retain their separate
+ten-second bounds.
+
