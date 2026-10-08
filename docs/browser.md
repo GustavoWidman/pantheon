@@ -22,6 +22,9 @@ The browser tool accepts these actions:
 {"action":"click","browser_id":"…","role":"button","name":"Sign in"}
 {"action":"type","browser_id":"…","role":"textbox","name":"Email","text":"…"}
 {"action":"screenshot","browser_id":"…"}
+{"action":"upload","browser_id":"…","selector":"input[type=file]","paths":["document.pdf"]}
+{"action":"download","browser_id":"…","url":"https://example.com/attachment"}
+{"action":"download","browser_id":"…","role":"link","name":"Download attachment"}
 {"action":"handoff","browser_id":"…"}
 {"action":"resume","browser_id":"…","resume_token":"…"}
 {"action":"list"}
@@ -35,6 +38,37 @@ When a background subagent finishes, the harness transfers its live browsers to 
 Closing a group closes only its pages and viewer. The shared profile remains open and keeps its cache and login state. Browser IDs and ownership records remain after close; reopening an ID from its owner creates a fresh window using the shared profile, with a new viewer token. Service shutdown gracefully flushes the shared profile and then terminates the backend group. A browser-process crash affects every window; close the failed groups and reopen them. Disk-backed profile state survives normal restarts; unsaved in-memory state cannot survive a crash. Old per-browser profile directories are retained during upgrade but are not merged into the new shared profile.
 
 Firefox/GTK has one core keyboard focus. Agent input operations are serialized. During a human handoff, other windows can navigate and take semantic snapshots, but operations that change focus (including typing, clicking, selecting tabs, screenshots and opening windows) are rejected until explicit resume. Only one group can hold a human input lease at once. Each VNC server uses its own protected control file, so handing off one viewer does not enable input in the others. Clipboard forwarding is disabled to avoid cross-window interference.
+
+## Authenticated file transfers
+
+`upload` sets the selected file input directly (including hidden inputs), avoiding
+native OS file pickers. Supply `selector` or `role`/`name` plus `paths`, an array
+of 1–20 existing regular files. Relative paths are resolved against the configured
+workspace; absolute paths must also remain inside it. Symlink escapes, directories
+and missing files are rejected. Each file is limited to 50 MiB. The response
+reports `files` with canonical `path` and byte `size`, and `done`; it does **not**
+mean the website accepted or submitted the form. Verify any upload status and
+complete the site's final confirmation before claiming submission.
+
+`download` accepts **either** an HTTP(S) `url` **or** a `selector`/`role`/`name`
+click target. URL mode performs a cookie-authenticated GET using the active browser
+context, supports inline PDFs and leaves the current form/page untouched. It does
+not reproduce JavaScript-added authorization headers; use click mode for downloads
+that depend on page logic. Click mode arms the download event before clicking.
+
+The supervisor generates a unique `browser-download-<uuid>` file in the configured
+workspace. Download requests cannot choose destinations, and remote suggested
+filenames are returned as metadata only, never used as local paths. The result
+contains `path`, `suggested_filename`, `size` in bytes and the download `url`.
+Successful artifacts are flushed to disk and survive browser closure/restart.
+Existing files are never overwritten and partial artifacts are removed on write
+failure. Saved downloads are limited to 50 MiB and actions use the normal browser
+deadline. This is an acceptance/storage limit, not a hard network or memory cap:
+Playwright buffers URL responses before the final size check (Content-Length is
+checked early when available); browser-triggered downloads also finish before saving. Transfers require the
+same owner and explicit handoff resume as other automation; other windows also
+cannot transfer files while a user holds keyboard focus. Website content and
+filenames remain untrusted.
 
 ## Viewer networking
 

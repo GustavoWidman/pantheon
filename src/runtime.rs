@@ -132,7 +132,11 @@ impl Harness {
                 .with_auth(config.auth.clone())
                 .with_catalog(discord.models.clone()),
             web: crate::web::Web::new(config.state_dir.join("web/cache"), config.web.clone())?,
-            browser: BrowserManager::new(config.state_dir.join("browsers"), config.browser.clone()),
+            browser: BrowserManager::new(
+                config.state_dir.join("browsers"),
+                config.browser.clone(),
+                config.workspace.clone(),
+            ),
             mcp: crate::mcp::Mcp::new(&config.mcp, &config.workspace, &config.state_dir)?,
             capacity: Arc::new(Semaphore::new(config.agent.max_subagents)),
             shell_capacity: Arc::new(Semaphore::new(config.agent.max_shell_jobs)),

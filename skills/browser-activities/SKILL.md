@@ -17,6 +17,14 @@ account, destination and consequential details before submitting an authorized
 action. Existing permission carries across the workflow; ask again only when the
 next action exceeds it or a meaningful unresolved decision requires the user.
 
+Use browser `download` for authenticated attachments: provide an HTTP(S) URL for
+cookie-authenticated GET without leaving a form, or a locator for a click-triggered
+download. Use the returned workspace artifact path, not the untrusted suggested
+filename. Inspect the document before reusing it. Use `upload` with a file-input
+selector (hidden inputs work) and workspace `paths`; do not use native file-picker
+keystrokes. Confirm the website's upload status and any final submission dialog.
+A completed upload or click is not a submitted/accepted record.
+
 Capture confirmation, persisted records or completed-page state as evidence.
 Report the outcome and any remaining blocker plainly. Offer the live noVNC link
 when user interaction helps. Handoff pauses automation until explicit resume;

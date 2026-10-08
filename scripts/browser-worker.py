@@ -2,7 +2,7 @@
 """JSON-line RPC; one shared Camoufox profile, private window viewers and authenticated noVNC.
 
 Only the Rust supervisor starts this process. stdout is exclusively protocol frames.
-Browser downloads, pip installs and Playwright installs never happen at runtime.
+Browser/driver installs never happen at runtime; website file transfers use the active session.
 """
 import argparse
 import asyncio
@@ -17,9 +17,120 @@ import logging
 import os
 from pathlib import Path
 import socket
+import io
+import re
 import subprocess
 import sys
 import uuid
+
+
+MAX_TRANSFER_BYTES = 50 * 1024 * 1024
+
+
+def workspace_file(workspace, value, writing=False):
+    root = workspace.resolve(strict=True)
+    path = Path(value).resolve(strict=not writing)
+    if not path.is_relative_to(root):
+        raise ValueError("file transfer path escapes workspace")
+    if writing:
+        if path.exists() or path.is_symlink():
+            raise ValueError("download destination already exists")
+        if not path.parent.is_dir():
+            raise ValueError("download destination parent does not exist")
+    elif not path.is_file():
+        raise ValueError("upload path must be a regular file")
+    return path
+
+
+def save_artifact(destination, source):
+    # Exclusive create: never overwrite an existing artifact or follow a symlink.
+    created = False
+    try:
+        with destination.open("xb") as output:
+            created = True
+            size = 0
+            while chunk := source.read(64 * 1024):
+                size += len(chunk)
+                if size > MAX_TRANSFER_BYTES:
+                    raise ValueError("download exceeds 50 MiB limit")
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        directory = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        return size
+    except Exception:
+        if created:
+            destination.unlink(missing_ok=True)
+        raise
+
+
+def locator_for(page, request):
+    if request.get("role"):
+        return page.get_by_role(request["role"], name=request.get("name", ""), exact=True)
+    if request.get("selector"):
+        return page.locator(request["selector"])
+    raise ValueError("provide role/name or a CSS selector")
+
+
+async def transfer(page, request, workspace):
+    action = request["action"]
+    if workspace is None:
+        raise ValueError("browser file transfers require a configured workspace")
+    if action == "upload":
+        values = request.get("paths")
+        if not isinstance(values, list) or not 1 <= len(values) <= 20 or not all(isinstance(v, str) for v in values):
+            raise ValueError("upload requires 1 to 20 workspace files")
+        paths = [workspace_file(workspace, value) for value in values]
+        if any(path.stat().st_size > MAX_TRANSFER_BYTES for path in paths):
+            raise ValueError("upload file exceeds 50 MiB limit")
+        # Hidden file inputs are supported without opening the OS file picker.
+        await locator_for(page, request).set_input_files([str(path) for path in paths])
+        return {"done": True, "url": page.url, "files": [{"path": str(path), "size": path.stat().st_size} for path in paths]}
+    has_url = isinstance(request.get("url"), str)
+    has_locator = bool(request.get("role") or request.get("selector"))
+    if has_url == has_locator:
+        raise ValueError("download requires either url or role/name/selector")
+    destination = workspace_file(workspace, request["path"], writing=True)
+    if has_url:
+        url = request["url"]
+        if not url.startswith(("http://", "https://")):
+            raise ValueError("download requires an http(s) URL")
+        # Context request shares browser cookies, handles inline PDFs too, and
+        # does not navigate away from an in-progress form.
+        response = await page.context.request.get(url, timeout=30000)
+        try:
+            if not response.ok:
+                raise ValueError(f"download HTTP status {response.status}")
+            length = response.headers.get("content-length")
+            if length and int(length) > MAX_TRANSFER_BYTES:
+                raise ValueError("download exceeds 50 MiB limit")
+            data = await response.body()
+            if len(data) > MAX_TRANSFER_BYTES:
+                raise ValueError("download exceeds 50 MiB limit")
+            disposition = response.headers.get("content-disposition", "")
+            match = re.search(r'filename="([^"\r\n]*)"', disposition)
+            filename = match.group(1) if match else "download"
+            size = save_artifact(destination, io.BytesIO(data))
+            return {"path": str(destination), "suggested_filename": filename, "size": size, "url": response.url}
+        finally:
+            await response.dispose()
+    # Arm before clicking, even when the response arrives immediately.
+    async with page.expect_download(timeout=30000) as pending:
+        await locator_for(page, request).click()
+    download = await pending.value
+    try:
+        failure = await download.failure()
+        if failure:
+            raise ValueError(f"download failed: {failure}")
+        with Path(await download.path()).open("rb") as source:
+            size = save_artifact(destination, source)
+        return {"path": str(destination), "suggested_filename": download.suggested_filename, "size": size, "url": download.url}
+    finally:
+        await download.delete()
 
 
 def emit(value):
@@ -337,7 +448,7 @@ async def backend(args):
             return {"state": "agent"}
         if group.human:
             raise RuntimeError("automation paused while human owns this window")
-        if action in ("click", "type", "select_tab", "new_tab", "close_tab", "screenshot"):
+        if action in ("click", "type", "select_tab", "new_tab", "close_tab", "screenshot", "upload", "download"):
             async with focus:
                 if any(other.human for other in groups.values()):
                     raise RuntimeError("shared browser keyboard focus is leased to the user; navigation and snapshots in other windows remain available")
@@ -386,13 +497,10 @@ async def backend(args):
             group.add(tab)
             await identify(tab, group)
             return {"tab_id": group.active, "url": tab.url}
+        if action in ("upload", "download"):
+            return await transfer(page, request, args.workspace)
         if action in ("click", "type"):
-            if request.get("role"):
-                locator = page.get_by_role(request["role"], name=request.get("name", ""), exact=True)
-            elif request.get("selector"):
-                locator = page.locator(request["selector"])
-            else:
-                raise ValueError("provide role/name or a CSS selector")
+            locator = locator_for(page, request)
             if action == "click":
                 await locator.click()
             else:
@@ -458,7 +566,7 @@ async def backend(args):
         if not executable or not Path(executable).is_file():
             raise RuntimeError("PANTHEON_CAMOUFOX must point to the packaged executable")
         playwright = await async_playwright().start()
-        browser = await playwright.firefox.launch_persistent_context(str(args.shared_root / "profile"), executable_path=executable, headless=False,
+        browser = await playwright.firefox.launch_persistent_context(str(args.shared_root / "profile"), executable_path=executable, headless=False, accept_downloads=True,
             viewport={"width": 1280, "height": 720},
             firefox_user_prefs={"browser.shell.checkDefaultBrowser": False, "browser.startup.homepage_override.mstone": "ignore",
                 "browser.cache.disk.enable": True, "browser.cache.disk.capacity": 262144,
@@ -524,6 +632,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", type=Path)
     parser.add_argument("--shared-root", type=Path)
+    parser.add_argument("--workspace", type=Path)
     parser.add_argument("--backend", action="store_true")
     parser.add_argument("--capacity", type=int, default=16)
     parser.add_argument("--port", type=int)
