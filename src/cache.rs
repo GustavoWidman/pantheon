@@ -1,6 +1,6 @@
-//! Durable diagnostics only: no conversation retention or provider cache-policy changes.
+//! Durable cache routing identities and diagnostics; provider transcripts stay ephemeral.
 use crate::store::Store;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -62,10 +62,34 @@ struct Snapshot {
 pub(crate) fn initialize(db: &Connection) -> Result<()> {
     db.execute_batch("CREATE TABLE IF NOT EXISTS cache_views(channel TEXT PRIMARY KEY,snapshot TEXT NOT NULL,trace TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS cache_usage(seq INTEGER PRIMARY KEY AUTOINCREMENT,channel TEXT NOT NULL,model TEXT NOT NULL,phase TEXT NOT NULL,usage TEXT NOT NULL,created INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS cache_affinity(scope TEXT PRIMARY KEY,identity TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS cache_usage_channel ON cache_usage(channel,seq);")?;
     Ok(())
 }
 impl Store {
+    /// Persist a random identity per owner, isolated from other state databases.
+    pub fn cache_affinity(&self, scope: &str) -> Result<uuid::Uuid> {
+        let db = self.db.lock().unwrap();
+        let read = || {
+            db.query_row(
+                "SELECT identity FROM cache_affinity WHERE scope=?1",
+                [scope],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+        };
+        let identity = match read()? {
+            Some(identity) => identity,
+            None => {
+                db.execute(
+                    "INSERT OR IGNORE INTO cache_affinity(scope,identity) VALUES(?1,?2)",
+                    params![scope, uuid::Uuid::new_v4().to_string()],
+                )?;
+                read()?.context("cache affinity identity missing")?
+            }
+        };
+        uuid::Uuid::parse_str(&identity).context("invalid saved cache affinity identity")
+    }
     pub fn cache_turn(
         &self,
         channel: u64,
@@ -275,6 +299,23 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn affinity_survives_restart_and_isolates_owners_roles_and_installations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let store = Store::open(&path).unwrap();
+        let root = store.cache_affinity("channel:1").unwrap();
+        for scope in ["channel:2", "worker-id", "compactor:1", "search:channel:1"] {
+            let id = store.cache_affinity(scope).unwrap();
+            assert_ne!(id, root);
+            assert_eq!(id, store.cache_affinity(scope).unwrap());
+        }
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(root, reopened.cache_affinity("channel:1").unwrap());
+        let separate = Store::open(&dir.path().join("other-db")).unwrap();
+        assert_ne!(root, separate.cache_affinity("channel:1").unwrap());
+    }
     #[test]
     fn usage_distinguishes_reads_writes_and_missing_reports() {
         let a = Usage::parse(
