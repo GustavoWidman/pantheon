@@ -8,11 +8,15 @@ import re
 from pathlib import Path
 import socket
 import struct
+import sys
 import subprocess
 import tempfile
 import threading
 import time
 import urllib.request
+import urllib.parse
+import ctypes
+import ctypes.util
 
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON = os.environ["PANTHEON_BROWSER_PYTHON"]
@@ -23,6 +27,8 @@ ATTACHMENT = b"%PDF-1.7\nlocal authenticated attachment\x00\xff\n"
 
 
 class Site(http.server.BaseHTTPRequestHandler):
+    entered = ""
+
     uploaded = None
 
     def do_POST(self):
@@ -46,11 +52,18 @@ class Site(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(ATTACHMENT)
             return
+        if self.path.startswith("/entered?"):
+            Site.entered = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query, keep_blank_values=True)["value"][0]
+            self.send_response(204)
+            self.end_headers()
+            return
         color = "#e00000" if self.path == "/red" else "#00e000"
         cookie = self.headers.get("Cookie", "")
         body = f'''<html><head><title>{self.path}</title></head><body style="background:{color}">
 <label>Name <input aria-label="Name"></label><button onclick="document.cookie='session=shared;max-age=86400';localStorage.setItem('login','shared');document.getElementById('result').textContent='saved'">Save</button>
 <button onclick="document.cookie='session=;max-age=0';localStorage.removeItem('login')">Logout</button>
+<label>Dummy password <input type="password" aria-label="Dummy password" oninput="fetch('/entered?value='+encodeURIComponent(this.value))"></label>
+<label>Dummy copy <input aria-label="Dummy copy" value="browser-local-copy"></label>
 <a href="/popup" target="_blank">Popup</a><a href="/attachment">Download attachment</a>
 <input type="file" id="attachment" style="display:none" multiple>
 <button onclick="document.getElementById('confirmation').hidden=false">Submit request</button>
@@ -93,6 +106,35 @@ class Viewer:
         self.connection.sendall(struct.pack(">BBBBBBBBHHHBBBxxx", 0, 0, 0, 0, 32, 24, 0, 1, 255, 255, 255, 16, 8, 0))
         self.connection.sendall(struct.pack(">BBHi", 2, 0, 1, 0))
 
+    def clipboard(self, text):
+        data = text.encode("latin-1")
+        self.connection.sendall(struct.pack(">BxxxI", 6, len(data)) + data)
+
+    def key(self, key, down):
+        self.connection.sendall(struct.pack(">BBxxI", 4, int(down), key))
+
+    def click(self, x, y):
+        self.connection.sendall(struct.pack(">BBHH", 5, 0, x, y))
+        self.connection.sendall(struct.pack(">BBHH", 5, 1, x, y))
+        self.connection.sendall(struct.pack(">BBHH", 5, 0, x, y))
+
+    def chord(self, key):
+        self.key(0xffe3, True)  # Linux Ctrl, including when the client is a Mac.
+        self.key(ord(key), True)
+        self.key(ord(key), False)
+        self.key(0xffe3, False)
+
+    def no_clipboard_output(self):
+        # No framebuffer request is pending on these fresh viewer connections.
+        self.connection.settimeout(0.3)
+        try:
+            data = self.connection.recv(1)
+            raise AssertionError(f"unexpected server message or disconnect: {data!r}")
+        except socket.timeout:
+            pass
+        finally:
+            self.connection.settimeout(10)
+
     def pixel(self, x=200, y=200):
         self.connection.sendall(struct.pack(">BBHHHH", 3, 0, x, y, 1, 1))
         while True:
@@ -128,6 +170,38 @@ def websocket(port, token):
         return connection.recv(8192)
 
 
+def assert_clipboard_empty(display):
+    library = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+    library.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    library.XOpenDisplay.restype = ctypes.c_void_p
+    library.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    library.XInternAtom.restype = ctypes.c_ulong
+    library.XGetSelectionOwner.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    library.XGetSelectionOwner.restype = ctypes.c_ulong
+    library.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+    library.XDefaultRootWindow.restype = ctypes.c_ulong
+    library.XGetWindowProperty.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_long, ctypes.c_long, ctypes.c_int, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_void_p)]
+    library.XGetWindowProperty.restype = ctypes.c_int
+    library.XFree.argtypes = [ctypes.c_void_p]
+    library.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    connection = library.XOpenDisplay(display.encode())
+    assert connection
+    try:
+        for name in (b"CLIPBOARD", b"PRIMARY", b"SECONDARY"):
+            atom = library.XInternAtom(connection, name, 0)
+            assert library.XGetSelectionOwner(connection, atom) == 0, name
+        for index in range(8):
+            atom = library.XInternAtom(connection, f"CUT_BUFFER{index}".encode(), 0)
+            actual_type, format_, count, remaining, data = ctypes.c_ulong(), ctypes.c_int(), ctypes.c_ulong(), ctypes.c_ulong(), ctypes.c_void_p()
+            assert library.XGetWindowProperty(connection, library.XDefaultRootWindow(connection), atom, 0, 1, 0, 0, ctypes.byref(actual_type), ctypes.byref(format_), ctypes.byref(count), ctypes.byref(remaining), ctypes.byref(data)) == 0
+            try:
+                assert actual_type.value == 0, (index, actual_type.value)
+            finally:
+                if data:
+                    library.XFree(data)
+    finally:
+        library.XCloseDisplay(connection)
+
 def main():
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Site)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -162,6 +236,15 @@ def main():
             result = subprocess.run([os.environ.get("PANTHEON_X11VNC", "x11vnc"), "-display", display, "-connect", str(directory / "viewer.control"), "-Q", "viewonly"], capture_output=True, text=True, timeout=15)
             assert result.returncode == 0, result.stderr
             return "viewonly:1" in result.stdout
+
+        def entered(expected):
+            deadline = time.monotonic() + 5
+            while Site.entered != expected and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert Site.entered == expected, (Site.entered, expected)
+
+        def clipboard_empty(display):
+            subprocess.run([PYTHON, str(Path(__file__).resolve()), "--clipboard-empty", display], check=True, timeout=10)
 
         try:
             backend, _ = process(["--backend", "--workspace", str(state), "--shared-root", str(shared), "--capacity", "4"])
@@ -228,16 +311,25 @@ def main():
                 assert viewer.pixel(1850, 950) == color
                 assert viewer.pixel(1918, 950) == (0, 0, 0)
                 assert viewer.pixel(1850, 1078) == (0, 0, 0)
+            first_view.close()
+            second_view.close()
             first_tabs = call(first, "tabs")["tabs"]
             second_tabs = call(second, "tabs")["tabs"]
-            call(first, "new_tab")
+            temporary_tab = call(first, "new_tab")["tab_id"]
             assert len(call(first, "tabs")["tabs"]) == 2
             assert len(call(second, "tabs")["tabs"]) == 1
             # Browser-local tab IDs cannot be used to steer another window.
             second.stdin.write(json.dumps({"action": "select_tab", "tab_id": first_tabs[0]["tab_id"]}) + "\n")
             second.stdin.flush()
             assert "error" in json.loads(second.stdout.readline())
+            call(first, "close_tab", tab_id=temporary_tab)
             call(first, "select_tab", tab_id=first_tabs[0]["tab_id"])
+            call(first, "click", role="textbox", name="Dummy password")
+            clipboard_view, other_view = Viewer(first_dir), Viewer(second_dir)
+            viewers.extend([clipboard_view, other_view])
+            clipboard_view.clipboard("view-only-must-not-paste")
+            time.sleep(0.3)
+            clipboard_empty(first_info["display"])
             call(first, "handoff")
             for request in [
                 {"action":"upload","selector":"#attachment","paths":[str(artifact)]},
@@ -249,17 +341,65 @@ def main():
                 second.stdin.write(json.dumps(request) + "\n")
                 second.stdin.flush()
                 assert "error" in json.loads(second.stdout.readline())
+            # Genuine ClientCutText, followed by VNC key events into Firefox.
+            clipboard_view.clipboard("dummy-password-123")
+            time.sleep(0.3)
+            clipboard_view.chord("v")
+            entered("dummy-password-123")
+            other_view.clipboard("other-window-must-not-overwrite")
+            time.sleep(0.3)
+            clipboard_view.chord("a")
+            clipboard_view.chord("v")
+            entered("dummy-password-123")
+            clipboard_view.no_clipboard_output()
+            other_view.no_clipboard_output()
+            # Password fields cannot be copied; Tab to the following normal input.
+            clipboard_view.key(0xff09, True)
+            clipboard_view.key(0xff09, False)
+            # Browser-local copy must not export data through either VNC server.
+            clipboard_view.chord("a")
+            clipboard_view.chord("c")
+            time.sleep(0.3)
+            clipboard_view.no_clipboard_output()
+            other_view.no_clipboard_output()
+            clipboard_view.close()
+            time.sleep(0.5)
+            clipboard_empty(first_info["display"])
+            clipboard_view = Viewer(first_dir)
+            viewers.append(clipboard_view)
+            clipboard_view.clipboard("lease-secret")
+            time.sleep(0.3)
             assert not view_only(first_dir, first_info["display"])
             assert view_only(second_dir, second_info["display"])
             call(second, "navigate", url=url + "/green")
             call(second, "snapshot")
             call(first, "resume")
+            clipboard_empty(first_info["display"])
+            call(second, "click", role="textbox", name="Dummy password")
+            Site.entered = "not-empty"
+            call(second, "handoff")
+            other_view.chord("v")
+            time.sleep(0.4)
+            assert Site.entered == "not-empty", Site.entered  # Empty field receives nothing.
+            other_view.clipboard("second-lease-secret")
+            time.sleep(0.3)
+            other_view.chord("v")
+            entered("second-lease-secret")
+            call(second, "resume")
+            clipboard_empty(second_info["display"])
+            clipboard_view.close()
+            other_view.close()
             assert view_only(first_dir, first_info["display"])
             assert view_only(second_dir, second_info["display"])
-            first_view.close()
-            second_view.close()
+            call(first, "click", role="textbox", name="Dummy password")
+            call(first, "handoff")
+            close_view = Viewer(first_dir)
+            viewers.append(close_view)
+            close_view.clipboard("close-secret")
+            time.sleep(0.3)
             call(first, "close")
             assert first.wait(timeout=15) == 0
+            clipboard_empty(first_info["display"])
             assert len(call(second, "tabs")["tabs"]) == len(second_tabs)
             call(second, "click", role="button", name="Logout")
             failed = state / "unauthenticated"
@@ -267,15 +407,23 @@ def main():
             second.stdin.flush()
             assert "403" in json.loads(second.stdout.readline())["error"]
             assert not failed.exists()
-            third, _, _ = window("third")
+            third, third_info, third_dir = window("third")
             call(third, "navigate", url=url + "/red")
             assert "session=shared" not in call(third, "snapshot")["snapshot"]
             call(second, "click", role="button", name="Save")
             image = call(second, "screenshot")
             assert Path(image["path"]).stat().st_size > 100
-            for child in (second, third):
-                call(child, "close")
-                assert child.wait(timeout=15) == 0
+            call(third, "click", role="textbox", name="Dummy password")
+            call(third, "handoff")
+            disconnected_view = Viewer(third_dir)
+            viewers.append(disconnected_view)
+            disconnected_view.clipboard("worker-disconnect-secret")
+            time.sleep(0.3)
+            third.stdin.close()
+            assert third.wait(timeout=15) == 0
+            clipboard_empty(third_info["display"])
+            call(second, "close")
+            assert second.wait(timeout=15) == 0
             backend.stdin.write("shutdown\n")
             backend.stdin.flush()
             assert backend.wait(timeout=20) == 0
@@ -289,7 +437,7 @@ def main():
             backend.stdin.write("shutdown\n")
             backend.stdin.flush()
             assert backend.wait(timeout=20) == 0
-            print("PASS: Full HD framebuffers, real-window viewport, separated window edges, shared live cookies/storage/logout, private viewer pixels, tab ownership, scoped handoff, independent close, screenshot, authenticated file download/upload bytes and confirmed receipt, restart durability")
+            print("PASS: Full HD framebuffers, real-window viewport, separated window edges, shared live cookies/storage/logout, private viewer pixels, tab ownership, scoped handoff and receive-only lease clipboard/paste/disconnect cleanup, independent close, screenshot, authenticated file download/upload bytes and confirmed receipt, restart durability")
         except Exception:
             log.flush()
             log.seek(0)
@@ -308,4 +456,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) == 3 and sys.argv[1] == "--clipboard-empty":
+        assert_clipboard_empty(sys.argv[2])
+    else:
+        main()
