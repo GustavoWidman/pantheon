@@ -14,7 +14,8 @@
         let
           pkgs = import nixpkgs { inherit system; };
           browser = pkgs.callPackage ./nix/browser.nix { };
-          package = pkgs.callPackage ./nix/package.nix { inherit browser; };
+          rustBinary = pkgs.callPackage ./nix/rust.nix { };
+          package = pkgs.callPackage ./nix/package.nix { inherit browser rustBinary; };
         in
         {
           default = package;
