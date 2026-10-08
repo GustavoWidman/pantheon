@@ -42,6 +42,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v19
+      - name: Cache Nix builds in GitHub Actions
+        uses: DeterminateSystems/magic-nix-cache-action@v15
+        with:
+          use-gha-cache: enabled
+          use-flakehub: disabled
       - run: nix flake check --print-build-logs
       - name: Check Nix compilation cache boundaries
         run: python3 -m unittest discover -s tests -p test_nix_packaging.py

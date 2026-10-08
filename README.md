@@ -109,6 +109,12 @@ Both root and workers can own wakeups and monitors. Shell commands return a back
 
 ### Nix CI compilation
 
+After installing Nix, CI uses `DeterminateSystems/magic-nix-cache-action` to
+cache build outputs in GitHub Actions across runs. GitHub Actions caching is
+explicitly enabled and FlakeHub caching is disabled; no additional credentials
+or OIDC permissions are required. The reusable release checks use the same
+cache setup. Cache misses still build normally, and the first run may be cold.
+
 The Nix package keeps its optimized Rust executable (`pantheon.unwrapped`)
 separate from the browser-worker/runtime wrapper. Cargo's source set includes
 `Cargo.toml`, `Cargo.lock`, `src/`, embedded `skills/`, and Rust integration tests;
