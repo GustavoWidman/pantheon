@@ -4,6 +4,7 @@ import contextlib
 import http.server
 import json
 import os
+import re
 from pathlib import Path
 import socket
 import struct
@@ -53,8 +54,8 @@ class Site(http.server.BaseHTTPRequestHandler):
 <a href="/popup" target="_blank">Popup</a><a href="/attachment">Download attachment</a>
 <input type="file" id="attachment" style="display:none" multiple>
 <button onclick="document.getElementById('confirmation').hidden=false">Submit request</button>
-<div id="confirmation" hidden><button onclick="fetch('/uploaded',{{method:'POST',body:document.getElementById('attachment').files[0]}}).then(r=>r.text()).then(t=>document.getElementById('receipt').textContent=t)">Confirm request</button></div><p id="receipt"></p><p id="result">{cookie}</p>
-<script>document.getElementById('result').textContent += ' storage=' + localStorage.getItem('login');</script></body></html>'''.encode()
+<div id="confirmation" hidden><button onclick="fetch('/uploaded',{{method:'POST',body:document.getElementById('attachment').files[0]}}).then(r=>r.text()).then(t=>document.getElementById('receipt').textContent=t)">Confirm request</button></div><p id="receipt"></p><p id="result">{cookie}</p><p id="geometry"></p>
+<script>document.getElementById('geometry').textContent = 'viewport=' + innerWidth + 'x' + innerHeight;document.getElementById('result').textContent += ' storage=' + localStorage.getItem('login');</script></body></html>'''.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
         self.end_headers()
@@ -88,12 +89,12 @@ class Viewer:
         header = read_exact(self.connection, 24)
         self.width, self.height = struct.unpack(">HH", header[:4])
         read_exact(self.connection, struct.unpack(">I", header[20:])[0])
-        assert (self.width, self.height) == (1440, 900)
+        assert (self.width, self.height) == (1920, 1080)
         self.connection.sendall(struct.pack(">BBBBBBBBHHHBBBxxx", 0, 0, 0, 0, 32, 24, 0, 1, 255, 255, 255, 16, 8, 0))
         self.connection.sendall(struct.pack(">BBHi", 2, 0, 1, 0))
 
     def pixel(self, x=200, y=200):
-        self.connection.sendall(struct.pack(">BBHHHH", 3, 0, 0, 0, self.width, self.height))
+        self.connection.sendall(struct.pack(">BBHHHH", 3, 0, x, y, 1, 1))
         while True:
             kind = read_exact(self.connection, 1)[0]
             if kind == 2:  # Bell.
@@ -215,8 +216,18 @@ def main():
             time.sleep(0.3)
             assert first_view.pixel() == (224, 0, 0)
             assert second_view.pixel() == (0, 224, 0)
-            first_view.close()
-            second_view.close()
+            # Content reaches the far side of the Full HD window (not the old
+            # 1280x720 emulated viewport), but stays out of each tile's margin.
+            geometry = re.search(r"viewport=(\d+)x(\d+)", snapshot["snapshot"])
+            assert geometry is not None, snapshot
+            width, height = map(int, geometry.groups())
+            # Camoufox/browser chrome may reserve or report additional pixels.
+            # Verify real-window layout expands beyond the old emulated viewport.
+            assert 1750 <= width <= 1888 and 850 <= height <= 1048, snapshot
+            for viewer, color in ((first_view, (224, 0, 0)), (second_view, (0, 224, 0))):
+                assert viewer.pixel(1850, 950) == color
+                assert viewer.pixel(1918, 950) == (0, 0, 0)
+                assert viewer.pixel(1850, 1078) == (0, 0, 0)
             first_tabs = call(first, "tabs")["tabs"]
             second_tabs = call(second, "tabs")["tabs"]
             call(first, "new_tab")
@@ -245,6 +256,8 @@ def main():
             call(first, "resume")
             assert view_only(first_dir, first_info["display"])
             assert view_only(second_dir, second_info["display"])
+            first_view.close()
+            second_view.close()
             call(first, "close")
             assert first.wait(timeout=15) == 0
             assert len(call(second, "tabs")["tabs"]) == len(second_tabs)
@@ -276,7 +289,7 @@ def main():
             backend.stdin.write("shutdown\n")
             backend.stdin.flush()
             assert backend.wait(timeout=20) == 0
-            print("PASS: shared live cookies/storage/logout, private viewer pixels, tab ownership, scoped handoff, independent close, screenshot, authenticated file download/upload bytes and confirmed receipt, restart durability")
+            print("PASS: Full HD framebuffers, real-window viewport, separated window edges, shared live cookies/storage/logout, private viewer pixels, tab ownership, scoped handoff, independent close, screenshot, authenticated file download/upload bytes and confirmed receipt, restart durability")
         except Exception:
             log.flush()
             log.seek(0)

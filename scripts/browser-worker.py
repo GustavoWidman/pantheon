@@ -133,6 +133,32 @@ async def transfer(page, request, workspace):
         await download.delete()
 
 
+# A viewer exports exactly one Full HD tile, including browser chrome. Keep a
+# small inset so GTK window borders cannot cross into another viewer's region.
+DESKTOP_WIDTH = 1920
+DESKTOP_HEIGHT = 1080
+WINDOW_INSET = 16
+
+
+def cell_origin(slot, columns):
+    return (slot % columns) * DESKTOP_WIDTH, (slot // columns) * DESKTOP_HEIGHT
+
+
+def window_geometry(slot, columns):
+    x, y = cell_origin(slot, columns)
+    return (
+        x + WINDOW_INSET,
+        y + WINDOW_INSET,
+        DESKTOP_WIDTH - 2 * WINDOW_INSET,
+        DESKTOP_HEIGHT - 2 * WINDOW_INSET,
+    )
+
+
+def viewer_clip(slot, columns):
+    x, y = cell_origin(slot, columns)
+    return f"{DESKTOP_WIDTH}x{DESKTOP_HEIGHT}+{x}+{y}"
+
+
 def emit(value):
     print(json.dumps(value, separators=(",", ":")), flush=True)
 
@@ -327,7 +353,7 @@ class XWindows:
         return found
 
     def place(self, window, slot, columns):
-        self.x.XMoveResizeWindow(self.display, window, (slot % columns) * 1440 + 16, (slot // columns) * 900 + 16, 1408, 868)
+        self.x.XMoveResizeWindow(self.display, window, *window_geometry(slot, columns))
         self.x.XFlush(self.display)
 
     def close(self):
@@ -364,7 +390,7 @@ async def backend(args):
     capacity = min(args.capacity, 256)
     columns = math.ceil(math.sqrt(capacity + 1))
     rows = math.ceil((capacity + 1) / columns)
-    display_server = start([os.environ.get("PANTHEON_XVFB", "Xvfb"), "-displayfd", "1", "-screen", "0", f"{columns * 1440}x{rows * 900}x24", "-nolisten", "tcp"], stdout=subprocess.PIPE)
+    display_server = start([os.environ.get("PANTHEON_XVFB", "Xvfb"), "-displayfd", "1", "-screen", "0", f"{columns * DESKTOP_WIDTH}x{rows * DESKTOP_HEIGHT}x24", "-nolisten", "tcp"], stdout=subprocess.PIPE)
     browser = playwright = x = server = None
     connections = set()
     groups = {}
@@ -537,7 +563,7 @@ async def backend(args):
                             page = await browser.new_page()
                             group.add(page)
                             await identify(page, group)
-                            response = {"display": display, "clip": f"1440x900+{slot % columns * 1440}+{slot // columns * 900}"}
+                            response = {"display": display, "clip": viewer_clip(slot, columns)}
                     elif group is None:
                         raise ValueError("open a window first")
                     else:
@@ -567,7 +593,9 @@ async def backend(args):
             raise RuntimeError("PANTHEON_CAMOUFOX must point to the packaged executable")
         playwright = await async_playwright().start()
         browser = await playwright.firefox.launch_persistent_context(str(args.shared_root / "profile"), executable_path=executable, headless=False, accept_downloads=True,
-            viewport={"width": 1280, "height": 720},
+            # Let page layout track the real, placed window rather than emulating a
+            # smaller viewport inside the Full HD desktop. Chrome uses some height.
+            no_viewport=True,
             firefox_user_prefs={"browser.shell.checkDefaultBrowser": False, "browser.startup.homepage_override.mstone": "ignore",
                 "browser.cache.disk.enable": True, "browser.cache.disk.capacity": 262144,
                 "browser.link.open_newwindow": 3, "browser.link.open_newwindow.restriction": 0})
