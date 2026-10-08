@@ -19,6 +19,7 @@ from pathlib import Path
 import socket
 import io
 import re
+import shlex
 import subprocess
 import sys
 import uuid
@@ -190,6 +191,9 @@ async def run(args):
 
     children = []
     writer = None
+    disconnect_server = None
+    disconnect_tasks = set()
+    disconnect_path = args.profile / "clipboard-disconnect.sock"
     token_file = args.profile / "viewer.tokens"
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -211,7 +215,11 @@ async def run(args):
             raise RuntimeError("browser port range exhausted by existing listeners")
         listener.listen(128)
         reader, writer = await asyncio.open_unix_connection(str(args.shared_root / "backend.sock"))
+        rpc_lock = asyncio.Lock()
         async def rpc(request):
+            async with rpc_lock:
+                return await unlocked_rpc(request)
+        async def unlocked_rpc(request):
             writer.write((json.dumps(request) + "\n").encode())
             await writer.drain()
             frame = await reader.readline()
@@ -225,8 +233,30 @@ async def run(args):
         display = ready["display"]
         control_file = args.profile / "viewer.control"
         control_file.write_text("")
+        # x11vnc invokes this hook for every departing viewer. Keep the clipboard
+        # on the owning backend connection; never clear a different group's lease.
+        async def disconnected(reader, event_writer):
+            try:
+                if await asyncio.wait_for(reader.readline(), 2) == b"clear\n":
+                    await rpc({"action": "clear_clipboard"})
+            except Exception:
+                pass  # Window teardown also clears the selection in the backend.
+            finally:
+                event_writer.close()
+                with contextlib.suppress(Exception):
+                    await event_writer.wait_closed()
+        def start_disconnected(reader, event_writer):
+            task = asyncio.create_task(disconnected(reader, event_writer))
+            disconnect_tasks.add(task)
+            task.add_done_callback(disconnect_tasks.discard)
+        disconnect_path.unlink(missing_ok=True)
+        disconnect_server = await asyncio.start_unix_server(start_disconnected, path=str(disconnect_path))
+        disconnect_path.chmod(0o600)
+        gone = shlex.join([sys.executable, __file__, "--clipboard-disconnect", str(disconnect_path), "--web", str(args.web)])
         # -autoport starts at 5900 and lets the OS choose; parse x11vnc's PORT frame.
-        vnc = start([os.environ.get("PANTHEON_X11VNC", "x11vnc"), "-display", display, "-localhost", "-autoport", "5900", "-forever", "-shared", "-nopw", "-viewonly", "-quiet", "-clip", ready["clip"], "-connect", str(control_file), "-novncconnect", "-nosel", "-nowireframe", "-noscrollcopyrect"], stdout=subprocess.PIPE)
+        # This is our private Xvfb, with no login/display manager. Initialize
+        # selection ownership immediately rather than x11vnc's 45s DM grace period.
+        vnc = start([os.environ.get("PANTHEON_X11VNC", "x11vnc"), "-display", display, "-localhost", "-autoport", "5900", "-forever", "-shared", "-nopw", "-viewonly", "-quiet", "-clip", ready["clip"], "-connect", str(control_file), "-novncconnect", "-seldir", "recv", "-nosetprimary", "-input", "KMBC,", "-gone", gone, "-nowireframe", "-noscrollcopyrect"], stdout=subprocess.PIPE, env=dict(os.environ, X11VNC_AVOID_WINDOWS="never"))
         children.append(vnc)
         async def vnc_port():
             while True:
@@ -245,6 +275,10 @@ async def run(args):
         children.append(proxy)
         listener.close()
         await wait_listener(args.port, proxy)
+        async def viewer_control(control):
+            result = await asyncio.create_subprocess_exec(os.environ.get("PANTHEON_X11VNC", "x11vnc"), "-display", display, "-connect", str(control_file), "-sync", "-R", control, stdout=sys.stderr, stderr=sys.stderr)
+            if await result.wait() != 0:
+                raise RuntimeError("failed to change browser viewer ownership")
         human = False
         emit({"ready": True, "display": display, "port": args.port, "profile": "pantheon-shared"})
         while True:
@@ -257,6 +291,7 @@ async def run(args):
                 if any(child.poll() is not None for child in children):
                     raise RuntimeError("a browser desktop component exited; close and reopen this browser")
                 if action == "close":
+                    await viewer_control("viewonly")
                     await rpc({"action": "close"})
                     emit({"closed": True})
                     break
@@ -265,9 +300,7 @@ async def run(args):
                         human = True  # A partially applied VNC command fails closed.
                         await rpc({"action": "handoff"})
                     control = "noviewonly" if action == "handoff" else "viewonly"
-                    result = await asyncio.create_subprocess_exec(os.environ.get("PANTHEON_X11VNC", "x11vnc"), "-display", display, "-connect", str(control_file), "-sync", "-R", control, stdout=sys.stderr, stderr=sys.stderr)
-                    if await result.wait() != 0:
-                        raise RuntimeError("failed to change browser viewer ownership")
+                    await viewer_control(control)
                     if action == "resume":
                         await rpc({"action": "resume"})
                     human = action == "handoff"
@@ -281,11 +314,17 @@ async def run(args):
             except Exception as error:
                 emit({"error": str(error)[:2000]})
     finally:
+        if disconnect_server:
+            disconnect_server.close()
+            # Python 3.13+ waits for accepted transports too. Cancel hooks before
+            # waiting, especially if a dead backend left one waiting for RPC.
+            pending = list(disconnect_tasks)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            await disconnect_server.wait_closed()
+        disconnect_path.unlink(missing_ok=True)
         listener.close()
-        if writer:
-            writer.close()
-            with contextlib.suppress(Exception):
-                await writer.wait_closed()
         for child in reversed(children):
             with contextlib.suppress(ProcessLookupError):
                 child.terminate()
@@ -295,6 +334,11 @@ async def run(args):
             except asyncio.TimeoutError:
                 child.kill()
                 await asyncio.to_thread(child.wait)
+        # Stop interactive viewers before releasing backend focus/selection ownership.
+        if writer:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
         token_file.unlink(missing_ok=True)
 
 
@@ -317,6 +361,9 @@ class XWindows:
             ("XGetWindowProperty", ctypes.c_int, [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_long, ctypes.c_long, ctypes.c_int, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_void_p)]),
             ("XFree", ctypes.c_int, [ctypes.c_void_p]),
             ("XMoveResizeWindow", ctypes.c_int, [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint]),
+            ("XSetSelectionOwner", ctypes.c_int, [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]),
+            ("XDeleteProperty", ctypes.c_int, [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong]),
+            ("XSync", ctypes.c_int, [ctypes.c_void_p, ctypes.c_int]),
             ("XFlush", ctypes.c_int, [ctypes.c_void_p]),
             ("XCloseDisplay", ctypes.c_int, [ctypes.c_void_p]),
         ):
@@ -355,6 +402,17 @@ class XWindows:
     def place(self, window, slot, columns):
         self.x.XMoveResizeWindow(self.display, window, *window_geometry(slot, columns))
         self.x.XFlush(self.display)
+
+    def clear_clipboard(self):
+        # X selections are display-wide. Drop both owners plus legacy cut buffers
+        # before releasing keyboard focus, so the next window cannot paste a secret.
+        for name in ("CLIPBOARD", "PRIMARY", "SECONDARY"):
+            atom = self.x.XInternAtom(self.display, name.encode(), 0)
+            self.x.XSetSelectionOwner(self.display, atom, 0, 0)
+        for index in range(8):
+            atom = self.x.XInternAtom(self.display, f"CUT_BUFFER{index}".encode(), 0)
+            self.x.XDeleteProperty(self.display, self.root, atom)
+        self.x.XSync(self.display, 0)
 
     def close(self):
         self.x.XCloseDisplay(self.display)
@@ -445,6 +503,8 @@ async def backend(args):
 
     async def close_group(group):
         groups.pop(group.identity, None)
+        if group.human and x:
+            x.clear_clipboard()
         group.human = False
         if stopping:
             return
@@ -458,15 +518,23 @@ async def backend(args):
         if action == "close":
             await close_group(group)
             return {"closed": True}
+        if action == "clear_clipboard":
+            if group.human:
+                x.clear_clipboard()
+            return {"done": True}
         if action == "handoff":
             async with focus:
                 if any(other.human and other is not group for other in groups.values()):
                     raise RuntimeError("another window has human input ownership; resume it first")
+                x.clear_clipboard()
                 group.human = True
                 if group.live():
                     await group.pages[group.active].bring_to_front()
             return {"state": "human"}
         if action == "resume":
+            if not group.human:
+                raise RuntimeError("this window has no human input lease")
+            x.clear_clipboard()
             for identity, page in group.live().items():
                 if await page.evaluate("document.visibilityState") == "visible":
                     group.active = identity
@@ -658,6 +726,7 @@ async def backend(args):
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser()
+    parser.add_argument("--clipboard-disconnect", type=Path)
     parser.add_argument("--profile", type=Path)
     parser.add_argument("--shared-root", type=Path)
     parser.add_argument("--workspace", type=Path)
@@ -670,6 +739,13 @@ def main():
     parser.add_argument("--proxy-fd", type=int)
     parser.add_argument("--token-file", type=Path)
     args = parser.parse_args()
+    if args.clipboard_disconnect is not None:
+        with contextlib.suppress(OSError):
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as notification:
+                notification.settimeout(2)
+                notification.connect(str(args.clipboard_disconnect))
+                notification.sendall(b"clear\n")
+        return
     if args.proxy_fd is not None:
         from websockify.websocketproxy import WebSocketProxy
         from websockify.token_plugins import TokenFile
