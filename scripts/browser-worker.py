@@ -187,6 +187,16 @@ async def wait_listener(port, process):
     raise RuntimeError("desktop listener did not start")
 
 
+class BrowserUnavailable(RuntimeError):
+    """Terminal session error: never retry a page action automatically."""
+
+
+def browser_health_error(closed, connected=True):
+    if closed or not connected:
+        return "shared browser context closed; close and reopen this browser_id (profile retained)"
+    return None
+
+
 async def run(args):
 
     children = []
@@ -220,14 +230,18 @@ async def run(args):
             async with rpc_lock:
                 return await unlocked_rpc(request)
         async def unlocked_rpc(request):
-            writer.write((json.dumps(request) + "\n").encode())
-            await writer.drain()
-            frame = await reader.readline()
-            if not frame:
-                raise RuntimeError("shared browser backend exited")
-            response = json.loads(frame)
+            try:
+                writer.write((json.dumps(request) + "\n").encode())
+                await writer.drain()
+                frame = await reader.readline()
+                if not frame:
+                    raise BrowserUnavailable("shared browser backend exited; close and reopen this browser_id (profile retained)")
+                response = json.loads(frame)
+            except (OSError, ValueError) as error:
+                raise BrowserUnavailable("shared browser backend connection lost; close and reopen this browser_id (profile retained)") from error
             if "error" in response:
-                raise RuntimeError(response["error"])
+                error_type = BrowserUnavailable if response.get("fatal") else RuntimeError
+                raise error_type(response["error"])
             return response
         ready = await rpc({"action": "open", "browser_id": args.profile.name})
         display = ready["display"]
@@ -289,7 +303,7 @@ async def run(args):
                 request = json.loads(line)
                 action = request.get("action")
                 if any(child.poll() is not None for child in children):
-                    raise RuntimeError("a browser desktop component exited; close and reopen this browser")
+                    raise BrowserUnavailable("a browser desktop component exited; close and reopen this browser_id (profile retained)")
                 if action == "close":
                     await viewer_control("viewonly")
                     await rpc({"action": "close"})
@@ -306,13 +320,16 @@ async def run(args):
                     human = action == "handoff"
                     emit({"state": "human" if human else "agent"})
                     continue
+                if action == "health":
+                    emit(await rpc(request))
+                    continue
                 if human:
                     raise RuntimeError("automation paused while human owns browser")
                 if action == "screenshot":
                     request["path"] = str(args.profile / ("screenshot-" + uuid.uuid4().hex + ".png"))
                 emit(await rpc(request))
             except Exception as error:
-                emit({"error": str(error)[:2000]})
+                emit({"error": str(error)[:2000], "fatal": isinstance(error, BrowserUnavailable)})
     finally:
         if disconnect_server:
             disconnect_server.close()
@@ -438,6 +455,20 @@ class WindowGroup:
         return self.pages
 
 
+async def close_connections(server, connections):
+    if server:
+        server.close()
+    # Python 3.13+ Server.wait_closed waits for active client connections.
+    # Cancel and close them first; otherwise Firefox death leaves the backend
+    # blocked forever with its profile lock held and viewers falsely alive.
+    tasks = list(connections)
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    if server:
+        await asyncio.wait_for(server.wait_closed(), 5)
+
+
 async def backend(args):
     from playwright.async_api import async_playwright
     args.shared_root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -454,6 +485,7 @@ async def backend(args):
     groups = {}
     stopped = asyncio.Event()
     stopping = False
+    context_closed = False
     opening = asyncio.Lock()
     # Firefox/GTK has one core keyboard focus. Serialize input operations, and
     # do not let another agent steal it during an explicit human lease.
@@ -609,6 +641,7 @@ async def backend(args):
         raise ValueError("unknown browser action")
 
     async def connection(reader, writer):
+        nonlocal context_closed
         task = asyncio.current_task()
         connections.add(task)
         group = None
@@ -616,7 +649,20 @@ async def backend(args):
             while frame := await reader.readline():
                 try:
                     request = json.loads(frame)
-                    if request.get("action") == "open":
+                    health_error = browser_health_error(context_closed,
+                        browser.browser.is_connected() if browser.browser else True)
+                    if health_error:
+                        raise BrowserUnavailable(health_error)
+                    if request.get("action") == "health":
+                        # Cached connection flags do not prove responsiveness.
+                        # This read-only RPC checks liveness without page/focus
+                        # changes or disclosing any cookie values in the reply.
+                        try:
+                            await asyncio.wait_for(browser.cookies(), 3)
+                        except Exception as error:
+                            raise BrowserUnavailable("shared browser health check failed; close and reopen this browser_id (profile retained)") from error
+                        response = {"healthy": True}
+                    elif request.get("action") == "open":
                         async with opening, focus:
                             if group or request["browser_id"] in groups:
                                 raise ValueError("browser window already open")
@@ -637,9 +683,13 @@ async def backend(args):
                     else:
                         response = await act(group, request)
                 except Exception as error:
-                    response = {"error": str(error)[:2000]}
+                    response = {"error": str(error)[:2000], "fatal": isinstance(error, BrowserUnavailable) or context_closed}
                 writer.write((json.dumps(response) + "\n").encode())
                 await writer.drain()
+                if response.get("fatal"):
+                    context_closed = True
+                    stopped.set()
+                    break
                 if request.get("action") == "close":
                     break
         finally:
@@ -679,7 +729,15 @@ async def backend(args):
             task = asyncio.create_task(new_page(page))
             task.add_done_callback(lambda finished: finished.exception() if not finished.cancelled() else None)
         browser.on("page", on_page)
-        browser.on("close", lambda: stopped.set())
+        def on_close():
+            nonlocal context_closed
+            context_closed = True
+            stopped.set()
+        browser.on("close", on_close)
+        # Treat either lifecycle event as terminal and release the profile lock
+        # for explicit reopen; never reconstruct windows or replay page actions.
+        if browser.browser:
+            browser.browser.on("disconnected", on_close)
         server = await asyncio.start_unix_server(connection, path=str(socket_path), limit=1_000_000)
         socket_path.chmod(0o600)
         emit({"ready": True, "display": display, "profile": "pantheon-shared"})
@@ -699,18 +757,13 @@ async def backend(args):
         raise
     finally:
         stopping = True
-        if server:
-            server.close()
-            await server.wait_closed()
-        for task in list(connections):
-            task.cancel()
-        await asyncio.gather(*list(connections), return_exceptions=True)
+        await close_connections(server, connections)
         if browser:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(browser.close(), 10)
         if playwright:
             with contextlib.suppress(Exception):
-                await playwright.stop()
+                await asyncio.wait_for(playwright.stop(), 10)
         if x:
             x.close()
         display_server.terminate()

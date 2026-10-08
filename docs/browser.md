@@ -117,3 +117,19 @@ The environment file holds `DISCORD_TOKEN` and any selected API provider keys. C
 The package supplies Bash, coreutils, Git, ripgrep, curl and findutils on the agent PATH. Add project-specific tools through `services.pantheon.extraPackages = [ pkgs.cargo pkgs.nodejs ];`. `pantheon doctor` checks the packaged executable, worker, noVNC files and required commands without making API calls.
 
 Supported Nix targets are x86_64 Linux and aarch64 Linux. The browser derivation pins Camoufox `156.0.1-beta.34`, validates architecture-specific release SHA256 digests and patches ELF dependencies into the immutable closure. Playwright and noVNC are fixed by `flake.lock`. Driver compatibility is checked with the shipped browser, rather than depending on a separately downloaded stock Firefox. Pantheon uses Camoufox's patched browser through Playwright directly; it does not promise wrapper-generated anti-detection fingerprints.
+
+## Unavailable browsers and explicit recovery
+
+`list` probes each owned worker and the shared browser context without creating
+pages, changing focus, or interrupting a human handoff. Rows include `health`
+(`healthy` or `unavailable`) and, on failure, `failure` and `recovery` details.
+Unavailable rows have no `view_urls`: a surviving viewer process is not evidence
+that Firefox is alive. `state` still records agent/human ownership; a failed
+browser does not discard its human lease or transfer ownership.
+
+If the context, desktop component, or worker dies, or an action times out, close
+that `browser_id`, then explicitly reopen it with `open`. Close cleans up the
+viewer even when its backend no longer responds. The shared profile is retained;
+new viewer tokens are issued. Tabs and unsaved state may be lost in a crash.
+No navigation, click, typing, or other mutation is automatically replayed.
+Check the site's persisted state before repeating an uncertain action.

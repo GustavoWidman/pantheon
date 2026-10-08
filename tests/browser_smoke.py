@@ -437,7 +437,53 @@ def main():
             backend.stdin.write("shutdown\n")
             backend.stdin.flush()
             assert backend.wait(timeout=20) == 0
-            print("PASS: Full HD framebuffers, real-window viewport, separated window edges, shared live cookies/storage/logout, private viewer pixels, tab ownership, scoped handoff and receive-only lease clipboard/paste/disconnect cleanup, independent close, screenshot, authenticated file download/upload bytes and confirmed receipt, restart durability")
+            # Kill only the Firefox main process descended from this test's
+            # isolated backend. No live harness services/profiles are touched.
+            backend, _ = process(["--backend", "--workspace", str(state), "--shared-root", str(shared), "--capacity", "4"])
+            crashed, _, _ = window("crashed")
+            leased, _, _ = window("leased")
+            call(leased, "handoff")
+            assert call(leased, "health")["healthy"]
+            parents = {}
+            for entry in Path("/proc").iterdir():
+                if entry.name.isdigit():
+                    with contextlib.suppress(OSError, ValueError):
+                        fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+                        parents[int(entry.name)] = int(fields[1])
+            descendants = {backend.pid}
+            while True:
+                expanded = descendants | {pid for pid, parent in parents.items() if parent in descendants}
+                if expanded == descendants:
+                    break
+                descendants = expanded
+            firefox = []
+            for pid in descendants - {backend.pid}:
+                with contextlib.suppress(OSError):
+                    argv = (Path("/proc") / str(pid) / "cmdline").read_bytes().split(b"\0")
+                    if argv[0].decode() == os.environ["PANTHEON_CAMOUFOX"] and b"-juggler-pipe" in argv:
+                        firefox.append(pid)
+            assert len(firefox) == 1, firefox
+            os.kill(firefox[0], 9)
+            # Teardown must finish even while client RPC sockets remain open.
+            # Waiting for server closure before closing clients deadlocks here.
+            backend.wait(timeout=30)
+            for child in (crashed, leased):
+                child.stdin.write(json.dumps({"action": "health"}) + "\n")
+                child.stdin.flush()
+                failure = json.loads(child.stdout.readline())
+                assert failure.get("fatal") and "close and reopen" in failure["error"], failure
+                child.stdin.close()
+                assert child.wait(timeout=15) == 0
+            backend, _ = process(["--backend", "--workspace", str(state), "--shared-root", str(shared), "--capacity", "4"])
+            recovered, _, _ = window("crashed")
+            call(recovered, "navigate", url=url + "/red")
+            assert "session=shared" in call(recovered, "snapshot")["snapshot"]
+            call(recovered, "close")
+            assert recovered.wait(timeout=15) == 0
+            backend.stdin.write("shutdown\n")
+            backend.stdin.flush()
+            assert backend.wait(timeout=20) == 0
+            print("PASS: Full HD framebuffers, real-window viewport, separated window edges, shared live cookies/storage/logout, private viewer pixels, tab ownership, scoped handoff and receive-only lease clipboard/paste/disconnect cleanup, independent close, screenshot, authenticated file download/upload bytes and confirmed receipt, restart durability, isolated Firefox death, fatal health under handoff, explicit recovery")
         except Exception:
             log.flush()
             log.seek(0)

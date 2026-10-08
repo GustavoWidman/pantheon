@@ -81,7 +81,7 @@ struct Session {
     port: u16,
     token: String,
     lease: Option<String>,
-    poisoned: bool,
+    failure: Option<String>,
     process_group_id: i32,
     group_terminated: bool,
     process: Child,
@@ -109,8 +109,12 @@ impl Session {
         if self.owner != owner {
             bail!("browser belongs to a different agent");
         }
-        if self.poisoned && action != "close" {
-            bail!("browser worker timed out; close and reopen its persistent profile");
+        if let Some(reason) = &self.failure
+            && action != "close"
+        {
+            bail!(
+                "browser unavailable: {reason}; close and reopen this browser_id. Inspect remote state before retrying an uncertain action"
+            );
         }
         if self.lease.is_some() && !matches!(action, "resume" | "handoff" | "close") {
             bail!(
@@ -130,26 +134,60 @@ impl Session {
             if self.output.read_line(&mut line).await? == 0 {
                 bail!("browser worker exited");
             }
-            let reply: Value =
-                serde_json::from_str(&line).context("invalid browser worker response")?;
-            if let Some(error) = reply.get("error").and_then(Value::as_str) {
-                bail!("{error}");
-            }
-            Ok(reply)
+            serde_json::from_str::<Value>(&line).context("invalid browser worker response")
         })
         .await;
-        match result {
-            Ok(result) => result,
+        let reply = match result {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(error)) => {
+                self.failure = Some(error.to_string());
+                bail!(
+                    "browser unavailable: {error}; close and reopen this browser_id. Inspect remote state before retrying an uncertain action"
+                )
+            }
             Err(_) => {
                 // A timed-out frame must never be mistaken for the next action's reply.
-                self.poisoned = true;
-                bail!("browser action timed out; close and reopen its persistent profile")
+                self.failure = Some("browser action timed out".into());
+                bail!(
+                    "browser action timed out; close and reopen this browser_id. Inspect remote state before retrying an uncertain action"
+                )
             }
+        };
+        if let Some(error) = reply.get("error").and_then(Value::as_str) {
+            if reply.get("fatal") == Some(&Value::Bool(true)) {
+                self.failure = Some(error.to_owned());
+                bail!(
+                    "browser unavailable: {error}; close and reopen this browser_id. Inspect remote state before retrying an uncertain action"
+                );
+            }
+            bail!("{error}");
+        }
+        Ok(reply)
+    }
+    async fn check_health(&mut self, duration: Duration) {
+        if self.failure.is_some() {
+            return;
+        }
+        match self.process.try_wait() {
+            Ok(None) => {
+                // Read-only, no page creation or focus changes, including during human leases.
+                match self.request(&json!({"action":"health"}), duration).await {
+                    Ok(reply) if reply.get("healthy") == Some(&Value::Bool(true)) => {}
+                    Ok(_) => self.failure = Some("invalid browser health response".into()),
+                    Err(error) if self.failure.is_none() => self.failure = Some(error.to_string()),
+                    Err(_) => {}
+                }
+            }
+            Ok(Some(status)) => self.failure = Some(format!("browser worker exited: {status}")),
+            Err(error) => self.failure = Some(format!("cannot check browser worker: {error}")),
         }
     }
     fn info(&self) -> Value {
         json!({"browser_id": self.id, "state": if self.lease.is_some() { "human" } else { "agent" },
-            "view_urls": candidate_urls(self.port, &self.token),
+            "health": if self.failure.is_some() { "unavailable" } else { "healthy" },
+            "failure": self.failure,
+            "recovery": self.failure.as_ref().map(|_| "Close then reopen this browser_id; profile retained. Inspect remote state before retrying uncertain actions."),
+            "view_urls": if self.failure.is_some() { Vec::new() } else { candidate_urls(self.port, &self.token) },
             "reachability": "candidate interface addresses; remote firewall/routing reachability is not verified",
             "profile_persistent": true, "profile": "pantheon-shared", "profile_shared": true,
             "view_only": self.lease.is_none()})
@@ -293,8 +331,11 @@ impl BrowserManager {
             let sessions: Vec<_> = self.sessions.lock().await.values().cloned().collect();
             let mut rows = Vec::new();
             for session in sessions {
-                let session = session.lock().await;
+                let mut session = session.lock().await;
                 if session.owner == owner {
+                    session
+                        .check_health(Duration::from_secs(self.config.action_timeout_secs))
+                        .await;
                     rows.push(session.info());
                 }
             }
@@ -355,7 +396,12 @@ impl BrowserManager {
             }
             "close" => {
                 // Close this window only. The backend flushes the shared profile at shutdown.
-                let outcome = session.request(&json!({"action":"close"}), deadline).await;
+                // Unavailable sessions still retain owner/lease until this explicit close.
+                let outcome = if session.failure.is_some() {
+                    Ok(json!({"closed":true}))
+                } else {
+                    session.request(&json!({"action":"close"}), deadline).await
+                };
                 #[cfg(unix)]
                 {
                     unsafe {
@@ -366,17 +412,12 @@ impl BrowserManager {
                 let _ = session.process.wait().await;
                 drop(session);
                 self.sessions.lock().await.remove(&id);
-                outcome.map(|_| json!({"closed":id,"profile_retained":true}))
+                Ok(
+                    json!({"closed":id,"profile_retained":true,"worker_error":outcome.err().map(|error| error.to_string())}),
+                )
             }
             "navigate" | "snapshot" | "click" | "type" | "screenshot" | "tabs" | "new_tab"
-            | "select_tab" | "close_tab" | "upload" | "download" => {
-                let result = session.request(&request, deadline).await;
-                if result.is_err() && session.process.try_wait()?.is_some() {
-                    drop(session);
-                    self.sessions.lock().await.remove(&id);
-                }
-                result
-            }
+            | "select_tab" | "close_tab" | "upload" | "download" => session.request(&request, deadline).await,
             _ => bail!("unknown browser action: {action}"),
         }
     }
@@ -474,7 +515,7 @@ impl BrowserManager {
             port,
             token,
             lease: None,
-            poisoned: false,
+            failure: None,
             process_group_id,
             group_terminated: false,
             process,
@@ -605,6 +646,40 @@ impl BrowserManager {
         }
     }
 }
+pub fn describe_browser(b: &Value) -> String {
+    if let Some(id) = b["closed"].as_str() {
+        return format!("Closed `{id}`; its profile is retained.");
+    }
+    if b["health"] == "unavailable" {
+        return format!(
+            "Browser `{}` · unavailable (ownership: {})\n{}\n{}",
+            b["browser_id"].as_str().unwrap_or(""),
+            b["state"].as_str().unwrap_or(""),
+            b["failure"].as_str().unwrap_or("Browser connection lost"),
+            b["recovery"]
+                .as_str()
+                .unwrap_or("Close then reopen this browser_id.")
+        );
+    }
+    let links = b["view_urls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|url| format!("<{url}>"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let lease = b["resume_token"]
+        .as_str()
+        .map(|t| format!("\nResume token: `{t}` — resume only when finished."))
+        .unwrap_or_default();
+    format!(
+        "Browser `{}` · {}\n{links}{lease}",
+        b["browser_id"].as_str().unwrap_or(""),
+        b["state"].as_str().unwrap_or("")
+    )
+}
+
 fn candidate_urls(port: u16, token: &str) -> Vec<String> {
     let mut addresses = BTreeSet::from(["127.0.0.1".to_owned()]);
     if let Ok(interfaces) = if_addrs::get_if_addrs() {
@@ -621,6 +696,19 @@ fn candidate_urls(port: u16, token: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unavailable_browser_summary_shows_recovery_not_stale_viewer_links() {
+        let description = describe_browser(&json!({
+            "browser_id":"test", "state":"human", "health":"unavailable",
+            "failure":"shared context closed", "recovery":"Close then reopen this browser_id.",
+            "view_urls":["http://stale.example/"], "resume_token":"lease"
+        }));
+        assert!(description.contains("unavailable (ownership: human)"));
+        assert!(description.contains("shared context closed"));
+        assert!(description.contains("Close then reopen"));
+        assert!(!description.contains("stale.example"));
+        assert!(!description.contains("Resume token"));
+    }
     #[test]
     fn viewer_urls_include_localhost_and_secret_path() {
         let urls = candidate_urls(6080, "test-secret");
@@ -719,7 +807,7 @@ print(json.dumps({'ready':True,'display':':123'}),flush=True)
 for line in sys.stdin:
     if line.strip()=='shutdown':break
     request=json.loads(line)
-    print(json.dumps({'done':True}),flush=True)
+    print(json.dumps({'done':True,'healthy':True}),flush=True)
     if request['action']=='close':break
 "#,
         )
@@ -831,6 +919,221 @@ for line in sys.stdin:
         manager.shutdown().await;
     }
     #[tokio::test]
+    async fn unavailable_sessions_keep_ownership_and_human_lease_until_explicit_close() {
+        let directory = tempfile::tempdir().unwrap();
+        let worker = directory.path().join("mock.py");
+        std::fs::write(
+            &worker,
+            r#"
+import json, sys
+from pathlib import Path
+root=Path(__file__).parent
+print(json.dumps({'ready':True,'display':':123'}),flush=True)
+for line in sys.stdin:
+    if line.strip()=='shutdown':break
+    request=json.loads(line)
+    with (root/'requests.jsonl').open('a') as log: log.write(line)
+    if (root/'dead').exists():
+        print(json.dumps({'error':'shared browser context closed','fatal':True}),flush=True)
+    else:
+        print(json.dumps({'done':True,'healthy':True}),flush=True)
+    if request['action']=='close':break
+"#,
+        )
+        .unwrap();
+        let manager = BrowserManager::new(
+            directory.path().join("profiles"),
+            BrowserConfig {
+                worker,
+                ..Default::default()
+            },
+        );
+        let browser = manager
+            .execute("child", json!({"action":"open"}))
+            .await
+            .unwrap();
+        let id = browser["browser_id"].as_str().unwrap();
+        let handoff = manager
+            .execute("child", json!({"action":"handoff","browser_id":id}))
+            .await
+            .unwrap();
+        std::fs::write(directory.path().join("dead"), "").unwrap();
+        manager.transfer_owner("child", "root").await.unwrap();
+        let rows = manager
+            .execute("root", json!({"action":"list"}))
+            .await
+            .unwrap();
+        assert_eq!(rows["browsers"][0]["health"], "unavailable");
+        assert_eq!(rows["browsers"][0]["state"], "human");
+        assert_eq!(rows["browsers"][0]["view_urls"], json!([]));
+        assert!(
+            rows["browsers"][0]["recovery"]
+                .as_str()
+                .unwrap()
+                .contains("Inspect remote state")
+        );
+        let session = manager.sessions.lock().await.get(id).unwrap().clone();
+        assert_eq!(
+            session.lock().await.lease.as_deref(),
+            handoff["resume_token"].as_str()
+        );
+        assert!(
+            manager
+                .execute("child", json!({"action":"close","browser_id":id}))
+                .await
+                .is_err()
+        );
+        let requests = std::fs::read(directory.path().join("requests.jsonl")).unwrap();
+        for action in ["click", "resume"] {
+            let error = manager
+                .execute(
+                    "root",
+                    json!({"action":action,"browser_id":id,"resume_token":handoff["resume_token"]}),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("close and reopen"));
+        }
+        // Neither uncertain mutations nor lease resumption are replayed on a failed worker.
+        assert_eq!(
+            std::fs::read(directory.path().join("requests.jsonl")).unwrap(),
+            requests
+        );
+        assert!(
+            manager
+                .execute("root", json!({"action":"open","browser_id":id}))
+                .await
+                .is_err()
+        );
+        manager
+            .execute("root", json!({"action":"close","browser_id":id}))
+            .await
+            .unwrap();
+        std::fs::remove_file(directory.path().join("dead")).unwrap();
+        let reopened = manager
+            .execute("root", json!({"action":"open","browser_id":id}))
+            .await
+            .unwrap();
+        assert_eq!(reopened["health"], "healthy");
+        assert_eq!(reopened["state"], "agent");
+        assert_ne!(reopened["view_urls"], browser["view_urls"]);
+        manager.shutdown().await;
+    }
+    #[tokio::test]
+    async fn uncertain_timed_out_action_is_not_replayed_or_advertised_as_live() {
+        let directory = tempfile::tempdir().unwrap();
+        let worker = directory.path().join("mock.py");
+        std::fs::write(
+            &worker,
+            r#"
+import json, sys, time
+from pathlib import Path
+print(json.dumps({'ready':True,'display':':123'}),flush=True)
+for line in sys.stdin:
+    if line.strip()=='shutdown':break
+    request=json.loads(line)
+    if request['action']=='click':
+        with (Path(__file__).parent/'clicked').open('a') as output: output.write('clicked\n')
+        time.sleep(2)
+    print(json.dumps({'healthy':True}),flush=True)
+"#,
+        )
+        .unwrap();
+        let manager = BrowserManager::new(
+            directory.path().join("profiles"),
+            BrowserConfig {
+                worker,
+                ..Default::default()
+            },
+        );
+        let browser = manager
+            .execute("root", json!({"action":"open"}))
+            .await
+            .unwrap();
+        let id = browser["browser_id"].as_str().unwrap();
+        let session = manager.sessions.lock().await.get(id).unwrap().clone();
+        let error = session
+            .lock()
+            .await
+            .request(&json!({"action":"click"}), Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Inspect remote state"));
+        let rows = manager
+            .execute("root", json!({"action":"list"}))
+            .await
+            .unwrap();
+        assert_eq!(rows["browsers"][0]["health"], "unavailable");
+        assert_eq!(rows["browsers"][0]["view_urls"], json!([]));
+        assert!(
+            manager
+                .execute("root", json!({"action":"click","browser_id":id}))
+                .await
+                .is_err()
+        );
+        manager
+            .execute("root", json!({"action":"close","browser_id":id}))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("clicked")).unwrap(),
+            "clicked\n"
+        );
+        manager.shutdown().await;
+    }
+    #[tokio::test]
+    async fn list_detects_exited_workers_and_close_still_retains_profile() {
+        let directory = tempfile::tempdir().unwrap();
+        let worker = directory.path().join("mock.py");
+        std::fs::write(
+            &worker,
+            r#"
+import json, sys
+print(json.dumps({'ready':True,'display':':123'}),flush=True)
+for line in sys.stdin:
+    if line.strip()=='shutdown':break
+    print(json.dumps({'healthy':True}),flush=True)
+"#,
+        )
+        .unwrap();
+        let manager = BrowserManager::new(
+            directory.path().join("profiles"),
+            BrowserConfig {
+                worker,
+                ..Default::default()
+            },
+        );
+        let browser = manager
+            .execute("root", json!({"action":"open"}))
+            .await
+            .unwrap();
+        let id = browser["browser_id"].as_str().unwrap();
+        let session = manager.sessions.lock().await.get(id).unwrap().clone();
+        {
+            let mut session = session.lock().await;
+            session.process.kill().await.unwrap();
+        }
+        let rows = manager
+            .execute("root", json!({"action":"list"}))
+            .await
+            .unwrap();
+        assert_eq!(rows["browsers"][0]["health"], "unavailable");
+        assert_eq!(rows["browsers"][0]["view_urls"], json!([]));
+        manager
+            .execute("root", json!({"action":"close","browser_id":id}))
+            .await
+            .unwrap();
+        assert!(
+            directory
+                .path()
+                .join("profiles")
+                .join(id)
+                .join("owner.json")
+                .is_file()
+        );
+        manager.shutdown().await;
+    }
+    #[tokio::test]
     async fn completed_child_browsers_are_adopted_without_interrupting_handoff() {
         let directory = tempfile::tempdir().unwrap();
         let worker = directory.path().join("mock.py");
@@ -842,7 +1145,7 @@ print(json.dumps({'ready':True,'display':':123'}),flush=True)
 for line in sys.stdin:
     if line.strip()=='shutdown':break
     request=json.loads(line)
-    print(json.dumps({'done':True}),flush=True)
+    print(json.dumps({'done':True,'healthy':True}),flush=True)
     if request['action']=='close':break
 "#,
         )
