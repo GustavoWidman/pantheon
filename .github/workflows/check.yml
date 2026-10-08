@@ -26,7 +26,13 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           PR_TITLE: ${{ github.event.pull_request.title }}
-        run: python3 .github/scripts/version.py commits --base "$BASE_SHA" --head "$HEAD_SHA"
+        run: |
+          # A force-push can remove the previous head from advertised refs.
+          # fetch-depth: 0 does not guarantee that commit is in this checkout.
+          if [[ -n "$BASE_SHA" && ! "$BASE_SHA" =~ ^0+$ ]] && ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            git fetch --no-tags origin "$BASE_SHA"
+          fi
+          python3 .github/scripts/version.py commits --base "$BASE_SHA" --head "$HEAD_SHA"
   nix:
     runs-on: ubuntu-latest
     steps:
