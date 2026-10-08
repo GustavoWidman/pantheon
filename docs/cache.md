@@ -4,13 +4,16 @@ Pantheon keeps OptChat's strict fresh-turn loop. Ordinary conversation takes a
 settled memory view before logging the new input, then creates a new provider
 conversation. It does not retain the previous native conversation for short chats.
 Short kind-prefixed messages fitting 512 bytes become verbatim tree leaves without
-a model call. Older adjacent summaries merge as the view needs room. Originals
+a model call. Older adjacent summaries merge in batches after the view exceeds its high watermark. Originals
 remain durable and accessible through `zoom`.
 
 Fresh conversations can still reuse an unchanged prompt prefix. Constant system
 instructions and tool schemas precede the memory view. Appending recent leaves
-preserves older view text; merging changes the prefix from the first modified line
-onward. Compaction does not inherently invalidate every earlier token. Within a
+preserves older view text; batches merge from 128,000 down to 64,000 rendered
+bytes by default. Pairs are ranked from their last message, preserving old lines
+longer. A batch changes the prefix from the first modified line onward. The exact
+view partition and unfinished-batch state survive restart in `view.json`; only
+legacy chats without a checkpoint need a one-time migration fold. Compaction does not inherently invalidate every earlier token. Within a
 tool loop, Pantheon replays the complete native transcript, including encrypted
 reasoning/signatures, with queued steering after the outstanding tool results.
 
@@ -51,3 +54,10 @@ The public API's current prefix matching and usage fields are documented in
 [OpenAI prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching).
 The underlying memory/fresh-turn layout follows
 [OptChat](https://gist.github.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449).
+
+The corrected merge priority and batched persistence follow the
+[October 8 recipe revision](https://gist.githubusercontent.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449/raw/3c190e06f34aba0c69f49042c526093269604935/optchat.md).
+Its 98.6% turn-cache figure is an Anthropic cache simulation, not a measured
+Pantheon result. These root-view changes do not adopt the recipe's separate
+16–32 KB compactor view, shared turn/compactor prompt, or four-line Anthropic
+blocks; Pantheon's existing compactor and API block policy remain as documented.

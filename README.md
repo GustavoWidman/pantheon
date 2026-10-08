@@ -2,7 +2,7 @@
 
 # Pantheon
 
-An always-on Discord agent harness in Rust, packaged as a NixOS service. Memory follows [OptChat](https://gist.githubusercontent.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449/raw/f51fe5c910427fd6f384d22823140b1693c76207/optchat.md): an immutable chat log, durable binary summary tree, incremental cache-friendly view, and fresh provider session each turn.
+An always-on Discord agent harness in Rust, packaged as a NixOS service. Memory uses the design in [OptChat](https://gist.githubusercontent.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449/raw/3c190e06f34aba0c69f49042c526093269604935/optchat.md): an immutable chat log, durable binary summary tree, incremental cache-friendly view, and fresh provider session each turn.
 
 Pantheon includes OpenAI Responses and Anthropic Messages adapters, background-only subagents, prompt steering, durable wakeups and change monitors, and bundled Camoufox windows with a shared profile and separate authenticated noVNC viewers. It runs its own agent loop; Prime Agent is not required.
 

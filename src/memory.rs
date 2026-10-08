@@ -19,6 +19,7 @@ pub const VIEW_BYTES: usize = 128_000;
 pub const TOOL_CHARS: usize = 30_000;
 pub const COMPACT: &str = include_str!("compact.txt");
 const PLACEHOLDER: &str = "(not summarized yet: zoom it)";
+const VIEW_FRAME_BYTES: usize = "<chat>\n</chat>".len();
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -101,6 +102,14 @@ struct Node {
     size: usize,
 }
 
+#[derive(Deserialize, Serialize)]
+struct SavedView {
+    version: u32,
+    messages: u64,
+    merging: bool,
+    parts: Vec<NodeKey>,
+}
+
 struct DailyLog {
     directory: PathBuf,
     current: Option<(String, File)>,
@@ -152,6 +161,9 @@ pub struct Memory {
     mergeable: BTreeSet<NodeKey>,
     view_bytes: usize,
     budget: usize,
+    merging: bool,
+    view_path: PathBuf,
+    view_dirty: bool,
     main_log: DailyLog,
     tree_log: DailyLog,
     poisoned: bool,
@@ -257,8 +269,11 @@ impl Memory {
             next_leaf: 0,
             view: Vec::new(),
             mergeable: BTreeSet::new(),
-            view_bytes: 0,
+            view_bytes: VIEW_FRAME_BYTES,
             budget,
+            merging: false,
+            view_path: path.join("view.json"),
+            view_dirty: true,
             main_log: DailyLog {
                 directory: main_dir,
                 current: None,
@@ -269,15 +284,17 @@ impl Memory {
             },
             poisoned: false,
         };
-        // Fold in append order; use the replay's length in the age rule rather
-        // than today's final length. Never retile or split the live view.
-        for index in 0..mem.root.len() {
+        // Restore the exact partition, including an unfinished merge batch.
+        // Only legacy chats without a checkpoint need a one-time fold.
+        let covered = mem.restore_view()?;
+        for index in covered..mem.root.len() {
             let key = NodeKey {
                 level: 0,
                 index: index as u64,
             };
             mem.view_bytes += mem.part_size(key);
             mem.view.push(key);
+            mem.view_dirty = true;
             mem.consider_view_pair(key);
             mem.fit(index as u64 + 1);
         }
@@ -287,6 +304,7 @@ impl Memory {
             mem.consider_parent(key);
         }
         mem.build_free_nodes()?;
+        mem.checkpoint_view()?;
         Ok(mem)
     }
 
@@ -339,10 +357,12 @@ impl Memory {
         let key = NodeKey { level: 0, index };
         self.view_bytes += self.part_size(key);
         self.view.push(key);
+        self.view_dirty = true;
         self.consider_view_pair(key);
         self.update_leaf_ready();
         self.fit(self.root.len() as u64);
         self.build_free_nodes()?;
+        self.checkpoint_view()?;
         Ok(index)
     }
 
@@ -427,7 +447,8 @@ impl Memory {
             key
         );
         self.save_node(key, text.to_owned())?;
-        self.build_free_nodes()
+        self.build_free_nodes()?;
+        self.checkpoint_view()
     }
 
     pub fn is_settled(&self) -> bool {
@@ -615,7 +636,9 @@ impl Memory {
             .binary_search_by_key(&key.start(), |part| part.start())
             .is_ok_and(|index| self.view[index] == key)
         {
-            self.view_bytes = self.view_bytes - self.part_size(key) + node.size;
+            self.view_bytes =
+                self.view_bytes - self.part_size(key) + node.size + line_header_size(key);
+            self.view_dirty = true;
         }
         self.nodes.insert(key, node.text);
         self.ready.remove(&key);
@@ -664,7 +687,7 @@ impl Memory {
     }
 
     fn part_size(&self, key: NodeKey) -> usize {
-        self.nodes.get(&key).map_or(PLACEHOLDER.len(), String::len)
+        self.nodes.get(&key).map_or(PLACEHOLDER.len(), String::len) + line_header_size(key)
     }
 
     fn view_size(&self) -> usize {
@@ -701,14 +724,23 @@ impl Memory {
     }
 
     fn fit(&mut self, total: u64) {
-        // Cached on every append, node completion, and replay step. Never sum
-        // the potentially very large unsummarized view while fitting.
+        // Grow only at the tail until the high watermark; finish a batch down
+        // to half the budget even if its parents arrive across several jobs.
+        if !self.merging && self.view_bytes > self.budget {
+            self.merging = true;
+            self.view_dirty = true;
+        }
+        if !self.merging {
+            return;
+        }
+        let target = self.budget / 2;
         let mut size = self.view_bytes;
-        while size > self.budget {
+        while size > target {
             let mut best: Option<(NodeKey, u64)> = None;
             for &a in &self.mergeable {
-                let age = total.saturating_sub(a.start());
-                // Compare age / 2^(level+2) exactly. u128 protects the cross
+                let last = a.parent().end().expect("built pair has a valid end") - 1;
+                let age = total.saturating_sub(last);
+                // Compare age / 2^level exactly. u128 protects the cross
                 // product; no floating point ties or overflow for long chats.
                 let better = best.as_ref().is_none_or(|(previous, previous_age)| {
                     let due = (age as u128) * previous.count() as u128;
@@ -730,10 +762,94 @@ impl Memory {
                 + self.part_size(parent);
             self.view[index] = parent;
             self.view.remove(index + 1);
+            self.view_dirty = true;
             self.mergeable.remove(&child);
             self.consider_view_pair(parent);
         }
         self.view_bytes = size;
+        if size <= target {
+            self.merging = false;
+            self.view_dirty = true;
+        }
+    }
+
+    fn restore_view(&mut self) -> Result<usize> {
+        let bytes = match fs::read(&self.view_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error.into()),
+        };
+        let saved: SavedView =
+            serde_json::from_slice(&bytes).context("invalid saved memory view")?;
+        ensure!(saved.version == 1, "unsupported saved memory view version");
+        ensure!(
+            saved.messages <= self.root.len() as u64,
+            "saved view exceeds history"
+        );
+        let mut end = 0;
+        for &part in &saved.parts {
+            ensure!(
+                part.count() > 0 && part.start() == end,
+                "saved view has a gap or overlap"
+            );
+            end = part.end().context("saved view range overflow")?;
+            ensure!(
+                end <= saved.messages,
+                "saved view exceeds its message count"
+            );
+            ensure!(
+                part.level == 0 || self.nodes.contains_key(&part),
+                "saved view summary is missing"
+            );
+        }
+        ensure!(
+            end == saved.messages,
+            "saved view does not cover its history"
+        );
+        self.view = saved.parts;
+        self.merging = saved.merging;
+        self.view_dirty = false;
+        self.view_bytes = VIEW_FRAME_BYTES
+            + self
+                .view
+                .iter()
+                .map(|&key| self.part_size(key))
+                .sum::<usize>();
+        for index in 0..self.view.len() {
+            self.consider_view_pair(self.view[index]);
+        }
+        Ok(saved.messages as usize)
+    }
+
+    fn checkpoint_view(&mut self) -> Result<()> {
+        if !self.view_dirty {
+            return Ok(());
+        }
+        let temporary = self.view_path.with_extension("json.tmp");
+        let result = (|| -> Result<()> {
+            let bytes = serde_json::to_vec(&SavedView {
+                version: 1,
+                messages: self.root.len() as u64,
+                merging: self.merging,
+                parts: self.view.clone(),
+            })?;
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            fs::rename(&temporary, &self.view_path)?;
+            File::open(self.view_path.parent().expect("view has a directory"))?.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.poisoned = true;
+            return Err(error.context("view checkpoint failed; reopen memory before writing again"));
+        }
+        self.view_dirty = false;
+        Ok(())
     }
 
     fn render_line(&self, key: NodeKey) -> String {
@@ -746,6 +862,13 @@ impl Memory {
                 .map_or_else(|| PLACEHOLDER.to_owned(), |text| flatten(text))
         )
     }
+}
+
+fn line_header_size(key: NodeKey) -> usize {
+    // id+n| and the terminating newline also consume the view byte budget.
+    key.start().checked_ilog10().unwrap_or(0) as usize
+        + key.count().checked_ilog10().unwrap_or(0) as usize
+        + 5
 }
 
 /// Invalid JSON (including torn UTF-8) is reported and skipped. Repair only the
@@ -1128,7 +1251,7 @@ mod tests {
         for _ in 0..96 {
             let previous = mem.view.clone();
             let old_prefix = mem.render().trim_end_matches("</chat>").to_owned();
-            let was_small = mem.view_size() + 400 < mem.budget;
+            let was_small = !mem.merging && mem.view_size() + 400 <= mem.budget;
             mem.append(Kind::User, &"input ".repeat(120)).unwrap();
             drain(&mut mem);
             assert!(mem.view_size() <= mem.budget);
@@ -1147,83 +1270,188 @@ mod tests {
             }
             assert_eq!(
                 mem.view_bytes,
-                mem.view
-                    .iter()
-                    .map(|&key| mem.part_size(key))
-                    .sum::<usize>()
+                VIEW_FRAME_BYTES
+                    + mem
+                        .view
+                        .iter()
+                        .map(|&key| mem.part_size(key))
+                        .sum::<usize>()
             );
         }
         assert!(mem.view.first().unwrap().level > mem.view.last().unwrap().level);
     }
 
     #[test]
-    fn startup_fold_matches_reference_age_rule_at_every_append() {
+    fn merge_age_uses_pairs_last_message_matching_rollback_push() {
         let temp = TempDir::new().unwrap();
-        {
-            let mut mem = Memory::open(temp.path(), 3000).unwrap();
-            for _ in 0..128 {
-                mem.append(Kind::User, &"original ".repeat(80)).unwrap();
-                drain(&mut mem);
-            }
+        let mut mem = Memory::open(temp.path(), VIEW_BYTES).unwrap();
+        for _ in 0..10 {
+            mem.append(Kind::User, &"original ".repeat(80)).unwrap();
+            drain(&mut mem);
         }
-        let mut mem = Memory::open(temp.path(), 3000).unwrap();
-        let reopened = mem.view.clone();
-        mem.view.clear();
+        // The published counterexample: measuring from the first message
+        // incorrectly selects 0..7 instead of the newest siblings 8 and 9.
+        mem.view = vec![key(2, 0), key(2, 1), key(0, 8), key(0, 9)];
         mem.mergeable.clear();
-        mem.view_bytes = 0;
-        let mut expected = Vec::<NodeKey>::new();
-        for index in 0..mem.root.len() {
-            let total = index as u64 + 1;
-            let leaf = key(0, index as u64);
-            expected.push(leaf);
-            loop {
-                let bytes: usize = expected.iter().map(|key| mem.nodes[key].len()).sum();
-                if bytes <= mem.budget {
-                    break;
-                }
-                let mut best: Option<(usize, f64)> = None;
-                for (index, pair) in expected.windows(2).enumerate() {
-                    let (a, b) = (pair[0], pair[1]);
-                    if a.level == b.level
-                        && a.index % 2 == 0
-                        && b.index == a.index + 1
-                        && mem.nodes.contains_key(&a.parent())
-                    {
-                        let due = (total - a.start()) as f64 / (4 * a.count()) as f64;
-                        if best.is_none_or(|(_, old_due)| due > old_due) {
-                            best = Some((index, due));
-                        }
-                    }
-                }
-                let Some((index, _)) = best else {
-                    break;
-                };
-                expected[index] = expected[index].parent();
-                expected.remove(index + 1);
-            }
-            mem.view_bytes += mem.part_size(leaf);
-            mem.view.push(leaf);
-            mem.consider_view_pair(leaf);
-            mem.fit(total);
-            assert_eq!(mem.view, expected, "cached fold differs at message {index}");
-            let pairs: BTreeSet<_> = mem
-                .view
-                .windows(2)
-                .filter_map(|pair| {
-                    let (a, b) = (pair[0], pair[1]);
-                    (a.level == b.level
-                        && a.index % 2 == 0
-                        && b.index == a.index + 1
-                        && mem.nodes.contains_key(&a.parent()))
-                    .then_some(a)
-                })
-                .collect();
-            assert_eq!(
-                mem.mergeable, pairs,
-                "merge frontier differs at message {index}"
-            );
+        for part in mem.view.clone() {
+            mem.consider_view_pair(part);
         }
-        assert_eq!(reopened, expected);
+        mem.view_bytes = mem.render().len();
+        mem.budget = 2000;
+        mem.merging = true;
+        let prefix = mem.render().split("8+1|").next().unwrap().to_owned();
+        mem.fit(10);
+        assert_eq!(mem.view, vec![key(2, 0), key(2, 1), key(1, 4)]);
+        assert!(mem.render().starts_with(&prefix));
+        assert!(!mem.merging);
+    }
+
+    #[test]
+    fn view_grows_then_batches_to_half_budget_and_survives_restart() {
+        let temp = TempDir::new().unwrap();
+        let mut mem = Memory::open(temp.path(), 6000).unwrap();
+        let mut batches = 0;
+        for _ in 0..200 {
+            let before = mem.render();
+            mem.append(Kind::User, &"original ".repeat(80)).unwrap();
+            drain(&mut mem);
+            let after = mem.render();
+            assert_eq!(after.len(), mem.view_size());
+            if !after.starts_with(before.trim_end_matches("</chat>")) {
+                batches += 1;
+                assert!(mem.view_size() <= mem.budget / 2);
+            } else {
+                assert!(mem.view_size() <= mem.budget);
+            }
+            let partition = mem.view.clone();
+            let merging = mem.merging;
+            drop(mem);
+            mem = Memory::open(temp.path(), 6000).unwrap();
+            assert_eq!(mem.view, partition);
+            assert_eq!(mem.merging, merging);
+            assert_eq!(mem.render(), after, "restart must preserve every view byte");
+        }
+        assert!(
+            batches > 2 && batches < 25,
+            "expected infrequent batches, got {batches}"
+        );
+    }
+
+    #[test]
+    fn unfinished_batch_survives_restart_and_waits_for_built_parents() {
+        let temp = TempDir::new().unwrap();
+        let mut mem = Memory::open(temp.path(), 3000).unwrap();
+        // Finish leaves while deliberately leaving every parent queued.
+        for _ in 0..20 {
+            mem.append(Kind::User, &"original ".repeat(80)).unwrap();
+        }
+        for index in 0..20 {
+            mem.finish(key(0, index), &"summary ".repeat(35)).unwrap();
+        }
+        assert!(mem.merging);
+        assert!(mem.view_size() > mem.budget);
+        let before = mem.render();
+        drop(mem);
+        let mut mem = Memory::open(temp.path(), 3000).unwrap();
+        assert!(mem.merging);
+        assert_eq!(mem.render(), before);
+        drain(&mut mem);
+        assert!(!mem.merging);
+        assert!(mem.view_size() <= mem.budget / 2);
+    }
+
+    #[test]
+    fn checkpoint_recovers_only_appended_journal_tail_and_ignores_torn_temporary() {
+        let temp = TempDir::new().unwrap();
+        let mut mem = Memory::open(temp.path(), VIEW_BYTES).unwrap();
+        mem.append(Kind::User, "saved exact prefix").unwrap();
+        let prefix = mem.render().trim_end_matches("</chat>").to_owned();
+        // Simulate a crash after the immutable journal committed but before
+        // the atomic checkpoint rename. Recovery adds only this missing tail.
+        mem.main_log
+            .append(&Message {
+                i: 1,
+                kind: Kind::User,
+                text: "committed tail".into(),
+                size: "user: committed tail".len(),
+                date: Local::now().to_rfc3339(),
+                source_id: None,
+            })
+            .unwrap();
+        fs::write(temp.path().join("view.json.tmp"), b"{torn").unwrap();
+        drop(mem);
+        let mem = Memory::open(temp.path(), VIEW_BYTES).unwrap();
+        assert!(mem.render().starts_with(&prefix));
+        assert!(mem.render().contains("1+1|user: committed tail"));
+        assert_eq!(mem.stats()["messages"], 2);
+        drop(mem);
+        let mem = Memory::open(temp.path(), VIEW_BYTES).unwrap();
+        assert!(mem.render().starts_with(&prefix));
+    }
+
+    #[test]
+    fn legacy_chat_gets_checkpoint_once_and_invalid_partition_is_rejected() {
+        let temp = TempDir::new().unwrap();
+        let mut mem = Memory::open(temp.path(), 6000).unwrap();
+        for _ in 0..40 {
+            mem.append(Kind::User, &"original ".repeat(80)).unwrap();
+            drain(&mut mem);
+        }
+        drop(mem);
+        fs::remove_file(temp.path().join("view.json")).unwrap();
+        let mem = Memory::open(temp.path(), 6000).unwrap();
+        let migrated = mem.render();
+        assert!(temp.path().join("view.json").exists());
+        drop(mem);
+        assert_eq!(Memory::open(temp.path(), 6000).unwrap().render(), migrated);
+        let path = temp.path().join("view.json");
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        saved["parts"][0]["index"] = serde_json::json!(1);
+        fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert!(
+            Memory::open(temp.path(), 6000).is_err(),
+            "never silently retile a corrupt checkpoint"
+        );
+    }
+
+    #[test]
+    fn checkpoint_failure_poisoning_preserves_committed_history_for_recovery() {
+        let temp = TempDir::new().unwrap();
+        let mut mem = Memory::open(temp.path(), VIEW_BYTES).unwrap();
+        // A directory in place of the temporary file forces a real write error
+        // after the immutable message and its free summary have committed.
+        fs::create_dir(temp.path().join("view.json.tmp")).unwrap();
+        assert!(
+            mem.append(Kind::User, "committed before checkpoint failure")
+                .is_err()
+        );
+        assert!(mem.append(Kind::User, "must not commit").is_err());
+        assert_eq!(mem.stats()["journal_healthy"], false);
+        drop(mem);
+        fs::remove_dir(temp.path().join("view.json.tmp")).unwrap();
+        let mem = Memory::open(temp.path(), VIEW_BYTES).unwrap();
+        assert_eq!(mem.stats()["messages"], 1);
+        assert!(mem.render().contains("committed before checkpoint failure"));
+    }
+
+    #[test]
+    fn parents_outside_the_live_view_do_not_rewrite_its_checkpoint() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = TempDir::new().unwrap();
+        let mut mem = Memory::open(temp.path(), VIEW_BYTES).unwrap();
+        for _ in 0..2 {
+            mem.append(Kind::User, &"original ".repeat(80)).unwrap();
+        }
+        for index in 0..2 {
+            mem.finish(key(0, index), &"summary ".repeat(35)).unwrap();
+        }
+        let inode = fs::metadata(temp.path().join("view.json")).unwrap().ino();
+        mem.finish(key(1, 0), "merged parent outside view").unwrap();
+        assert_eq!(
+            fs::metadata(temp.path().join("view.json")).unwrap().ino(),
+            inode
+        );
     }
 
     #[test]
