@@ -162,6 +162,9 @@ impl Store {
             })?
             .collect::<std::result::Result<_, _>>()?)
     }
+    pub fn has_active_work(&self) -> Result<bool> {
+        Ok(self.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM inbox WHERE state IN ('queued','running')) OR EXISTS(SELECT 1 FROM agent_runs WHERE state='running') OR EXISTS(SELECT 1 FROM agent_inbox WHERE state='queued') OR EXISTS(SELECT 1 FROM shell_runs WHERE state='running') OR EXISTS(SELECT 1 FROM ui_agents WHERE active=1)", [], |r|r.get(0))?)
+    }
     pub fn complete_turn(
         &self,
         inputs: &[String],

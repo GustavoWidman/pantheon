@@ -53,8 +53,21 @@ port_end = 6180
 
 [skills]
 bundled = true
-# Libraries or individual directories with SKILL.md. Reload on service restart.
+# Libraries or individual directories with SKILL.md seed the durable library.
 directories = []
+
+[curator]
+enabled = true
+# Omit model to use the source channel's selected chat model.
+# model = "codex/YOUR_MODEL"
+reasoning = "low"
+interval_seconds = 3600
+idle_seconds = 120
+minimum_tasks = 4
+timeout_seconds = 300
+max_steps = 6
+max_input_chars = 128000
+token_budget = 100000
 
 # MCP servers are optional; executable packages and credentials are configured
 # by the operator. Full transport/access details are in docs/mcp.md.

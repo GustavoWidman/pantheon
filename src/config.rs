@@ -17,6 +17,7 @@ pub struct Config {
     pub web: crate::web::WebConfig,
     pub browser: crate::browser::BrowserConfig,
     pub skills: crate::skills::SkillsConfig,
+    pub curator: crate::curator::CuratorConfig,
     pub mcp: crate::mcp::McpConfig,
 }
 #[derive(Clone, Deserialize, Serialize, Default)]
@@ -56,6 +57,7 @@ impl Default for Config {
             web: Default::default(),
             browser: Default::default(),
             skills: Default::default(),
+            curator: Default::default(),
             mcp: Default::default(),
         }
     }
@@ -121,6 +123,7 @@ impl Config {
         config.auth.validate()?;
         config.web.validate()?;
         config.skills.validate()?;
+        config.curator.validate()?;
         config.mcp.validate()?;
         Ok(config)
     }

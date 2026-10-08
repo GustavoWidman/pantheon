@@ -33,15 +33,20 @@ struct Frontmatter {
     #[serde(default, rename = "disable-model-invocation")]
     explicit_only: bool,
 }
-struct Skill {
+#[derive(Clone)]
+pub(crate) struct Skill {
     name: String,
     description: String,
     explicit_only: bool,
     text: String,
-    root: Option<PathBuf>,
+    pub(crate) root: Option<PathBuf>,
+    pub(crate) resources: Option<BTreeMap<String, String>>,
+    pub(crate) revision: i64,
+    pub(crate) origin: String,
 }
+#[derive(Clone)]
 pub struct Skills {
-    entries: BTreeMap<String, Skill>,
+    pub(crate) entries: BTreeMap<String, Skill>,
 }
 impl Skills {
     pub fn load(config: &SkillsConfig) -> Result<Self> {
@@ -106,7 +111,7 @@ impl Skills {
             .context("invalid skill directory name")?;
         self.insert(id, text, Some(root.into()))
     }
-    fn insert(&mut self, id: &str, text: String, root: Option<PathBuf>) -> Result<()> {
+    pub(crate) fn insert(&mut self, id: &str, text: String, root: Option<PathBuf>) -> Result<()> {
         ensure!(
             !id.is_empty()
                 && id.len() <= 64
@@ -142,9 +147,20 @@ impl Skills {
                 explicit_only: meta.explicit_only,
                 text,
                 root,
+                resources: None,
+                revision: 0,
+                origin: "seed".into(),
             },
         );
         Ok(())
+    }
+    pub(crate) fn empty() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+        }
+    }
+    pub(crate) fn main_text(&self, id: &str) -> Result<&str> {
+        Ok(&self.entries.get(id).context("unknown skill")?.text)
     }
     pub fn index(&self) -> String {
         let summaries: Vec<_> = self.entries.iter().filter(|(_,skill)|!skill.explicit_only)
@@ -159,7 +175,7 @@ impl Skills {
         match crate::tools::string(args, "action")? {
             "list" => {
                 let offset = integer(args, "offset", 0, 256)?;
-                let entries: Vec<_> = self.entries.iter().skip(offset).take(8).map(|(id,s)|json!({"id":id,"name":s.name,"description":s.description,"explicit_only":s.explicit_only})).collect();
+                let entries: Vec<_> = self.entries.iter().skip(offset).take(8).map(|(id,s)|json!({"id":id,"name":s.name,"description":s.description,"explicit_only":s.explicit_only,"revision":s.revision,"origin":s.origin})).collect();
                 let next = offset + entries.len();
                 Ok(
                     json!({"skills":entries,"next_offset":if next<self.entries.len(){Some(next)}else{None}}),
@@ -185,19 +201,26 @@ impl Skills {
                             .all(|c| matches!(c, Component::Normal(_))),
                         "skill file must be a relative path without traversal"
                     );
-                    let root = skill
-                        .root
-                        .as_ref()
-                        .context("bundled skill has no supporting file")?;
-                    let path = root
-                        .join(relative)
-                        .canonicalize()
-                        .context("find skill resource")?;
-                    ensure!(
-                        path.starts_with(root),
-                        "skill resource escapes its directory"
-                    );
-                    read_bounded(&path)?
+                    if let Some(resources) = &skill.resources {
+                        resources
+                            .get(file)
+                            .context("unknown skill resource")?
+                            .clone()
+                    } else {
+                        let root = skill
+                            .root
+                            .as_ref()
+                            .context("bundled skill has no supporting file")?;
+                        let path = root
+                            .join(relative)
+                            .canonicalize()
+                            .context("find skill resource")?;
+                        ensure!(
+                            path.starts_with(root),
+                            "skill resource escapes its directory"
+                        );
+                        read_bounded(&path)?
+                    }
                 };
                 let offset = integer(args, "offset", 0, 512_000)?;
                 let max = integer(args, "max_chars", 8000, 12_000)?;
@@ -208,7 +231,7 @@ impl Skills {
                 loop {
                     let page: String = text.chars().skip(offset).take(budget).collect();
                     let next = offset + page.chars().count();
-                    let result = json!({"id":id,"name":skill.name,"description":skill.description,"file":file,"text":page,"next_offset":if next<total{Some(next)}else{None},"total_chars":total,"directory":skill.root,"explicit_only":skill.explicit_only});
+                    let result = json!({"id":id,"name":skill.name,"description":skill.description,"file":file,"text":page,"next_offset":if next<total{Some(next)}else{None},"total_chars":total,"directory":skill.root,"resources":skill.resources.as_ref().map(|files|files.keys().collect::<Vec<_>>()),"explicit_only":skill.explicit_only,"revision":skill.revision,"origin":skill.origin});
                     if result.to_string().chars().count() <= 24_000 {
                         return Ok(result);
                     }
@@ -220,7 +243,7 @@ impl Skills {
         }
     }
 }
-fn read_bounded(path: &Path) -> Result<String> {
+pub(crate) fn read_bounded(path: &Path) -> Result<String> {
     use std::io::Read;
     let mut bytes = Vec::new();
     std::fs::File::open(path)?

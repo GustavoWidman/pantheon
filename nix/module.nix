@@ -20,6 +20,7 @@ let
         port_start = cfg.browserPortStart;
         port_end = cfg.browserPortEnd;
       };
+      curator.enabled = cfg.skillCurator;
       skills = {
         directories = map toString cfg.skillDirectories;
         bundled = cfg.bundledSkills;
@@ -84,12 +85,17 @@ in
     skillDirectories = lib.mkOption {
       type = lib.types.listOf lib.types.path;
       default = [ ];
-      description = "Skill libraries or individual folders containing SKILL.md. Index and main guides are frozen at service startup. Repository-local or packaged skills work without runtime downloads.";
+      description = "Skill libraries or individual folders containing SKILL.md. Skills initialize a durable evolving library. Main guides and supporting text are imported together; curator revisions survive restarts and package updates.";
+    };
+    skillCurator = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = "Enable bounded background skill curation during idle time. Configure budgets, model and cadence through settings.curator. Chat memory is never rewritten.";
     };
     bundledSkills = lib.mkOption {
       type = lib.types.bool;
       default = true;
-      description = "Include Pantheon's research, browser activities, learning and engineering guides.";
+      description = "Seed the evolving library with Pantheon's research, browser activities, learning and engineering guides. Existing revisions and retirements are preserved.";
     };
   };
   config = lib.mkIf cfg.enable {

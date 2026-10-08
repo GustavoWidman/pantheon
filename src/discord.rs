@@ -914,6 +914,16 @@ pub fn command_definitions() -> Value {
     };
     let mut browser_action = action(&["list", "open", "handoff", "resume", "close"]);
     browser_action["required"] = json!(false);
+    let mut skills_action = action(&[
+        "list",
+        "history",
+        "rollback",
+        "curator",
+        "curate",
+        "proposals",
+        "proposal",
+    ]);
+    skills_action["required"] = json!(false);
     json!([
         command(
             "context",
@@ -954,7 +964,11 @@ pub fn command_definitions() -> Value {
         command(
             "skills",
             "Browse available task guides",
-            vec![string_option("id", "Skill ID to inspect", false)]
+            vec![
+                string_option("id", "Skill ID or proposal attempt ID", false),
+                skills_action,
+                json!({"type":4,"name":"revision","description":"Revision to restore with rollback","required":false,"min_value":1}),
+            ]
         ),
         command(
             "mcp",
