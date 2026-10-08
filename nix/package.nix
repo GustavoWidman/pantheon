@@ -1,9 +1,9 @@
 {
   lib,
-  rustPlatform,
+  symlinkJoin,
   makeWrapper,
   cacert,
-  python3,
+  rustBinary,
   browser,
   bash,
   coreutils,
@@ -13,17 +13,14 @@
   findutils,
   codex,
 }:
-rustPlatform.buildRustPackage {
+symlinkJoin {
   pname = "pantheon";
   version = (builtins.fromTOML (builtins.readFile ../Cargo.toml)).package.version;
-  src = lib.cleanSource ../.;
-  cargoLock.lockFile = ../Cargo.lock;
+  paths = [ rustBinary ];
   nativeBuildInputs = [ makeWrapper ];
-  nativeCheckInputs = [ python3 ];
-  SSL_CERT_FILE = "${cacert}/etc/ssl/certs/ca-bundle.crt";
-  postInstall = ''
+  postBuild = ''
     mkdir -p "$out/libexec/pantheon"
-    cp scripts/browser-worker.py "$out/libexec/pantheon/browser-worker.py"
+    cp ${../scripts/browser-worker.py} "$out/libexec/pantheon/browser-worker.py"
     wrapProgram "$out/bin/pantheon" \
       --set-default SSL_CERT_FILE "${cacert}/etc/ssl/certs/ca-bundle.crt" \
       --set PANTHEON_CODEX_CLI "${codex}/bin/codex" \
@@ -46,6 +43,7 @@ rustPlatform.buildRustPackage {
       }" \
       --set PANTHEON_BROWSER_WORKER "$out/libexec/pantheon/browser-worker.py"
   '';
+  passthru.unwrapped = rustBinary;
   meta = {
     description = "Durable always-on Discord agent harness";
     license = lib.licenses.mit;

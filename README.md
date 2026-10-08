@@ -106,3 +106,30 @@ Rust and Nix checks run when a PR is opened, updated or reopened, not on develop
 Both root and workers can own wakeups and monitors. Shell commands return a background job ID after five seconds by default; their results reach the owning agent’s durable inbox. An idle worker resumes under its existing ID. Successful worker turns with running shells or queued inbox work keep their report private until that work finishes; future scheduled wakeups and monitor intervals do not hold reports. See [architecture](docs/architecture.md) for delivery, cancellation and recovery behavior, and [browser ownership](docs/browser.md) for shared storage and handoff details.
 
 [Model discovery and chat-local overrides](docs/models.md) cover `/model` and `/reasoning` autocomplete and the agent’s `models` catalog tool. `pantheon models` performs live discovery without inference. Agents can compare dated official API prices and Codex credit rates, including cache/context bands; included subscription quota and API references remain separate.
+
+### Nix CI compilation
+
+After installing Nix, CI uses `DeterminateSystems/magic-nix-cache-action` to
+cache build outputs in GitHub Actions across runs. GitHub Actions caching is
+explicitly enabled and FlakeHub caching is disabled; no additional credentials
+or OIDC permissions are required. The reusable release checks use the same
+cache setup. Cache misses still build normally, and the first run may be cold.
+
+The Nix package keeps its optimized Rust executable (`pantheon.unwrapped`)
+separate from the browser-worker/runtime wrapper. Cargo's source set includes
+`Cargo.toml`, `Cargo.lock`, `src/`, embedded `skills/`, and Rust integration tests;
+changes to documentation, Python tests or the browser worker do not recompile
+Rust. Browser-worker changes still produce a new final package and run the
+packaged-browser smoke test. `tests/test_nix_packaging.py` checks these cache
+boundaries by evaluating real derivations after source mutations (Nix required).
+
+The installed executable retains the release profile, including thin LTO.
+Nix runs all Rust test targets and doctests using Cargo's normal test profile rather than
+release LTO: Rust tests require unwinding, so they cannot reuse the release
+binary's abort-on-panic build. This avoids expensive redundant test optimization
+without dropping tests. The Rust CI job still runs formatting, Clippy, Rust and
+Python tests, and the Nix job still builds the package/runtime and exercises the
+packaged browser. Opt-in credential-dependent tests remain opt-in.
+
+Superseded PR check runs are cancelled; reusable release checks use a unique
+run group and are never cancelled by a newer PR or release run.

@@ -3210,12 +3210,16 @@ mod tests {
 
     #[tokio::test]
     async fn worker_tools_and_notifications_stay_private_until_detached_work_finishes() {
+        // Hold the detached shell until the pre-completion assertions finish.
+        // A fixed sleep can expire under CPU contention (especially debug Nix
+        // tests), incorrectly testing the already-completed branch instead.
+        let shell_command = "while [ -e hold-detached-shell ]; do sleep 0.01; done; printf Hi";
         let calls = json!({"status":"completed","output":[
             {"type":"message","role":"assistant","content":[{"type":"output_text","text":"Private worker progress"}]},
-            {"type":"function_call","call_id":"delay","name":"shell","arguments":"{\"command\":\"sleep 0.4; printf Hi\"}"},
+            {"type":"function_call","call_id":"delay","name":"shell","arguments":json!({"command":shell_command}).to_string()},
             {"type":"function_call","call_id":"error","name":"write","arguments":"{\"path\":\"../escape\",\"text\":\"bad\"}"}
         ]});
-        let (_dir, mut h, mut run, mock, server) = fixture(
+        let (dir, mut h, mut run, mock, server) = fixture(
             "openai",
             vec![
                 calls,
@@ -3224,6 +3228,8 @@ mod tests {
             ],
         )
         .await;
+        let shell_barrier = dir.path().join("hold-detached-shell");
+        std::fs::write(&shell_barrier, b"").unwrap();
         Arc::get_mut(&mut h)
             .unwrap()
             .config
@@ -3254,6 +3260,7 @@ mod tests {
         assert!(timeline[0].text.contains("↗ spawned Delayed Greeter"));
         assert!(!timeline[0].text.contains("shell ·"));
         assert!(!timeline[0].text.contains("write ·"));
+        std::fs::remove_file(shell_barrier).unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             while h.store.agent_events(id).unwrap().is_empty() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -3295,7 +3302,7 @@ mod tests {
         )
         .unwrap();
         let private = trace.export_html();
-        assert!(private.contains("sleep 0.4"));
+        assert!(private.contains(shell_command));
         assert!(private.contains("../escape"));
         assert!(private.contains("background"));
         assert!(private.contains("Error:"));
@@ -3305,7 +3312,7 @@ mod tests {
                 .lock()
                 .await
                 .export_html()
-                .contains("sleep 0.4")
+                .contains(shell_command)
         );
         let requests = mock.requests.lock().await;
         assert!(

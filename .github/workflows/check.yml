@@ -3,6 +3,11 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   workflow_call:
+# Cancel superseded PR checks only. Reusable release checks must finish even
+# when another main/release run starts, so non-PR runs use a unique run ID.
+concurrency:
+  group: checks-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 permissions:
   contents: read
 jobs:
@@ -37,6 +42,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v19
+      - name: Cache Nix builds in GitHub Actions
+        uses: DeterminateSystems/magic-nix-cache-action@v15
+        with:
+          use-gha-cache: enabled
+          use-flakehub: disabled
       - run: nix flake check --print-build-logs
+      - name: Check Nix compilation cache boundaries
+        run: python3 -m unittest discover -s tests -p test_nix_packaging.py
       - name: Exercise packaged browser sharing and private viewers
         run: nix develop --command python3 tests/browser_smoke.py
