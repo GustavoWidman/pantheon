@@ -16,17 +16,44 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON = os.environ["PANTHEON_BROWSER_PYTHON"]
 WEB = os.environ["PANTHEON_NOVNC_WEB"]
+WORKER = os.environ.get("PANTHEON_BROWSER_WORKER", str(ROOT / "scripts/browser-worker.py"))
 TOKEN = "0" * 64
+ATTACHMENT = b"%PDF-1.7\nlocal authenticated attachment\x00\xff\n"
 
 
 class Site(http.server.BaseHTTPRequestHandler):
+    uploaded = None
+
+    def do_POST(self):
+        if self.path != "/uploaded" or "session=shared" not in self.headers.get("Cookie", ""):
+            self.send_error(403)
+            return
+        Site.uploaded = self.rfile.read(int(self.headers["Content-Length"]))
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"verified receipt")
+
     def do_GET(self):
+        if self.path.startswith("/attachment"):
+            if "session=shared" not in self.headers.get("Cookie", ""):
+                self.send_error(403)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Disposition", 'attachment; filename="../../untrusted.pdf"')
+            self.send_header("Content-Length", str(len(ATTACHMENT)))
+            self.end_headers()
+            self.wfile.write(ATTACHMENT)
+            return
         color = "#e00000" if self.path == "/red" else "#00e000"
         cookie = self.headers.get("Cookie", "")
         body = f'''<html><head><title>{self.path}</title></head><body style="background:{color}">
 <label>Name <input aria-label="Name"></label><button onclick="document.cookie='session=shared;max-age=86400';localStorage.setItem('login','shared');document.getElementById('result').textContent='saved'">Save</button>
 <button onclick="document.cookie='session=;max-age=0';localStorage.removeItem('login')">Logout</button>
-<a href="/popup" target="_blank">Popup</a><p id="result">{cookie}</p>
+<a href="/popup" target="_blank">Popup</a><a href="/attachment">Download attachment</a>
+<input type="file" id="attachment" style="display:none" multiple>
+<button onclick="document.getElementById('confirmation').hidden=false">Submit request</button>
+<div id="confirmation" hidden><button onclick="fetch('/uploaded',{{method:'POST',body:document.getElementById('attachment').files[0]}}).then(r=>r.text()).then(t=>document.getElementById('receipt').textContent=t)">Confirm request</button></div><p id="receipt"></p><p id="result">{cookie}</p>
 <script>document.getElementById('result').textContent += ' storage=' + localStorage.getItem('login');</script></body></html>'''.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
@@ -112,7 +139,7 @@ def main():
         log = (state / "worker.log").open("w+")
 
         def process(arguments):
-            child = subprocess.Popen([PYTHON, str(ROOT / "scripts/browser-worker.py"), *arguments, "--web", WEB], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, text=True, start_new_session=True, env=dict(os.environ, PANTHEON_BROWSER_TOKEN=TOKEN))
+            child = subprocess.Popen([PYTHON, WORKER, *arguments, "--web", WEB], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, text=True, start_new_session=True, env=dict(os.environ, PANTHEON_BROWSER_TOKEN=TOKEN))
             processes.append(child)
             ready = json.loads(child.stdout.readline())
             assert ready.get("ready"), ready
@@ -136,7 +163,7 @@ def main():
             return "viewonly:1" in result.stdout
 
         try:
-            backend, _ = process(["--backend", "--shared-root", str(shared), "--capacity", "4"])
+            backend, _ = process(["--backend", "--workspace", str(state), "--shared-root", str(shared), "--capacity", "4"])
             first, first_info, first_dir = window("first")
             second, second_info, second_dir = window("second")
             assert first_info["display"] == second_info["display"]
@@ -152,6 +179,37 @@ def main():
             call(second, "navigate", url=url + "/green")
             snapshot = call(second, "snapshot")
             assert "session=shared" in snapshot["snapshot"] and "storage=shared" in snapshot["snapshot"], snapshot
+            # Cookie-authenticated URL downloads keep the form's current page,
+            # while event-first click downloads handle Content-Disposition.
+            artifact = state / "download-url"
+            downloaded = call(second, "download", url=url + "/attachment", path=str(artifact))
+            assert artifact.read_bytes() == ATTACHMENT
+            assert downloaded["size"] == len(ATTACHMENT)
+            assert downloaded["path"] == str(artifact)
+            assert downloaded["suggested_filename"] == "../../untrusted.pdf"
+            assert call(second, "snapshot")["url"] == url + "/green"
+            clicked = state / "download-click"
+            downloaded = call(second, "download", role="link", name="Download attachment", path=str(clicked))
+            assert clicked.read_bytes() == ATTACHMENT and downloaded["size"] == len(ATTACHMENT)
+            call(second, "upload", selector="#attachment", paths=[str(artifact), str(clicked)])
+            call(second, "click", role="button", name="Submit request")
+            assert Site.uploaded is None  # A confirmation modal is not a receipt.
+            call(second, "click", role="button", name="Confirm request")
+            for _ in range(100):
+                if "verified receipt" in call(second, "snapshot")["snapshot"]:
+                    break
+            else:
+                raise AssertionError("upload form receipt missing")
+            assert Site.uploaded == ATTACHMENT
+            for request in [
+                {"action":"download", "url":url + "/attachment", "path":str(artifact)},
+                {"action":"upload", "selector":"#attachment", "paths":["/etc/passwd"]},
+                {"action":"download", "url":url + "/attachment", "path":"/tmp/outside-pantheon-artifact"},
+            ]:
+                second.stdin.write(json.dumps(request) + "\n")
+                second.stdin.flush()
+                assert "error" in json.loads(second.stdout.readline())
+            assert artifact.read_bytes() == ATTACHMENT
             first_view, second_view = Viewer(first_dir), Viewer(second_dir)
             viewers.extend([first_view, second_view])
             time.sleep(0.3)
@@ -170,6 +228,16 @@ def main():
             assert "error" in json.loads(second.stdout.readline())
             call(first, "select_tab", tab_id=first_tabs[0]["tab_id"])
             call(first, "handoff")
+            for request in [
+                {"action":"upload","selector":"#attachment","paths":[str(artifact)]},
+                {"action":"download","url":url + "/attachment","path":str(state / "leased")},
+            ]:
+                first.stdin.write(json.dumps(request) + "\n")
+                first.stdin.flush()
+                assert "error" in json.loads(first.stdout.readline())
+                second.stdin.write(json.dumps(request) + "\n")
+                second.stdin.flush()
+                assert "error" in json.loads(second.stdout.readline())
             assert not view_only(first_dir, first_info["display"])
             assert view_only(second_dir, second_info["display"])
             call(second, "navigate", url=url + "/green")
@@ -181,6 +249,11 @@ def main():
             assert first.wait(timeout=15) == 0
             assert len(call(second, "tabs")["tabs"]) == len(second_tabs)
             call(second, "click", role="button", name="Logout")
+            failed = state / "unauthenticated"
+            second.stdin.write(json.dumps({"action":"download","url":url + "/attachment","path":str(failed)}) + "\n")
+            second.stdin.flush()
+            assert "403" in json.loads(second.stdout.readline())["error"]
+            assert not failed.exists()
             third, _, _ = window("third")
             call(third, "navigate", url=url + "/red")
             assert "session=shared" not in call(third, "snapshot")["snapshot"]
@@ -193,7 +266,7 @@ def main():
             backend.stdin.write("shutdown\n")
             backend.stdin.flush()
             assert backend.wait(timeout=20) == 0
-            backend, _ = process(["--backend", "--shared-root", str(shared), "--capacity", "4"])
+            backend, _ = process(["--backend", "--workspace", str(state), "--shared-root", str(shared), "--capacity", "4"])
             reopened, _, _ = window("first")
             call(reopened, "navigate", url=url + "/red")
             snapshot = call(reopened, "snapshot")["snapshot"]
@@ -203,7 +276,7 @@ def main():
             backend.stdin.write("shutdown\n")
             backend.stdin.flush()
             assert backend.wait(timeout=20) == 0
-            print("PASS: shared live cookies/storage/logout, private viewer pixels, tab ownership, scoped handoff, independent close, screenshot, restart durability")
+            print("PASS: shared live cookies/storage/logout, private viewer pixels, tab ownership, scoped handoff, independent close, screenshot, authenticated file download/upload bytes and confirmed receipt, restart durability")
         except Exception:
             log.flush()
             log.seek(0)

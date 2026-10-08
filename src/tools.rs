@@ -74,8 +74,8 @@ pub fn definitions(child: bool, coordinator: bool) -> Vec<Value> {
         ),
         tool(
             "browser",
-            "Control your Camoufox window and tabs in the pantheon-shared profile. Cookies, logins and local storage are shared. Each window has a private live noVNC viewer. Claim an adopted browser before controlling it. Handoff pauses automation until explicit resume with the returned lease token.",
-            json!({"action":{"type":"string","enum":["open","list","navigate","snapshot","click","type","screenshot","handoff","resume","close","claim","tabs","new_tab","select_tab","close_tab"]},"browser_id":{"type":"string"},"tab_id":{"type":"string"},"url":{"type":"string"},"selector":{"type":"string"},"role":{"type":"string"},"name":{"type":"string"},"text":{"type":"string"},"resume_token":{"type":"string"}}),
+            "Control your Camoufox window and tabs in the pantheon-shared profile. Cookies, logins and local storage are shared. Each window has a private live noVNC viewer. Claim an adopted browser before controlling it. Handoff pauses automation until explicit resume with the returned lease token. Upload sets a file input from workspace paths without a native picker. Download uses authenticated url GET or a click locator and saves a generated workspace artifact; inspect its returned path, suggested_filename and size.",
+            json!({"action":{"type":"string","enum":["open","list","navigate","snapshot","click","type","screenshot","handoff","resume","close","claim","tabs","new_tab","select_tab","close_tab","upload","download"]},"browser_id":{"type":"string"},"tab_id":{"type":"string"},"url":{"type":"string"},"selector":{"type":"string"},"role":{"type":"string"},"name":{"type":"string"},"text":{"type":"string"},"resume_token":{"type":"string"},"paths":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":20}}),
             &["action"],
         ),
     ];
