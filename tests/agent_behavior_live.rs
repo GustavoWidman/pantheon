@@ -6,29 +6,41 @@ use pantheon::{provider::Provider, tools};
 async fn fresh_turn_cache_probe_reports_real_provider_counters() {
     let model = std::env::var("PANTHEON_TEST_CODEX_MODEL").expect("set PANTHEON_TEST_CODEX_MODEL");
     assert!(model.starts_with("codex/"));
-    let p = Provider::new(120).unwrap();
     let system = system(false);
     let defs = tools::definitions(false, false);
     let d = tempfile::tempdir().unwrap();
-    let mut memory = pantheon::memory::Memory::open(d.path(), 128000).unwrap();
+    let mut memory = pantheon::memory::Memory::open(d.path().join("memory"), 128000).unwrap();
+    let store_path = d.path().join("cache.sqlite");
+    let identity = pantheon::store::Store::open(&store_path)
+        .unwrap()
+        .cache_affinity("channel:cache-probe")
+        .unwrap();
     memory
         .append(
             pantheon::memory::Kind::User,
             "This is a greeting-only cache probe. Reply with hi when asked.",
         )
         .unwrap();
-    let initial = memory.render();
-    for (phase, view) in [
-        ("cold", initial.clone()),
-        ("identical fresh request", initial),
-        ("appended fresh turn", String::new()),
-        ("next appended fresh turn", String::new()),
+    for phase in [
+        "cold",
+        "identical fresh request",
+        "reopened provider and store",
+        "appended fresh turn",
+        "next appended fresh turn",
     ] {
-        let view = if view.is_empty() {
-            memory.render()
-        } else {
-            view
-        };
+        if phase.contains("appended") {
+            memory
+                .append(pantheon::memory::Kind::User, "Say exactly hi.")
+                .unwrap();
+            memory.append(pantheon::memory::Kind::Talk, "hi").unwrap();
+        }
+        let saved = pantheon::store::Store::open(&store_path)
+            .unwrap()
+            .cache_affinity("channel:cache-probe")
+            .unwrap();
+        assert_eq!(saved, identity);
+        let p = Provider::new(120).unwrap().with_cache_affinity(saved);
+        let view = memory.render();
         let history = Provider::start("openai", &view, "Say exactly hi.");
         let response = p
             .step(&model, "medium", &system, &history, &defs)
@@ -42,14 +54,6 @@ async fn fresh_turn_cache_probe_reports_real_provider_counters() {
             "CACHE PROBE {phase}: {}",
             serde_json::to_string(&pantheon::cache::Usage::parse(&response.usage)).unwrap()
         );
-        if phase != "cold" {
-            memory
-                .append(pantheon::memory::Kind::User, "Say exactly hi.")
-                .unwrap();
-            memory
-                .append(pantheon::memory::Kind::Talk, &visible(&response))
-                .unwrap();
-        }
     }
 }
 

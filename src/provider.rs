@@ -11,6 +11,7 @@ pub struct Provider {
     timeout_seconds: Option<u64>,
     codex: CodexAuth,
     catalog: std::sync::Arc<crate::models::Catalog>,
+    cache_affinity: uuid::Uuid,
     #[cfg(test)]
     endpoint: Option<String>,
 }
@@ -48,6 +49,7 @@ impl Provider {
             timeout_seconds: Some(timeout_seconds),
             codex: CodexAuth::new(AuthConfig::default()),
             catalog: std::sync::Arc::default(),
+            cache_affinity: uuid::Uuid::new_v4(),
             #[cfg(test)]
             endpoint: None,
         })
@@ -59,6 +61,7 @@ impl Provider {
             timeout_seconds: None,
             codex: CodexAuth::new(AuthConfig::default()),
             catalog: std::sync::Arc::default(),
+            cache_affinity: uuid::Uuid::new_v4(),
             endpoint: Some(endpoint),
         }
     }
@@ -68,6 +71,11 @@ impl Provider {
     }
     pub fn with_catalog(mut self, catalog: std::sync::Arc<crate::models::Catalog>) -> Self {
         self.catalog = catalog;
+        self
+    }
+    /// Routing identity only: it neither retains nor resumes provider history.
+    pub fn with_cache_affinity(mut self, identity: uuid::Uuid) -> Self {
+        self.cache_affinity = identity;
         self
     }
     pub(crate) async fn pricing_document(&self, source: &str) -> Result<String> {
@@ -511,6 +519,9 @@ impl Provider {
         let (vendor, _) = model_parts(model)?;
         let is_codex = model.starts_with("codex/");
         if is_codex {
+            let affinity = self.cache_affinity.to_string();
+            let mut body = body.clone();
+            body["prompt_cache_key"] = json!(affinity);
             let mut credentials = self.codex.credentials(None).await?;
             for attempt in 0..2 {
                 #[cfg(test)]
@@ -525,6 +536,8 @@ impl Provider {
                     .post(endpoint)
                     .bearer_auth(&credentials.access)
                     .header("ChatGPT-Account-ID", &credentials.account)
+                    // ChatGPT derives cache affinity from this hyphenated header.
+                    .header("session-id", &affinity)
                     .header("originator", "pantheon")
                     .header(
                         "User-Agent",
@@ -535,7 +548,13 @@ impl Provider {
                     request = request.header("x-openai-internal-codex-residency", residency);
                 }
                 let value = self
-                    .receive_model_response(request.json(body), model, attempt + 1, true, submitted)
+                    .receive_model_response(
+                        request.json(&body),
+                        model,
+                        attempt + 1,
+                        true,
+                        submitted,
+                    )
                     .await?;
                 if value.is_none() {
                     credentials = self.codex.credentials(Some(&credentials.access)).await?;
@@ -1113,6 +1132,99 @@ impl SseDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn codex_affinity_matches_body_and_header_across_fresh_and_appended_requests() {
+        use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
+        type Requests = std::sync::Arc<std::sync::Mutex<Vec<(HeaderMap, Value)>>>;
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(HeaderMap, Value)>::new()));
+        let state = requests.clone();
+        let app = Router::new()
+            .route(
+                "/",
+                post(
+                    |State(requests): State<Requests>,
+                     headers: HeaderMap,
+                     Json(body): Json<Value>| async move {
+                        let streaming = body["stream"] == true;
+                        requests.lock().unwrap().push((headers, body));
+                        let value = json!({"status":"completed","output":[],"usage":{}});
+                        if streaming {
+                            axum::response::Response::new(axum::body::Body::from(format!(
+                                "data: {}\n\n",
+                                json!({"type":"response.completed","response":value})
+                            )))
+                        } else {
+                            use axum::response::IntoResponse;
+                            Json(value).into_response()
+                        }
+                    },
+                ),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("auth.json"),
+            json!({"tokens":{"access_token":"test-token","account_id":"test-account"}}).to_string(),
+        )
+        .unwrap();
+        let provider = Provider::mock(format!("http://{address}/")).with_auth(AuthConfig {
+            codex_home: Some(directory.path().into()),
+            codex_cli: None,
+        });
+        let store_path = directory.path().join("runtime.sqlite");
+        let store = crate::store::Store::open(&store_path).unwrap();
+        let identity = store.cache_affinity("channel:1").unwrap();
+        let scoped = provider.clone().with_cache_affinity(identity);
+        let fresh = Provider::start("openai", "<chat>stable memory</chat>", "first input");
+        let body = Provider::request_body("codex/test", "none", "fixed", &fresh, &[]).unwrap();
+        scoped.send_body("codex/test", &body).await.unwrap();
+        let mut history = fresh.clone();
+        history.push(Provider::user("openai", "next step"));
+        let appended =
+            Provider::request_body("codex/test", "none", "fixed", &history, &[]).unwrap();
+        scoped.send_body("codex/test", &appended).await.unwrap();
+        drop(store);
+        let store = crate::store::Store::open(&store_path).unwrap();
+        provider
+            .clone()
+            .with_cache_affinity(store.cache_affinity("channel:1").unwrap())
+            .send_body("codex/test", &body)
+            .await
+            .unwrap();
+        provider
+            .clone()
+            .with_cache_affinity(store.cache_affinity("worker-id").unwrap())
+            .send_body("codex/test", &body)
+            .await
+            .unwrap();
+        scoped
+            .step("openai/test", "none", "fixed", &fresh, &[])
+            .await
+            .unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 5);
+        for (headers, sent) in requests.iter().take(3) {
+            assert_eq!(headers["session-id"], identity.to_string());
+            assert!(!headers.contains_key("session_id"));
+            assert_eq!(sent["prompt_cache_key"], identity.to_string());
+            assert_eq!(sent["store"], false);
+            assert!(sent.get("previous_response_id").is_none());
+        }
+        assert_eq!(requests[0].1["input"], json!(fresh));
+        assert_eq!(requests[1].1["input"], json!(history));
+        assert_eq!(requests[2].1["input"], json!(fresh));
+        assert_ne!(requests[3].0["session-id"], requests[0].0["session-id"]);
+        assert_eq!(
+            requests[3].1["prompt_cache_key"],
+            requests[3].0["session-id"].to_str().unwrap()
+        );
+        assert!(!requests[4].0.contains_key("session-id"));
+        assert!(requests[4].1.get("prompt_cache_key").is_none());
+        server.abort();
+    }
     #[derive(Clone, Default)]
     struct DiagnosticLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
     impl std::io::Write for DiagnosticLog {

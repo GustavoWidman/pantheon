@@ -28,12 +28,22 @@ requests, not proof of a server cache hit. Snapshots and the bounded counter his
 survive restart without storing prompt text or native reasoning in the diagnostic
 tables. Provider KV entries are remote and have their own retention policy.
 
+Codex requests send matching `session-id` and `prompt_cache_key` values. The
+hyphenated header supplies ChatGPT's cache affinity; a cache key alone does not
+provide the same routing behavior. Random UUIDs persist in `runtime.sqlite`, with
+separate identities for each coordinator, worker, channel compactor, and agent's
+hosted search. They survive fresh turns, worker resumptions and service restarts.
+Separate state databases receive separate identities. These values control routing
+only: every fresh turn still constructs a new provider transcript, and compaction
+can change its reusable prefix. Public API requests keep their existing contract.
+
 No cache renewal requests, native-tail retention, or provider cache-policy changes
 are introduced. Codex keeps its subscription transport contract; public API cache
 metadata remains omitted there. The opt-in
 `fresh_turn_cache_probe_reports_real_provider_counters` test measures a cold request,
-an identical repeated request and two appended fresh views against the configured
-authenticated Codex model. It prints counters and never executes model tool calls.
+identical repeated requests with reopened providers/stores and two appended fresh
+views against the configured authenticated Codex model. It prints counters and
+never executes model tool calls.
 Zero reported reuse is a valid finding, not a test failure or evidence of caching
 success. Investigate transport/model behavior separately from local prefix stability.
 

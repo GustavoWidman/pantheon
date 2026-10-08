@@ -466,6 +466,10 @@ impl Harness {
         run_id: &str,
     ) -> Result<String> {
         let mut transcript = String::new();
+        let provider = self
+            .provider
+            .clone()
+            .with_cache_affinity(self.store.cache_affinity(&run.owner)?);
         for step in 0..self.config.agent.max_steps {
             if run.cancel.is_cancelled() {
                 bail!("cancelled");
@@ -478,7 +482,7 @@ impl Harness {
             let submitted_inputs = run.inputs.clone();
             let submitted = || self.store.submitted_inputs(&submitted_inputs);
             let response = tokio::select! {
-                r=self.provider.step_observed(&run.settings.0,&run.settings.1,system,&run.history,defs,Some(&submitted))
+                r=provider.step_observed(&run.settings.0,&run.settings.1,system,&run.history,defs,Some(&submitted))
                     .instrument(tracing::info_span!("provider_step", channel=run.channel, owner=%run.owner, run_id=%run_id, step))=>r?,
                 _=run.cancel.cancelled()=>bail!("cancelled"),
             };
@@ -839,8 +843,12 @@ impl Harness {
                     })
                     .transpose()?
                     .unwrap_or_default();
+                let provider = self.provider.clone().with_cache_affinity(
+                    self.store
+                        .cache_affinity(&format!("search:{}", run.owner))?,
+                );
                 let value = tokio::select! {
-                    value = tokio::time::timeout(Duration::from_secs(self.config.web.search_timeout_seconds), self.provider.search(model, tools::string(a, "query")?, limit, &domains)) => value.context("web search timed out")??,
+                    value = tokio::time::timeout(Duration::from_secs(self.config.web.search_timeout_seconds), provider.search(model, tools::string(a, "query")?, limit, &domains)) => value.context("web search timed out")??,
                     _ = run.cancel.cancelled() => bail!("web search cancelled"),
                 };
                 value
@@ -2004,7 +2012,7 @@ impl Harness {
                 workers.spawn(async move {
                     (
                         key,
-                        h.compress(&model, key, &context, &source)
+                        h.compress(channel, &model, key, &context, &source)
                             .instrument(tracing::info_span!(
                                 "compaction",
                                 channel,
@@ -2031,6 +2039,7 @@ impl Harness {
     }
     async fn compress(
         &self,
+        channel: u64,
         model: &str,
         key: NodeKey,
         context: &str,
@@ -2056,9 +2065,12 @@ impl Harness {
         );
         let mut history = Provider::start(vendor, context, &step);
         let mut best: Option<String> = None;
+        let provider = self
+            .provider
+            .clone()
+            .with_cache_affinity(self.store.cache_affinity(&format!("compactor:{channel}"))?);
         for _ in 0..5 {
-            let response = self
-                .provider
+            let response = provider
                 .step(model, &reasoning, COMPACT, &history, &[])
                 .await?;
             let line = response
@@ -2099,7 +2111,12 @@ mod tests {
         started: Notify,
         release: Notify,
     }
-    async fn respond(State(state): State<Arc<Mock>>, Json(body): Json<Value>) -> Json<Value> {
+    async fn respond(
+        State(state): State<Arc<Mock>>,
+        Json(body): Json<Value>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let streaming = body["stream"] == true;
         let first = {
             let mut requests = state.requests.lock().await;
             let first = requests.is_empty();
@@ -2110,14 +2127,20 @@ mod tests {
             state.started.notify_one();
             state.release.notified().await;
         }
-        Json(
-            state
-                .responses
-                .lock()
-                .await
-                .pop_front()
-                .expect("unexpected provider request"),
-        )
+        let response = state
+            .responses
+            .lock()
+            .await
+            .pop_front()
+            .expect("unexpected provider request");
+        if streaming {
+            axum::response::Response::new(axum::body::Body::from(format!(
+                "data: {}\n\n",
+                json!({"type":"response.completed","response":response})
+            )))
+        } else {
+            Json(response).into_response()
+        }
     }
     async fn fixture(
         vendor: &str,
@@ -2197,6 +2220,73 @@ mod tests {
         } else {
             json!({"stop_reason":"end_turn","content":[{"type":"text","text":text}],"usage":{"cache_read_input_tokens":123}})
         }
+    }
+    #[tokio::test]
+    async fn codex_runtime_routes_root_worker_and_compactor_to_durable_scopes() {
+        let (dir, mut h, mut run, mock, server) =
+            fixture("openai", vec![final_response("openai", "done"); 3]).await;
+        std::fs::write(
+            dir.path().join("auth.json"),
+            json!({"tokens":{"access_token":"test-token","account_id":"test-account"}}).to_string(),
+        )
+        .unwrap();
+        let provider = h.provider.clone().with_auth(crate::auth::AuthConfig {
+            codex_home: Some(dir.path().into()),
+            codex_cli: None,
+        });
+        Arc::get_mut(&mut h).unwrap().provider = provider;
+        run.settings = ("codex/gpt-6.1-sol".into(), "medium".into());
+        mock.release.notify_one();
+        h.run_steps(
+            &mut run,
+            "openai",
+            &tools::definitions(false, false),
+            &h.master_system,
+            "root-run",
+        )
+        .await
+        .unwrap();
+        run.owner = "worker-id".into();
+        run.child = true;
+        run.history = Provider::start("openai", "<chat></chat>", "fresh worker task");
+        run.trace = Some(Memory::open(dir.path().join("worker-trace"), 128000).unwrap());
+        h.run_steps(
+            &mut run,
+            "openai",
+            &tools::definitions(true, false),
+            &h.child_system,
+            "worker-run",
+        )
+        .await
+        .unwrap();
+        h.compress(
+            1,
+            "codex/gpt-6.1-sol",
+            NodeKey { level: 0, index: 0 },
+            "<chat></chat>",
+            "source",
+        )
+        .await
+        .unwrap();
+        let requests = mock.requests.lock().await;
+        for (request, scope) in requests
+            .iter()
+            .zip(["channel:1", "worker-id", "compactor:1"])
+        {
+            assert_eq!(
+                request["prompt_cache_key"],
+                h.store.cache_affinity(scope).unwrap().to_string()
+            );
+        }
+        assert_ne!(
+            requests[0]["prompt_cache_key"],
+            requests[1]["prompt_cache_key"]
+        );
+        assert_ne!(
+            requests[0]["prompt_cache_key"],
+            requests[2]["prompt_cache_key"]
+        );
+        server.abort();
     }
     fn drain(h: &Harness) -> Vec<crate::store::Outbound> {
         let mut out = vec![];
