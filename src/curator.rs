@@ -32,7 +32,9 @@ pub struct CuratorConfig {
     pub max_steps: usize,
     pub review_steps: usize,
     pub max_input_chars: usize,
-    pub token_budget: u64,
+    // Accept legacy operator configs; this field has no runtime effect.
+    #[serde(rename = "token_budget", skip_serializing)]
+    pub legacy_token_budget: Option<u64>,
     pub max_research_calls: usize,
 }
 impl Default for CuratorConfig {
@@ -45,11 +47,11 @@ impl Default for CuratorConfig {
             minimum_steps: 3,
             description_chars: 240,
             reviewers: 2,
-            timeout_seconds: 300,
+            timeout_seconds: 900,
             max_steps: 8,
             review_steps: 4,
             max_input_chars: 256_000,
-            token_budget: 100_000,
+            legacy_token_budget: None,
             max_research_calls: 4,
         }
     }
@@ -89,10 +91,6 @@ impl CuratorConfig {
         ensure!(
             (16_000..=1_000_000).contains(&self.max_input_chars),
             "curator max_input_chars must be 16000–1000000"
-        );
-        ensure!(
-            (1000..=1_000_000).contains(&self.token_budget),
-            "curator token budget must be 1000–1000000"
         );
         ensure!(
             (1..=16).contains(&self.max_research_calls),
@@ -154,7 +152,6 @@ pub struct Environment<'a> {
 }
 #[derive(Default)]
 struct Budget {
-    tokens: u64,
     usage: Vec<Value>,
     searches: usize,
 }
@@ -173,10 +170,6 @@ impl Session<'_> {
     ) -> Result<crate::provider::Response> {
         ensure!(!self.env.cancel.is_cancelled(), "curation cancelled");
         ensure!(
-            self.budget.lock().unwrap().tokens < self.env.config.token_budget,
-            "curation token budget exhausted"
-        );
-        ensure!(
             system.chars().count()
                 + serde_json::to_string(history)?.chars().count()
                 + serde_json::to_string(tools)?.chars().count()
@@ -189,17 +182,7 @@ impl Session<'_> {
         Ok(r)
     }
     fn usage(&self, raw: &Value) -> Result<()> {
-        let usage = crate::cache::Usage::parse(raw);
-        let mut b = self.budget.lock().unwrap();
-        b.tokens = b
-            .tokens
-            .saturating_add(usage.input.unwrap_or(0))
-            .saturating_add(usage.output.unwrap_or(0));
-        b.usage.push(raw.clone());
-        ensure!(
-            b.tokens <= self.env.config.token_budget,
-            "curation token budget exhausted"
-        );
+        self.budget.lock().unwrap().usage.push(raw.clone());
         Ok(())
     }
     async fn read(
@@ -255,11 +238,7 @@ impl Session<'_> {
                     .await
             }
             "web_search" => {
-                ensure!(
-                    !self.env.cancel.is_cancelled()
-                        && self.budget.lock().unwrap().tokens < self.env.config.token_budget,
-                    "curation search budget exhausted"
-                );
+                ensure!(!self.env.cancel.is_cancelled(), "curation cancelled");
                 {
                     let mut budget = self.budget.lock().unwrap();
                     ensure!(

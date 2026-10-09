@@ -163,21 +163,22 @@ idle_seconds = 300
 minimum_steps = 3
 description_chars = 240
 reviewers = 2
-timeout_seconds = 300
+timeout_seconds = 900
 max_steps = 8
 review_steps = 4
 max_input_chars = 256000
-token_budget = 100000
 max_research_calls = 4
 ```
 
-Defaults bound the whole pass to five minutes, eight drafting steps, four steps
+Defaults bound the whole pass to fifteen minutes, eight drafting steps, four steps
 per reviewer, 256,000 characters per request and four hosted-search calls shared
 across the job. Each hosted search allows at most two provider continuations and
-accounts usage before admitting another continuation. Reported tokens are checked
-before and after requests. Parallel reviewers can overshoot the threshold by their
-already in-flight requests (up to configured reviewer concurrency); missing usage
-cannot establish an exact cost. An exhausted budget blocks publication.
+records reported usage for diagnostics. There is no cumulative token cap: rereading
+inherited context, including cached input, never aborts drafting or review. Legacy
+`curator.token_budget` settings are accepted and ignored. The configurable
+`timeout_seconds` deadline starts when the fork executes, after the idle wait, and
+covers drafting plus all reviewers together. Cancellation, step, request-size and
+research-call limits still apply.
 
 For NixOS use `services.pantheon.skillDirectories`, `bundledSkills`, `skillCurator`
 and `settings.curator`. Seed files include `SKILL.md` with YAML name/description

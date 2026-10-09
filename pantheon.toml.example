@@ -71,11 +71,11 @@ minimum_steps = 3
 # Unicode characters shown for each description in the complete system catalogue.
 description_chars = 240
 reviewers = 2
-timeout_seconds = 300
+# Total running deadline for drafting and review, separate from the idle wait.
+timeout_seconds = 900
 max_steps = 8
 review_steps = 4
 max_input_chars = 256000
-token_budget = 100000
 max_research_calls = 4
 
 # MCP servers are optional; executable packages and credentials are configured

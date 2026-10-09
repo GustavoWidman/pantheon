@@ -701,45 +701,76 @@ async fn cancellation_retains_staged_proposal_without_publishing() {
 }
 
 #[tokio::test]
-async fn reported_token_budget_exhaustion_retains_draft_without_review_or_publication() {
-    let f = Fixture::new();
-    let job = f.job();
-    let server = Mock::new(
-        vec![
-            response(
-                vec![call(
+async fn repeated_large_cached_context_finishes_review_and_records_usage_without_a_token_cap() {
+    assert_eq!(CuratorConfig::default().timeout_seconds, 900);
+    for config in [
+        CuratorConfig::default(),
+        // Previously valid configs still load, but the old limit has no effect.
+        toml::from_str::<CuratorConfig>("token_budget = 1000").unwrap(),
+    ] {
+        config.validate().unwrap();
+        assert!(
+            serde_json::to_value(&config)
+                .unwrap()
+                .get("token_budget")
+                .is_none()
+        );
+        let f = Fixture::new();
+        let job = f.job();
+        let mut research = call("read", "evidence", "");
+        research.arguments = json!({"path":"evidence.txt"});
+        let cached = |calls| {
+            let mut value = response(calls, 30_000);
+            value["usage"]["input_tokens_details"] = json!({"cached_tokens":29_900});
+            value
+        };
+        let server = Mock::new(
+            vec![
+                cached(vec![call(
                     "create_skill",
                     "deployment-checks",
                     "Check observable state.",
-                )],
-                100,
-            ),
-            response(vec![], 1500),
-        ],
-        vec![],
-        0,
-    )
-    .await;
-    let config = CuratorConfig {
-        token_budget: 1000,
-        ..Default::default()
-    };
-    let cancel = CancellationToken::new();
-    run(
-        f.environment(&server, &config, &cancel),
-        &job,
-        f.frozen.clone(),
-    )
-    .await
-    .unwrap();
-    assert_inactive(&f, "failed");
-    assert!(
-        current_status(&f)["report"]
-            .as_str()
-            .unwrap()
-            .contains("token budget exhausted")
-    );
-    assert_eq!(server.state.requests.lock().unwrap().len(), 2);
+                )]),
+                cached(vec![research]),
+                cached(vec![]),
+            ],
+            vec![cached(vec![verdict(true)]), cached(vec![verdict(true)])],
+            0,
+        )
+        .await;
+        let cancel = CancellationToken::new();
+        run(
+            f.environment(&server, &config, &cancel),
+            &job,
+            f.frozen.clone(),
+        )
+        .await
+        .unwrap();
+        let status = current_status(&f);
+        assert_eq!(status["status"], "published");
+        assert_eq!(status["reviewers_finished"], 2);
+        assert_eq!(server.state.requests.lock().unwrap().len(), 5);
+        assert_eq!(f.library.notifications("42").unwrap().len(), 1);
+        assert!(
+            f.library
+                .snapshot()
+                .unwrap()
+                .entries
+                .contains_key("deployment-checks")
+        );
+        let usage: Vec<Value> = serde_json::from_str(status["usage"].as_str().unwrap()).unwrap();
+        assert_eq!(usage.len(), 5);
+        let total: u64 = usage
+            .iter()
+            .map(|u| u["input_tokens"].as_u64().unwrap() + u["output_tokens"].as_u64().unwrap())
+            .sum();
+        assert_eq!(total, 150_050);
+        assert!(
+            usage
+                .iter()
+                .all(|u| u["input_tokens_details"]["cached_tokens"] == 29_900)
+        );
+    }
 }
 
 #[tokio::test]
