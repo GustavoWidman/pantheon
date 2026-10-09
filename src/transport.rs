@@ -31,19 +31,23 @@ fn milliseconds(duration: std::time::Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
 }
 
+pub(crate) fn model_id(model: &str) -> &str {
+    if model.len() <= 200
+        && model
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/._:-".contains(&b))
+    {
+        model
+    } else {
+        "[invalid model ID]"
+    }
+}
+
 impl Exchange {
     pub fn new(model: &str, attempt: usize, timeout_seconds: Option<u64>) -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
-            model: if model.len() <= 200
-                && model
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"/._:-".contains(&b))
-            {
-                model.to_owned()
-            } else {
-                "[invalid model ID]".into()
-            },
+            model: model_id(model).to_owned(),
             attempt,
             timeout_seconds,
             started: Instant::now(),

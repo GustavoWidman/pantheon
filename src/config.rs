@@ -38,6 +38,8 @@ pub struct AgentConfig {
     pub max_subagents: usize,
     pub agent_idle_seconds: u64,
     pub request_timeout_seconds: u64,
+    pub request_max_attempts: usize,
+    pub request_backoff_seconds: u64,
     pub tool_timeout_seconds: u64,
     pub show_reasoning: bool,
     pub coordinator_root: bool,
@@ -74,6 +76,8 @@ impl Default for AgentConfig {
             max_subagents: 8,
             agent_idle_seconds: 3600,
             request_timeout_seconds: 300,
+            request_max_attempts: 4,
+            request_backoff_seconds: 2,
             tool_timeout_seconds: 120,
             show_reasoning: false,
             coordinator_root: false,
@@ -114,6 +118,10 @@ impl Config {
             "timeouts must be positive"
         );
         crate::provider::model_parts(&config.agent.model)?;
+        crate::provider::validate_request_retries(
+            config.agent.request_max_attempts,
+            config.agent.request_backoff_seconds,
+        )?;
         crate::provider::model_parts(&config.agent.compactor_model)?;
         validate_reasoning(&config.agent.reasoning)?;
         for (model, tokens) in &config.agent.context_windows {
@@ -144,4 +152,41 @@ pub fn validate_reasoning(s: &str) -> Result<()> {
         "reasoning must be none, minimal, low, medium, high, xhigh, max or ultra"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_configs_inherit_bounded_retries_and_operator_values_are_validated() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pantheon.toml");
+        let old = "[discord]\napplication_id = 1\nallowed_users = [2]\n";
+        std::fs::write(&path, old).unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.agent.request_max_attempts, 4);
+        assert_eq!(config.agent.request_backoff_seconds, 2);
+        for (attempts, backoff, valid) in [
+            (1, 1, true),
+            (5, 10, true),
+            (10, 60, true),
+            (0, 2, false),
+            (11, 2, false),
+            (4, 0, false),
+            (4, 61, false),
+        ] {
+            std::fs::write(&path, format!("{old}\n[agent]\nrequest_max_attempts={attempts}\nrequest_backoff_seconds={backoff}\n")).unwrap();
+            let config = Config::load(&path);
+            assert_eq!(
+                config.is_ok(),
+                valid,
+                "{attempts} attempts, {backoff}s delay"
+            );
+            if let Ok(config) = config {
+                assert_eq!(config.agent.request_max_attempts, attempts);
+                assert_eq!(config.agent.request_backoff_seconds, backoff);
+            }
+        }
+    }
 }

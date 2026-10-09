@@ -16,6 +16,10 @@ max_steps = 128
 max_subagents = 8
 agent_idle_seconds = 3600
 request_timeout_seconds = 300
+# Total HTTP attempts, including the first; 1 disables retries.
+request_max_attempts = 4
+# Linear retry waits: 2, 4, 6 seconds with the defaults.
+request_backoff_seconds = 2
 tool_timeout_seconds = 120
 # Full root tools with selective background delegation. Set true for a
 # strict coordinator that delegates all execution to workers.

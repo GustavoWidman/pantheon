@@ -5,6 +5,11 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::time::Duration;
 
+#[path = "provider_retry.rs"]
+mod retry;
+pub(crate) use retry::validate as validate_request_retries;
+use retry::{HttpFailure, RequestRetries, StreamFailure};
+
 #[derive(Clone)]
 pub struct Provider {
     http: reqwest::Client,
@@ -12,6 +17,7 @@ pub struct Provider {
     codex: CodexAuth,
     catalog: std::sync::Arc<crate::models::Catalog>,
     cache_affinity: uuid::Uuid,
+    retries: RequestRetries,
     #[cfg(test)]
     endpoint: Option<String>,
 }
@@ -57,6 +63,7 @@ impl Provider {
             codex: CodexAuth::new(AuthConfig::default()),
             catalog: std::sync::Arc::default(),
             cache_affinity: uuid::Uuid::new_v4(),
+            retries: RequestRetries::default(),
             #[cfg(test)]
             endpoint: None,
         })
@@ -69,12 +76,29 @@ impl Provider {
             codex: CodexAuth::new(AuthConfig::default()),
             catalog: std::sync::Arc::default(),
             cache_affinity: uuid::Uuid::new_v4(),
+            // Existing mocks test one exchange; retry fixtures enable their policy explicitly.
+            retries: RequestRetries {
+                max_attempts: 1,
+                ..Default::default()
+            },
             endpoint: Some(endpoint),
         }
     }
     pub fn with_auth(mut self, config: AuthConfig) -> Self {
         self.codex = CodexAuth::new(config);
         self
+    }
+    pub fn with_request_retries(
+        mut self,
+        max_attempts: usize,
+        backoff_seconds: u64,
+    ) -> Result<Self> {
+        validate_request_retries(max_attempts, backoff_seconds)?;
+        self.retries = RequestRetries {
+            max_attempts,
+            backoff: Duration::from_secs(backoff_seconds),
+        };
+        Ok(self)
     }
     pub fn with_catalog(mut self, catalog: std::sync::Arc<crate::models::Catalog>) -> Self {
         self.catalog = catalog;
@@ -545,7 +569,8 @@ impl Provider {
             let mut body = body.clone();
             body["prompt_cache_key"] = json!(affinity);
             let mut credentials = self.codex.credentials(None).await?;
-            for attempt in 0..2 {
+            let mut refreshed = false;
+            for attempt in 1..=self.retries.max_attempts {
                 #[cfg(test)]
                 let endpoint = self
                     .endpoint
@@ -569,20 +594,27 @@ impl Provider {
                 if let Some(residency) = &credentials.residency {
                     request = request.header("x-openai-internal-codex-residency", residency);
                 }
-                let value = self
-                    .receive_model_response(
-                        request.json(&body),
-                        model,
-                        attempt + 1,
-                        true,
-                        submitted,
-                    )
-                    .await?;
-                if value.is_none() {
-                    credentials = self.codex.credentials(Some(&credentials.access)).await?;
-                    continue;
+                let result = self
+                    .receive_model_response(request.json(&body), model, attempt, true, submitted)
+                    .await;
+                match result {
+                    Ok(value) => return Ok(value),
+                    Err(error) => {
+                        if error
+                            .downcast_ref::<HttpFailure>()
+                            .is_some_and(|e| e.status == reqwest::StatusCode::UNAUTHORIZED)
+                            && !refreshed
+                            && attempt < self.retries.max_attempts
+                        {
+                            credentials = self.codex.credentials(Some(&credentials.access)).await?;
+                            refreshed = true;
+                            continue;
+                        }
+                        if !self.retry_request(model, &error, attempt).await {
+                            return Err(error);
+                        }
+                    }
                 }
-                return Ok(value.unwrap());
             }
             unreachable!();
         }
@@ -619,10 +651,47 @@ impl Provider {
                 .header("x-api-key", key)
                 .header("anthropic-version", "2023-06-01")
         };
-        Ok(self
-            .receive_model_response(req.json(body), model, 1, false, submitted)
-            .await?
-            .unwrap())
+        let request = req.json(body);
+        for attempt in 1..=self.retries.max_attempts {
+            let result = self
+                .receive_model_response(
+                    request
+                        .try_clone()
+                        .context("provider request cannot be replayed")?,
+                    model,
+                    attempt,
+                    false,
+                    submitted,
+                )
+                .await;
+            match result {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    if !self.retry_request(model, &error, attempt).await {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        unreachable!();
+    }
+    async fn retry_request(&self, model: &str, error: &anyhow::Error, attempt: usize) -> bool {
+        let Some(delay) = self.retries.delay(error, attempt) else {
+            return false;
+        };
+        // No payload/error strings: the exchange diagnostic records the cause.
+        tracing::warn!(
+            model = crate::transport::model_id(model),
+            attempt,
+            max_attempts = self.retries.max_attempts,
+            next_attempt = attempt + 1,
+            retry_delay_ms = delay.as_millis() as u64,
+            "provider request retry scheduled"
+        );
+        // The caller's cancellation/deadline select drops this future, including
+        // its sleep. Nothing is appended or dispatched until a complete response.
+        tokio::time::sleep(delay).await;
+        true
     }
     async fn receive_model_response(
         &self,
@@ -631,7 +700,7 @@ impl Provider {
         attempt: usize,
         streaming: bool,
         submitted: Option<&(dyn Fn() -> Result<()> + Sync)>,
-    ) -> Result<Option<Value>> {
+    ) -> Result<Value> {
         let mut diagnostic = crate::transport::Exchange::new(model, attempt, self.timeout_seconds);
         let result = async {
             let pending = request.send();
@@ -643,22 +712,22 @@ impl Provider {
                 .map_err(reqwest::Error::without_url)
                 .context("provider transport failure")?;
             diagnostic.headers(&response);
-            if response.status() == reqwest::StatusCode::UNAUTHORIZED
-                && model.starts_with("codex/")
-                && attempt == 1
-            {
-                return Ok(None);
-            }
             // Do not expose provider error bodies: they can echo prompts or credentials.
-            ensure!(
-                response.status().is_success(),
-                "{} returned HTTP {}",
-                model.split('/').next().unwrap_or("provider"),
-                response.status()
-            );
-            read_response_observed(response, streaming, Some(&mut diagnostic))
-                .await
-                .map(Some)
+            if !response.status().is_success() {
+                return Err(HttpFailure {
+                    status: response.status(),
+                    provider: if model.starts_with("codex/") {
+                        "codex"
+                    } else if model.starts_with("anthropic/") {
+                        "anthropic"
+                    } else {
+                        "openai"
+                    },
+                    retry_after: retry::retry_after(response.headers()),
+                }
+                .into());
+            }
+            read_response_observed(response, streaming, Some(&mut diagnostic)).await
         }
         .await;
         diagnostic.finish(result)
@@ -1051,10 +1120,9 @@ async fn read_response_observed(
     if let Some(d) = diagnostic.as_deref_mut() {
         d.stage = "premature_eof";
     }
-    ensure!(
-        !sse,
-        "provider stream ended without a completed response; no tools from this response executed"
-    );
+    if sse {
+        return Err(StreamFailure::PrematureEof.into());
+    }
     if let Some(d) = diagnostic {
         d.stage = "json_decode";
     }
@@ -1163,6 +1231,9 @@ impl SseDecoder {
                         self.completed_items.insert(index, item);
                     }
                     Some("error" | "response.failed" | "response.incomplete") => {
+                        if retry::transient_event(&event) {
+                            return Err(StreamFailure::Transient.into());
+                        }
                         bail!(
                             "provider stream failed or was incomplete; no tools from this response executed"
                         )
@@ -1180,6 +1251,7 @@ impl SseDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("provider_retry_tests.rs");
     #[test]
     fn private_search_affinity_is_stable_and_separate_from_its_parent() {
         let parent = uuid::Uuid::new_v4();
@@ -1603,7 +1675,10 @@ mod tests {
             drop(loss);
             let _ = socket.write_all(body.as_bytes()).await;
         });
-        let mut provider = Provider::new(70).unwrap();
+        let mut provider = Provider::new(70)
+            .unwrap()
+            .with_request_retries(1, 2)
+            .unwrap();
         provider.endpoint = Some(endpoint);
         let started = std::time::Instant::now();
         let log = DiagnosticLog::default();
@@ -1644,7 +1719,10 @@ mod tests {
                     json!({"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","name":"shell","call_id":"pending","arguments":"{}"}})),
             )
             .await;
-            let mut provider = Provider::new(1).unwrap();
+            let mut provider = Provider::new(1)
+                .unwrap()
+                .with_request_retries(1, 2)
+                .unwrap();
             provider.endpoint = Some(endpoint);
             let log = DiagnosticLog::default();
             let started = std::time::Instant::now();

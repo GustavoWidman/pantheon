@@ -72,7 +72,7 @@ Root and workers have [skill discovery/loading](docs/skills.md) and [MCP integra
 ## State and checks
 
 [Cache diagnostics](docs/cache.md) distinguish provider-reported reuse from local
-prefix stability. [Transport diagnostics](docs/transport.md) correlate provider failures with timing, stream progress and underlying transport causes. [Tool activity](docs/tool-activity.md) shows compact previews,
+prefix stability. [Transport diagnostics and retries](docs/transport.md) correlate provider failures with timing, stream progress and underlying transport causes; configurable linear backoff recovers transient failures without replaying completed tools. [Tool activity](docs/tool-activity.md) shows compact previews,
 line counts, exit codes and original-message updates for detached shells. Steering
 queues behind requested tool execution; `/stop` explicitly cancels work.
 

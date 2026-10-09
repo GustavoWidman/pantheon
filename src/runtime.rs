@@ -175,6 +175,10 @@ impl Harness {
         );
         let h = Self {
             provider: Provider::new(config.agent.request_timeout_seconds)?
+                .with_request_retries(
+                    config.agent.request_max_attempts,
+                    config.agent.request_backoff_seconds,
+                )?
                 .with_auth(config.auth.clone())
                 .with_catalog(discord.models.clone()),
             web: crate::web::Web::new(config.state_dir.join("web/cache"), config.web.clone())?,
@@ -4058,4 +4062,5 @@ for line in sys.stdin:
         server.abort();
     }
     include!("runtime_curator_tests.rs");
+    include!("runtime_request_retry_tests.rs");
 }
