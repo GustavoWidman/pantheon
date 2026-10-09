@@ -27,7 +27,10 @@ pub struct Harness {
     provider: Provider,
     web: crate::web::Web,
     browser: BrowserManager,
-    skills: crate::skills::Skills,
+    skills: crate::skill_library::SkillLibrary,
+    curators: Mutex<HashMap<u64, CancellationToken>>,
+    curator_changed: Notify,
+    curator_instructions: String,
     mcp: crate::mcp::Mcp,
     channels: Mutex<HashMap<u64, Arc<Channel>>>,
     children: Mutex<HashMap<String, Child>>,
@@ -74,6 +77,12 @@ struct Run {
     trace: Option<Memory>,
     steering: Vec<String>,
     context: crate::ui::ReplyContext,
+    skills: Arc<crate::skills::Skills>,
+    task: String,
+    system: Option<String>,
+    steps: usize,
+    invocation_scope: String,
+    counted_skills: HashSet<String>,
 }
 
 /// One startup prefix shared by production and opt-in behavioral evaluations.
@@ -95,7 +104,7 @@ pub fn system_prompt(
         "This agent has direct execution tools. shell is available and can inspect the actual machine and requested environment values. browser is available for authorized account activities and credential entry. Use these tools instead of asking the user to perform available checks."
     };
     format!(
-        "{}\n{}\nCurrent harness capabilities (authoritative over obsolete chat claims): {names}.\n{execution}\n{skill_index}\n{instructions}",
+        "{}\n{}\nCurrent harness capabilities (authoritative over obsolete chat claims): {names}.\n{execution}\n{instructions}\n{skill_index}",
         if child {
             include_str!("child.txt")
         } else {
@@ -103,6 +112,27 @@ pub fn system_prompt(
         },
         include_str!("behavior.txt")
     )
+}
+fn curator_note(note: &Value) -> Result<String> {
+    let escape = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    };
+    let kind = match note["kind"].as_str() {
+        Some("add") => "add",
+        Some("modify") => "modify",
+        Some("retire") => "retire",
+        _ => bail!("invalid curator notification"),
+    };
+    Ok(format!(
+        "<curator-skill-{kind} name=\"{}\" revision=\"{}\">{} {}</curator-skill-{kind}>",
+        escape(tools::string(note, "skill")?),
+        tools::number(note, "revision")?,
+        escape(tools::string(note, "summary")?),
+        escape(tools::string(note, "purpose")?)
+    ))
 }
 impl Harness {
     fn reasoning_for_model(&self, model: &str, requested: &str) -> Result<String> {
@@ -124,9 +154,25 @@ impl Harness {
         for (channel, model) in store.chat_models()? {
             discord.models.set_chat_model(channel, &model);
         }
+        for channel in store.model_override_channels()? {
+            discord.models.set_kind_model(
+                channel,
+                "compact",
+                Some(&store.compactor_model(channel, &config.agent.compactor_model)?),
+            )?;
+            discord.models.set_kind_model(
+                channel,
+                "curator",
+                store.curator_model(channel)?.as_deref(),
+            )?;
+        }
         let instructions = config.instructions()?;
-        let skills = crate::skills::Skills::load(&config.skills)?;
-        let skill_index = skills.index();
+        let skills = crate::skill_library::SkillLibrary::open(&config.skills, &config.state_dir)?;
+        let skill_index = format!(
+            "{}\n{}",
+            crate::skill_library::INDEX,
+            skills.catalogue(config.curator.description_chars)?
+        );
         let h = Self {
             provider: Provider::new(config.agent.request_timeout_seconds)?
                 .with_auth(config.auth.clone())
@@ -149,6 +195,9 @@ impl Harness {
             ),
             child_system: system_prompt(true, false, &skill_index, &instructions),
             skills,
+            curators: Mutex::new(HashMap::new()),
+            curator_changed: Notify::new(),
+            curator_instructions: instructions,
             config,
             store,
             discord,
@@ -180,6 +229,20 @@ impl Harness {
                 .append_with_id(Kind::User, &input.text, &input.id)?;
             self.store.mark_logged(&input.id)?;
         }
+        self.discord.models.set_kind_model(
+            id,
+            "compact",
+            Some(
+                &self
+                    .store
+                    .compactor_model(id, &self.config.agent.compactor_model)?,
+            ),
+        )?;
+        self.discord.models.set_kind_model(
+            id,
+            "curator",
+            self.store.curator_model(id)?.as_deref(),
+        )?;
         channels.insert(id, c.clone());
         let h = self.clone();
         let cc = c.clone();
@@ -227,6 +290,8 @@ impl Harness {
         let progress = tokio::spawn(async move { h.progress_worker().await });
         let h = self.clone();
         let reactions = tokio::spawn(async move { h.reaction_worker().await });
+        let h = self.clone();
+        let curation = tokio::spawn(async move { h.curator_worker().await });
         let mut commands = tokio::task::JoinSet::new();
         let command_capacity = Arc::new(Semaphore::new(16));
         for id in self.store.queued_channels()? {
@@ -240,7 +305,7 @@ impl Harness {
                     let Some(input)=input else{break;};
                     match input {
                         Inbound::Prompt{id,channel,user,text}=>{
-                            let admitted=self.store.admit(&Input{id:id.clone(),channel,user,text})?;self.discord.acknowledge(&id)?;if admitted {self.channel(channel).await?.incoming.notify_one();}
+                            let admitted=self.admit_prompt(&Input{id:id.clone(),channel,user,text})?;self.discord.acknowledge(&id)?;if admitted {self.channel(channel).await?.incoming.notify_one();}
                         }
                         Inbound::Command{id:_,token,channel,user,name,options}=>{
                             let h=self.clone();let permit=command_capacity.clone().try_acquire_owned();
@@ -250,6 +315,12 @@ impl Harness {
                                     Err(_)=>crate::ui::card("Please try again shortly","This channel has too many active commands.",vec![],true),
                                 };
                                 if h.discord.reply_card(&token,card).await.is_err(){tracing::warn!(channel,"interaction reply failed");}
+                            });
+                        }
+                        Inbound::Component{id:_,token,channel,user,custom_id,values}=>{
+                            let h=self.clone();commands.spawn(async move {
+                                let card=crate::skill_dashboard::render(&h.skills,channel,user,&custom_id,&values).unwrap_or_else(|e|json!({"content":e.to_string(),"embeds":[],"components":[],"allowed_mentions":{"parse":[]}}));
+                                if let Err(e)=h.discord.reply_card(&token,card).await {tracing::warn!(channel,error=%e,"dashboard interaction failed");}
                             });
                         }
                     }
@@ -274,6 +345,7 @@ impl Harness {
             let _ = jobs.await;
             let _ = progress.await;
             let _ = reactions.await;
+            let _ = curation.await;
         })
         .await;
         Ok(())
@@ -304,6 +376,188 @@ impl Harness {
             }
             tokio::select! {_=changed=>{},_=cancel.cancelled()=>bail!("turn cancelled while waiting for summaries"),_=self.shutdown.cancelled()=>bail!("shutdown")}
         }
+    }
+    fn admit_prompt(&self, input: &Input) -> Result<bool> {
+        self.store.admit(input)
+    }
+    async fn curator_settings(&self, channel: u64) -> Result<(String, String)> {
+        let main = self.store.settings(
+            channel,
+            &self.config.agent.model,
+            &self.config.agent.reasoning,
+        )?;
+        let selected = self.store.curator_model(channel)?;
+        let model = match selected.as_deref() {
+            Some("none") => main.0.clone(),
+            Some(m) => m.to_owned(),
+            None => self.config.curator.model.clone().unwrap_or(main.0.clone()),
+        };
+        let selected = self.store.reasoning_override(channel, "curator")?;
+        let inherited = self.discord.models.reasoning(&model, &main.1);
+        let requested = match selected.as_deref() {
+            Some("inherit") => inherited.clone(),
+            Some(e) => e.to_owned(),
+            None => self.config.curator.reasoning.clone().unwrap_or(inherited),
+        };
+        let effort = self.reasoning_for_model(&model, &requested)?;
+        self.discord.models.validate_effort(&model, &effort)?;
+        Ok((model, effort))
+    }
+    async fn cancel_curator(&self, channel: u64) -> Result<()> {
+        if let Some(cancel) = self.curators.lock().await.get(&channel) {
+            cancel.cancel();
+        }
+        self.skills.cancel_channel_forks(&channel.to_string())?;
+        Ok(())
+    }
+    async fn curator_worker(self: Arc<Self>) {
+        loop {
+            tokio::select! {_=self.shutdown.cancelled()=>break,_=self.curator_changed.notified()=>{},_=tokio::time::sleep(Duration::from_secs(10))=>{}}
+            let result: Result<()> = async {
+                // Bridge publication receipts idempotently; they never enter the root inbox.
+                for channel in self.skills.notification_channels()? {
+                    for event in self.skills.pending_skill_events(&channel)? {
+                        let verb = match event["kind"].as_str() {
+                            Some("add") => ("✦", "created"),
+                            Some("retire") => ("⊖", "retired"),
+                            _ => ("↻", "modified"),
+                        };
+                        let id = event["id"].as_str().context("notification id")?;
+                        self.store.curator_activity(
+                            channel.parse()?,
+                            id,
+                            &format!(
+                                "{} curator · {} skill {}",
+                                verb.0,
+                                verb.1,
+                                event["skill"].as_str().unwrap_or("unknown")
+                            ),
+                        )?;
+                        self.skills
+                            .mark_skill_events_presented(&channel, &[id.into()])?;
+                    }
+                }
+                if !self.config.curator.enabled {
+                    return Ok(());
+                }
+                for channel in self.skills.queued_channels()? {
+                    let id = channel.parse::<u64>()?;
+                    if self.curators.lock().await.contains_key(&id)
+                        || self.store.has_channel_work(id)?
+                    {
+                        continue;
+                    }
+                    let requested = self.skills.fork_requested(&channel)?;
+                    let last = self
+                        .skills
+                        .last_settled(&channel)?
+                        .unwrap_or(crate::store::now());
+                    if !requested
+                        && crate::store::now() - last < self.config.curator.idle_seconds as i64
+                    {
+                        continue;
+                    }
+                    let c = self.channel(id).await?;
+                    let memory = {
+                        let m = c.memory.lock().await;
+                        if !m.is_settled() {
+                            continue;
+                        }
+                        Arc::new(m.snapshot()?)
+                    };
+                    // Claim under channel-specific state. Other channels continue independently.
+                    let Some(job) = self.skills.take_fork(&channel)? else {
+                        continue;
+                    };
+                    let cancel = self.shutdown.child_token();
+                    self.curators.lock().await.insert(id, cancel.clone());
+                    let h = self.clone();
+                    tokio::spawn(async move {
+                        let result: Result<()> = async {
+                            let settings = h.curator_settings(id).await?;
+                            h.skills
+                                .pin_fork_settings(&job.id, &settings.0, &settings.1)?;
+                            let provider = h.provider.clone().with_cache_affinity(
+                                h.store.cache_affinity(&format!("curator:{id}"))?,
+                            );
+                            let reviewers = (0..h.config.curator.reviewers)
+                                .map(|slot| {
+                                    Ok(h.provider.clone().with_cache_affinity(
+                                        h.store.cache_affinity(&format!(
+                                            "curator-reviewer:{id}:{slot}"
+                                        ))?,
+                                    ))
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+                            crate::curator::run(
+                                crate::curator::Environment {
+                                    provider,
+                                    reviewer_providers: reviewers,
+                                    library: &h.skills,
+                                    web: &h.web,
+                                    workspace: &h.config.workspace,
+                                    config: &h.config.curator,
+                                    instructions: &h.curator_instructions,
+                                    model: &settings.0,
+                                    reasoning: &settings.1,
+                                    cancel: &cancel,
+                                },
+                                &job,
+                                memory,
+                            )
+                            .await
+                        }
+                        .await;
+                        if let Err(e) = result {
+                            let _ = h.skills.finish_fork(
+                                &job.id,
+                                "failed",
+                                &json!({"reason":e.to_string()}),
+                                &[],
+                            );
+                            tracing::warn!(channel=id,error=%e,"curator fork failed");
+                        }
+                        h.curators.lock().await.remove(&id);
+                        h.curator_changed.notify_one();
+                    });
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(e) = result {
+                tracing::warn!(error=%e,"curator maintenance failed");
+            }
+        }
+    }
+    async fn skill_notifications(&self, channel: u64, memory: &Channel) -> Result<Option<String>> {
+        let notes = self.skills.notifications(&channel.to_string())?;
+        if notes.is_empty() {
+            return Ok(None);
+        }
+        let mut parts = vec![];
+        let mut ids = vec![];
+        for note in notes {
+            let id = note["id"].as_str().context("notification id")?.to_owned();
+            let text = curator_note(&note)?;
+            let mut m = memory.memory.lock().await;
+            let source = format!("curator-note:{id}");
+            let already = m.has_source(&source);
+            m.append_with_id(Kind::User, &text, &source)?;
+            if !already {
+                parts.push(text);
+            }
+            ids.push(id);
+        }
+        self.skills
+            .acknowledge_notifications(&channel.to_string(), &ids)?;
+        memory.changed.notify_waiters();
+        if parts.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(format!(
+            "<system-notification>\n{}\n</system-notification>",
+            parts.join("\n")
+        )))
     }
     async fn channel_worker(self: Arc<Self>, channel: u64, c: Arc<Channel>) -> Result<()> {
         loop {
@@ -364,6 +618,25 @@ impl Harness {
                 continue;
             }
             let view = view.unwrap();
+            let refresh = self.skills.catalogue_refresh_due(
+                &channel.to_string(),
+                self.config.curator.idle_seconds,
+                crate::store::now(),
+            )?;
+            let catalogue = self.skills.cache_catalogue(
+                &channel.to_string(),
+                &self
+                    .skills
+                    .catalogue(self.config.curator.description_chars)?,
+                refresh,
+            )?;
+            let system = system_prompt(
+                false,
+                self.config.agent.coordinator_root,
+                &format!("{}\n{catalogue}", crate::skill_library::INDEX),
+                &self.curator_instructions,
+            );
+            let note = self.skill_notifications(channel, &c).await?;
             let mut ids = vec![];
             let mut texts = vec![];
             for input in &queued {
@@ -382,7 +655,7 @@ impl Harness {
                 channel,
                 &settings.0,
                 &settings.1,
-                &self.master_system,
+                &system,
                 &tools::definitions(false, self.config.agent.coordinator_root),
                 &view,
             )?;
@@ -394,12 +667,25 @@ impl Harness {
                 child: false,
                 memory: c.clone(),
                 cancel: cancel.clone(),
-                history: Provider::start(vendor, &view, &texts.join("\n\n")),
+                history: Provider::start(
+                    vendor,
+                    &view,
+                    &match note {
+                        Some(note) => format!("{note}\n\n{}", texts.join("\n\n")),
+                        None => texts.join("\n\n"),
+                    },
+                ),
                 settings,
                 inputs: ids,
                 trace: None,
                 steering: vec![],
                 context,
+                skills: self.skills.snapshot()?,
+                task: texts.join("\n\n").chars().take(8000).collect(),
+                system: Some(system),
+                steps: 0,
+                invocation_scope: uuid::Uuid::new_v4().to_string(),
+                counted_skills: HashSet::new(),
             };
             let run_id = queued[0].id.clone();
             let result = self.clone().run_agent(run).await;
@@ -427,11 +713,13 @@ impl Harness {
             let (vendor, _) = model_parts(&run.settings.0)?;
             let vendor = vendor.to_string();
             let defs = tools::definitions(run.child, self.config.agent.coordinator_root);
-            let system = if run.child {
-                &self.child_system
-            } else {
-                &self.master_system
-            };
+            let system = run.system.clone().unwrap_or_else(|| {
+                if run.child {
+                    self.child_system.clone()
+                } else {
+                    self.master_system.clone()
+                }
+            });
             let name = self.store.agent_label(&run.owner)?;
             self.store.present_agent(
                 &run.owner,
@@ -442,9 +730,18 @@ impl Harness {
             )?;
             self.store.agent_phase(&run.owner, true, "Thinking")?;
             let run_id = uuid::Uuid::new_v4().to_string();
+            run.invocation_scope = run_id.clone();
             let outcome = self
-                .run_steps(&mut run, &vendor, &defs, system, &run_id)
+                .run_steps(&mut run, &vendor, &defs, &system, &run_id)
                 .await;
+            if !run.child {
+                self.skills
+                    .note_channel_settled(&run.channel.to_string(), crate::store::now())?;
+                if self.config.curator.enabled && run.steps >= self.config.curator.minimum_steps {
+                    self.skills.enqueue_fork(&run.channel.to_string(),&run_id,&json!({"user":run.user,"activity":run.context.activity,"task":run.task,"model_iterations":run.steps,"turn_completed":outcome.is_ok()}))?;
+                    self.curator_changed.notify_one();
+                }
+            }
             self.store
                 .refresh_activities(run.channel, run.memory.memory.lock().await.is_settled())?;
             self.store.agent_phase(
@@ -490,6 +787,7 @@ impl Harness {
                     .instrument(tracing::info_span!("provider_step", channel=run.channel, owner=%run.owner, run_id=%run_id, step))=>r?,
                 _=run.cancel.cancelled()=>bail!("cancelled"),
             };
+            run.steps += 1;
             if !run.child {
                 self.store.observed_usage(
                     run.channel,
@@ -706,6 +1004,11 @@ impl Harness {
                 received = true;
             }
         } else {
+            if let Some(note) = self.skill_notifications(run.channel, &run.memory).await? {
+                run.skills = self.skills.snapshot()?;
+                run.steering.push(note);
+                received = true;
+            }
             for input in self.store.queued(run.channel)? {
                 let context = self.store.reply_context(&input.id)?;
                 let prompt = self.store.is_prompt(&input.id)?;
@@ -748,7 +1051,24 @@ impl Harness {
                 a["offset"].as_u64().unwrap_or(0) as usize,
                 a["limit"].as_u64().unwrap_or(25) as usize,
             ),
-            "skill" => self.skills.execute(a)?,
+            "skill" => {
+                let value = if a["action"] == "history" {
+                    self.skills.history(
+                        tools::string(a, "id")?,
+                        a["offset"].as_u64().unwrap_or(0) as usize,
+                    )?
+                } else {
+                    run.skills.execute(a)?
+                };
+                if a["action"] == "load" && a["file"].as_str().is_none_or(|file| file == "SKILL.md")
+                {
+                    let id = tools::string(a, "id")?;
+                    if run.counted_skills.insert(id.into()) {
+                        self.skills.record_invocation(id, &run.invocation_scope)?;
+                    }
+                }
+                value
+            }
             "mcp" => {
                 self.mcp
                     .execute(
@@ -1075,7 +1395,9 @@ impl Harness {
                 let prompt=if !resumed {task.clone()} else {format!("Continue the existing task: {task}\nYour previous private turn ended with: {previous}\nThe new inbox notifications contain results of work already started. Use those results to continue; do not start the task over or repeat completed commands or delays. Inspect saved effects if a result is unclear.")};
                 trace.append(Kind::User,&prompt)?;
                 let (vendor,_)=model_parts(&settings.0)?;
-                let run=Run {channel,user,owner:id.clone(),child:true,memory:memory.clone(),cancel,settings:settings.clone(),history:Provider::start(vendor,&view,&prompt),inputs:vec![],trace:Some(trace),steering:vec![],context:context.clone()};
+                let catalogue=h.skills.cache_catalogue(&channel.to_string(),&h.skills.catalogue(h.config.curator.description_chars)?,false)?;
+                let worker_system=system_prompt(true,false,&format!("{}\n{catalogue}",crate::skill_library::INDEX),&h.curator_instructions);
+                let run=Run {channel,user,owner:id.clone(),child:true,memory:memory.clone(),cancel,settings:settings.clone(),history:Provider::start(vendor,&view,&prompt),inputs:vec![],trace:Some(trace),steering:vec![],context:context.clone(),skills:h.skills.snapshot()?,task:prompt.chars().take(8000).collect(),system:Some(worker_system),steps:0,invocation_scope:uuid::Uuid::new_v4().to_string(),counted_skills:HashSet::new()};
                 h.clone().run_agent(run).await
             }.await;
             let successful = outcome.is_ok();
@@ -1314,53 +1636,170 @@ impl Harness {
             &self.config.agent.reasoning,
         )?;
         let text = match name {
-            "skills" => {
-                if let Some(id) = args["id"].as_str() {
-                    let skill = self
-                        .skills
-                        .execute(&json!({"action":"load","id":id,"max_chars":800}))?;
-                    return Ok(crate::ui::card(
-                        "Skill guide",
-                        "Load the full guide and supporting references through the agent's skill tool.",
-                        vec![
-                            (
-                                "Name",
-                                format!("{} (`{id}`)", skill["name"].as_str().unwrap()),
-                                false,
-                            ),
-                            (
-                                "Purpose",
-                                skill["description"].as_str().unwrap().to_owned(),
-                                false,
-                            ),
-                            ("Preview", skill["text"].as_str().unwrap().to_owned(), false),
-                        ],
-                        false,
-                    ));
+            "curator" => {
+                match args["action"].as_str().unwrap_or("status") {
+                    "run" => {
+                        ensure!(self.config.curator.enabled, "Curator is disabled");
+                        ensure!(
+                            self.skills.request_channel_fork(&channel.to_string())?,
+                            "No eligible queued work: curation requires a settled task with enough model iterations"
+                        );
+                        self.curator_changed.notify_one();
+                    }
+                    "cancel" => self.cancel_curator(channel).await?,
+                    "status" => {}
+                    _ => bail!("Unknown curator action"),
                 }
-                let page = self.skills.execute(&json!({"action":"list"}))?;
-                let mut fields = page["skills"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|s| {
-                        (
-                            s["id"].as_str().unwrap(),
-                            s["description"].as_str().unwrap().to_owned(),
-                            false,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                if fields.is_empty() {
-                    fields.push(("Available guides", "No skills configured.".into(), false));
-                }
-                fields.push(("Discovery","The agent can browse the complete catalog with `skill`. Use `/skills id:<name>` to inspect a guide.".into(),false));
-                return Ok(crate::ui::card(
-                    "Skills",
-                    "Task-specific methods for everyday and technical work.",
-                    fields,
-                    false,
+                let settings = self.curator_settings(channel).await?;
+                let mut status = self.skills.channel_status(&channel.to_string())?;
+                status["enabled"] = json!(self.config.curator.enabled);
+                status["requested"] = json!(self.skills.fork_requested(&channel.to_string())?);
+                return Ok(crate::skill_dashboard::curator_status(
+                    &status,
+                    &settings.0,
+                    &settings.1,
                 ));
+            }
+            "skills" => {
+                let action = args["action"].as_str().unwrap_or("list");
+                match action {
+                    "curator" => {
+                        let settings = self.curator_settings(channel).await?;
+                        let mut status = self.skills.channel_status(&channel.to_string())?;
+                        status["enabled"] = json!(self.config.curator.enabled);
+                        status["requested"] =
+                            json!(self.skills.fork_requested(&channel.to_string())?);
+                        return Ok(crate::skill_dashboard::curator_status(
+                            &status,
+                            &settings.0,
+                            &settings.1,
+                        ));
+                    }
+                    "curate" => {
+                        ensure!(self.config.curator.enabled, "Curator is disabled");
+                        ensure!(
+                            self.skills.request_channel_fork(&channel.to_string())?,
+                            "No eligible queued work"
+                        );
+                        self.curator_changed.notify_one();
+                        return Ok(crate::ui::card(
+                            "Curation requested",
+                            "This channel's eligible work will run once memory settles; the idle debounce is bypassed.",
+                            vec![],
+                            false,
+                        ));
+                    }
+                    "proposals" => {
+                        let proposals = self.skills.proposals(&channel.to_string())?;
+                        return Ok(crate::ui::card(
+                            "Skill proposals",
+                            "Recent proposals from this channel. Use action:proposal with an attempt ID to inspect one.",
+                            proposals
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|p| {
+                                    (
+                                        "Proposal",
+                                        format!(
+                                            "`{}` · {}\n{}\n{}",
+                                            p["id"].as_str().unwrap(),
+                                            p["status"].as_str().unwrap(),
+                                            p["task_family"].as_str().unwrap(),
+                                            p["reason"].as_str().unwrap()
+                                        ),
+                                        false,
+                                    )
+                                })
+                                .collect(),
+                            false,
+                        ));
+                    }
+                    "proposal" => {
+                        let id = tools::string(&args, "id")?;
+                        let p = self.skills.proposal(&channel.to_string(), id)?;
+                        let changes = p
+                            .changes
+                            .iter()
+                            .map(|c| {
+                                format!(
+                                    "{} · {} from revision {}",
+                                    c.id,
+                                    if c.retire { "retire" } else { "create/revise" },
+                                    c.expected_revision
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        return Ok(crate::ui::card(
+                            "Skill proposal",
+                            &p.reason,
+                            vec![
+                                ("Changes", changes, false),
+                                ("Task family", p.task_family, false),
+                                ("Triggers", p.triggers, false),
+                                ("Procedure", p.procedure, false),
+                                ("Variable inputs", p.variables, false),
+                                ("Verification", p.verification, false),
+                                ("Limits", p.limits, false),
+                            ],
+                            false,
+                        ));
+                    }
+                    "history" => {
+                        let id = tools::string(&args, "id")?;
+                        let history = self.skills.history(id, 0)?;
+                        return Ok(crate::ui::card(
+                            "Skill revisions",
+                            &format!("History for `{id}`"),
+                            history["revisions"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|r| {
+                                    (
+                                        "Revision",
+                                        format!(
+                                            "{}{} — {}",
+                                            r["revision"],
+                                            if r["retired"] == true {
+                                                " (retired)"
+                                            } else {
+                                                ""
+                                            },
+                                            r["reason"].as_str().unwrap()
+                                        ),
+                                        false,
+                                    )
+                                })
+                                .collect(),
+                            false,
+                        ));
+                    }
+                    "rollback" => {
+                        self.cancel_curator(channel).await?;
+                        let id = tools::string(&args, "id")?;
+                        self.skills.rollback(
+                            id,
+                            i64::try_from(tools::number(&args, "revision")?)
+                                .context("revision too large")?,
+                        )?;
+                        return Ok(crate::ui::card(
+                            "Skill restored",
+                            &format!(
+                                "Restored `{id}` as a new revision. Active turns keep their existing snapshot."
+                            ),
+                            vec![],
+                            false,
+                        ));
+                    }
+                    "list" => {}
+                    _ => bail!("Unknown skills action"),
+                }
+                return match args["id"].as_str() {
+                    Some(id) => crate::skill_dashboard::open_skill(&self.skills, channel, user, id),
+                    None => crate::skill_dashboard::home(&self.skills, channel, user),
+                };
             }
             "mcp" => {
                 let servers = self.mcp.servers(channel, false);
@@ -1398,11 +1837,45 @@ impl Harness {
             "model" => {
                 let kind = args["kind"].as_str().unwrap_or("chat");
                 ensure!(
-                    ["chat", "compact"].contains(&kind),
-                    "Model kind must be chat or compact"
+                    ["chat", "compact", "curator"].contains(&kind),
+                    "Model kind must be chat, compact or curator"
                 );
                 let provider = args["provider"].as_str();
                 let selected = args["model"].as_str().or_else(|| args["id"].as_str());
+                if kind == "curator" {
+                    if let Some(id) = selected {
+                        let target = match id {
+                            "none" => Some("none".to_owned()),
+                            "default" => None,
+                            _ => Some(self.discord.models.resolve(provider, id)?),
+                        };
+                        let effective = match target.as_deref() {
+                            Some("none") => model.clone(),
+                            Some(m) => m.to_owned(),
+                            None => self.config.curator.model.clone().unwrap_or(model.clone()),
+                        };
+                        let preferred = self.discord.models.reasoning(&effective, &reasoning);
+                        self.reasoning_for_model(&effective, &preferred)?;
+                        self.store.set_curator_model(channel, target.as_deref())?;
+                        self.discord.models.set_kind_model(
+                            channel,
+                            "curator",
+                            target.as_deref(),
+                        )?;
+                    } else {
+                        ensure!(provider.is_none(), "Select a model to change providers");
+                    }
+                    let settings = self.curator_settings(channel).await?;
+                    return Ok(crate::ui::card(
+                        "Curator model",
+                        "Applies to newly started jobs and all their reviewers. model:none inherits the main model; default restores configuration.",
+                        vec![
+                            ("Model", settings.0, false),
+                            ("Reasoning", settings.1, true),
+                        ],
+                        false,
+                    ));
+                }
                 if let Some(id) = selected {
                     let target = if id == "default" {
                         if kind == "chat" {
@@ -1421,6 +1894,11 @@ impl Harness {
                     if kind == "compact" {
                         self.store.set_compactor_model(
                             channel,
+                            if id == "default" { None } else { Some(&target) },
+                        )?;
+                        self.discord.models.set_kind_model(
+                            channel,
+                            "compact",
                             if id == "default" { None } else { Some(&target) },
                         )?;
                         c.changed.notify_one();
@@ -1449,35 +1927,64 @@ impl Harness {
                 ));
             }
             "reasoning" => {
+                let kind = args["kind"].as_str().unwrap_or("chat");
+                ensure!(
+                    ["chat", "compact", "curator"].contains(&kind),
+                    "Reasoning kind must be chat, compact or curator"
+                );
+                let target = match kind {
+                    "compact" => self
+                        .store
+                        .compactor_model(channel, &self.config.agent.compactor_model)?,
+                    "curator" => match self.store.curator_model(channel)?.as_deref() {
+                        Some("none") => model.clone(),
+                        Some(m) => m.to_owned(),
+                        None => self.config.curator.model.clone().unwrap_or(model.clone()),
+                    },
+                    _ => model.clone(),
+                };
                 if let Some(level) = args["level"].as_str() {
-                    self.discord.models.validate_effort(&model, level)?;
-                    reasoning = self.reasoning_for_model(&model, level)?;
-                    self.store.set_settings(channel, &model, &reasoning)?;
+                    if level == "inherit" {
+                        ensure!(kind == "curator", "inherit is available for the curator");
+                        self.store
+                            .set_reasoning_override(channel, kind, Some("inherit"))?;
+                    } else if level == "default" {
+                        if kind == "chat" {
+                            reasoning = self
+                                .discord
+                                .models
+                                .reasoning(&model, &self.config.agent.reasoning);
+                            self.store.set_settings(channel, &model, &reasoning)?;
+                        } else {
+                            self.store.set_reasoning_override(channel, kind, None)?;
+                        }
+                    } else {
+                        self.discord.models.validate_effort(&target, level)?;
+                        let level = self.reasoning_for_model(&target, level)?;
+                        if kind == "chat" {
+                            reasoning = level;
+                            self.store.set_settings(channel, &model, &reasoning)?;
+                        } else {
+                            self.store
+                                .set_reasoning_override(channel, kind, Some(&level))?;
+                        }
+                    }
                 }
+                let current = match kind {
+                    "curator" => self.curator_settings(channel).await?.1,
+                    "compact" => self
+                        .store
+                        .reasoning_override(channel, "compact")?
+                        .unwrap_or_else(|| self.discord.models.reasoning(&target, "medium")),
+                    _ => reasoning,
+                };
                 return Ok(crate::ui::card(
                     "Reasoning effort",
-                    "Changes apply to the next fresh turn.",
+                    "Changes apply to new turns or jobs; running jobs keep their model and effort.",
                     vec![
-                        ("Current effort", format!("`{reasoning}`"), true),
-                        ("Active model", format!("`{model}`"), false),
-                        (
-                            "Available efforts",
-                            self.discord
-                                .models
-                                .metadata(&model)
-                                .filter(|m| !m.efforts.is_empty())
-                                .map(|m| {
-                                    m.efforts
-                                        .iter()
-                                        .map(|e| format!("`{e}`"))
-                                        .collect::<Vec<_>>()
-                                        .join(" · ")
-                                })
-                                .unwrap_or_else(|| {
-                                    "Not advertised by this provider; no levels are guessed.".into()
-                                }),
-                            false,
-                        ),
+                        ("Kind", kind.into(), true),
+                        ("Model", target, false),
+                        ("Effort", current, true),
                     ],
                     false,
                 ));
@@ -1984,10 +2491,14 @@ impl Harness {
                 let model = self
                     .store
                     .compactor_model(channel, &self.config.agent.compactor_model)?;
+                let effort = self
+                    .store
+                    .reasoning_override(channel, "compact")?
+                    .unwrap_or_else(|| self.discord.models.reasoning(&model, "medium"));
                 workers.spawn(async move {
                     (
                         key,
-                        h.compress(channel, &model, key, &context, &source)
+                        h.compress_with_effort(channel, &model, &effort, key, &context, &source)
                             .instrument(tracing::info_span!(
                                 "compaction",
                                 channel,
@@ -2012,6 +2523,7 @@ impl Harness {
         workers.abort_all();
         Ok(())
     }
+    #[cfg(test)]
     async fn compress(
         &self,
         channel: u64,
@@ -2020,8 +2532,22 @@ impl Harness {
         context: &str,
         source: &str,
     ) -> Result<String> {
-        let (vendor, _) = model_parts(model)?;
         let reasoning = self.discord.models.reasoning(model, "medium");
+        self.compress_with_effort(channel, model, &reasoning, key, context, source)
+            .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn compress_with_effort(
+        &self,
+        channel: u64,
+        model: &str,
+        reasoning: &str,
+        key: NodeKey,
+        context: &str,
+        source: &str,
+    ) -> Result<String> {
+        let (vendor, _) = model_parts(model)?;
+        self.discord.models.validate_effort(model, reasoning)?;
         let example = "user: Build Pantheon in Rust as an always-on NixOS Discord agent; preserve every message durably and start each turn with a stable binary summary view. Background workers summarize in order; zoom retrieves exact history. echo: inspected Thoth's gateway and found steering, mention and delivery races. work: browser implementation assigns separate displays and permanent noVNC URLs, with explicit handoff leases. talk: chosen append-only daily files and a durable inbox/outbox; live deployment still needs credentials.";
         let mut scale = example.to_string();
         while scale.len() > 512 {
@@ -2046,7 +2572,7 @@ impl Harness {
             .with_cache_affinity(self.store.cache_affinity(&format!("compactor:{channel}"))?);
         for _ in 0..5 {
             let response = provider
-                .step(model, &reasoning, COMPACT, &history, &[])
+                .step(model, reasoning, COMPACT, &history, &[])
                 .await?;
             let line = response
                 .texts
@@ -2186,6 +2712,12 @@ mod tests {
             inputs: vec![input.id],
             trace: None,
             steering: vec![],
+            skills: h.skills.snapshot().unwrap(),
+            task: input.text.chars().take(8000).collect(),
+            system: None,
+            steps: 0,
+            invocation_scope: uuid::Uuid::new_v4().to_string(),
+            counted_skills: HashSet::new(),
         };
         (directory, h, run, mock, server)
     }
@@ -3413,6 +3945,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skill_publication_pins_current_turn_and_keeps_memory_and_prefixes_unchanged() {
+        let (_directory, h, mut run, _mock, server) = fixture("openai", vec![]).await;
+        let before_memory = run.memory.memory.lock().await.export_html();
+        let before_system = h.master_system.clone();
+        let old = run
+            .skills
+            .execute(&json!({"action":"load","id":"research"}))
+            .unwrap();
+        let proposal:crate::skill_library::Proposal=serde_json::from_value(json!({
+            "changes":[{"id":"research","expected_revision":1,"retire":false,"files":{"SKILL.md":"---\nname: research\ndescription: Compare products using verified constraints.\n---\nDiscover constraints, compare primary sources and verify the recommendation.","references/checks.md":"Check current product specifications."}}],
+            "task_family":"Product comparison","triggers":"Choosing between products","procedure":"Discover constraints and compare sources","variables":"Products, budget and constraints","verification":"Check specifications against constraints","limits":"Prices may change","reason":"Concrete comparison method","evidence":[1]
+        })).unwrap();
+        h.skills.publish(&proposal).unwrap();
+        let call = ToolCall {
+            id: "load".into(),
+            name: "skill".into(),
+            arguments: json!({"action":"load","id":"research"}),
+        };
+        let pinned: Value =
+            serde_json::from_str(&h.execute_tool(&mut run, &call).await.unwrap()).unwrap();
+        assert_eq!(pinned["text"], old["text"]);
+        assert_eq!(pinned["revision"], 1);
+        assert!(
+            run.skills
+                .execute(&json!({"action":"load","id":"research","file":"references/checks.md"}))
+                .is_err()
+        );
+        run.skills = h.skills.snapshot().unwrap();
+        let current: Value =
+            serde_json::from_str(&h.execute_tool(&mut run, &call).await.unwrap()).unwrap();
+        assert_eq!(current["revision"], 2);
+        assert_eq!(
+            run.skills
+                .execute(&json!({"action":"load","id":"research","file":"references/checks.md"}))
+                .unwrap()["text"],
+            "Check current product specifications."
+        );
+        assert_eq!(h.master_system, before_system);
+        assert_eq!(run.memory.memory.lock().await.export_html(), before_memory);
+        let cancel = CancellationToken::new();
+        h.curators.lock().await.insert(1, cancel.clone());
+        h.cancel_curator(1).await.unwrap();
+        assert!(cancel.is_cancelled());
+        let cancel = CancellationToken::new();
+        h.curators.lock().await.insert(1, cancel.clone());
+        let input = Input {
+            id: "arriving-prompt".into(),
+            channel: 1,
+            user: 2,
+            text: "New user work".into(),
+        };
+        assert!(h.admit_prompt(&input).unwrap());
+        assert!(!cancel.is_cancelled());
+        let cancel = CancellationToken::new();
+        h.curators.lock().await.insert(1, cancel.clone());
+        assert!(!h.admit_prompt(&input).unwrap());
+        assert!(!cancel.is_cancelled());
+        server.abort();
+    }
+    #[tokio::test]
     async fn mcp_error_results_reach_anthropic_and_activity_keeps_arguments_private() {
         let call = json!({"stop_reason":"tool_use","content":[{"type":"tool_use","id":"integration-call","name":"mcp","input":{"action":"call","server":"demo","tool":"fail","arguments":{"password":"private-fixture-password"}}}],"usage":{}});
         let (directory, mut h, run, mock, server) = fixture(
@@ -3465,4 +4057,5 @@ for line in sys.stdin:
         );
         server.abort();
     }
+    include!("runtime_curator_tests.rs");
 }

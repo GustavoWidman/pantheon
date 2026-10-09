@@ -87,6 +87,8 @@ impl Store {
         )?;
         db.execute("INSERT OR IGNORE INTO coordinator_lifecycle(channel,last_active) SELECT channel,?1 FROM ui_agents WHERE owner LIKE 'channel:%'",[now()])?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS compactor_settings(channel TEXT PRIMARY KEY,model TEXT NOT NULL);")?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS curator_settings(channel TEXT PRIMARY KEY,model TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS reasoning_overrides(channel TEXT NOT NULL,kind TEXT NOT NULL,reasoning TEXT NOT NULL,PRIMARY KEY(channel,kind));")?;
         Ok(Self { db: Mutex::new(db) })
     }
     pub fn admit(&self, input: &Input) -> Result<bool> {
@@ -161,6 +163,19 @@ impl Store {
                 })
             })?
             .collect::<std::result::Result<_, _>>()?)
+    }
+    pub fn has_active_work(&self) -> Result<bool> {
+        Ok(self.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM inbox WHERE state IN ('queued','running')) OR EXISTS(SELECT 1 FROM agent_runs WHERE state='running') OR EXISTS(SELECT 1 FROM agent_inbox WHERE state='queued') OR EXISTS(SELECT 1 FROM shell_runs WHERE state='running') OR EXISTS(SELECT 1 FROM ui_agents WHERE active=1)", [], |r|r.get(0))?)
+    }
+    /// Ordinary work in one channel only; private curators use their own queue.
+    pub fn has_channel_work(&self, channel: u64) -> Result<bool> {
+        Ok(self.db.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM inbox WHERE channel=?1 AND state IN ('queued','running'))
+             OR EXISTS(SELECT 1 FROM agent_runs r JOIN tasks t ON t.id=r.owner WHERE t.channel=?1 AND r.state='running')
+             OR EXISTS(SELECT 1 FROM agent_inbox WHERE channel=?1 AND state='queued')
+             OR EXISTS(SELECT 1 FROM shell_runs WHERE channel=?1 AND state='running')
+             OR EXISTS(SELECT 1 FROM ui_agents WHERE channel=?1 AND active=1)",
+            [channel.to_string()], |r|r.get(0))?)
     }
     pub fn complete_turn(
         &self,
@@ -343,6 +358,84 @@ impl Store {
             db.execute(
                 "DELETE FROM compactor_settings WHERE channel=?1",
                 [channel.to_string()],
+            )?;
+        }
+        Ok(())
+    }
+    pub fn curator_model(&self, channel: u64) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT model FROM curator_settings WHERE channel=?1",
+                [channel.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+    pub fn model_override_channels(&self) -> Result<Vec<u64>> {
+        let db = self.db.lock().unwrap();
+        let mut q=db.prepare("SELECT channel FROM settings UNION SELECT channel FROM compactor_settings UNION SELECT channel FROM curator_settings")?;
+        Ok(q.query_map([], |r| {
+            Ok(r.get::<_, String>(0)?.parse::<u64>().unwrap_or(0))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+    pub fn set_curator_model(&self, channel: u64, model: Option<&str>) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        if let Some(model) = model {
+            ensure!(!model.trim().is_empty(), "curator model cannot be empty");
+            db.execute("INSERT INTO curator_settings(channel,model) VALUES(?1,?2) ON CONFLICT(channel) DO UPDATE SET model=excluded.model",params![channel.to_string(),model])?;
+        } else {
+            db.execute(
+                "DELETE FROM curator_settings WHERE channel=?1",
+                [channel.to_string()],
+            )?;
+        }
+        Ok(())
+    }
+    pub fn reasoning_override(&self, channel: u64, kind: &str) -> Result<Option<String>> {
+        ensure!(
+            ["chat", "compact", "curator"].contains(&kind),
+            "invalid reasoning kind"
+        );
+        Ok(self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT reasoning FROM reasoning_overrides WHERE channel=?1 AND kind=?2",
+                params![channel.to_string(), kind],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+    pub fn set_reasoning_override(
+        &self,
+        channel: u64,
+        kind: &str,
+        reasoning: Option<&str>,
+    ) -> Result<()> {
+        ensure!(
+            ["chat", "compact", "curator"].contains(&kind),
+            "invalid reasoning kind"
+        );
+        let db = self.db.lock().unwrap();
+        if let Some(reasoning) = reasoning {
+            ensure!(
+                [
+                    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"
+                ]
+                .contains(&reasoning)
+                    || (kind == "curator" && reasoning == "inherit"),
+                "invalid reasoning level"
+            );
+            db.execute("INSERT INTO reasoning_overrides(channel,kind,reasoning) VALUES(?1,?2,?3) ON CONFLICT(channel,kind) DO UPDATE SET reasoning=excluded.reasoning",params![channel.to_string(),kind,reasoning])?;
+        } else {
+            db.execute(
+                "DELETE FROM reasoning_overrides WHERE channel=?1 AND kind=?2",
+                params![channel.to_string(), kind],
             )?;
         }
         Ok(())
@@ -1132,6 +1225,123 @@ pub fn now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn curator_and_reasoning_overrides_are_channel_local_durable_and_resettable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.sqlite");
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.curator_model(1).unwrap(), None);
+        store
+            .set_curator_model(1, Some("codex/gpt-6-luna"))
+            .unwrap();
+        store
+            .set_reasoning_override(1, "curator", Some("high"))
+            .unwrap();
+        store
+            .set_reasoning_override(1, "compact", Some("low"))
+            .unwrap();
+        store
+            .set_reasoning_override(1, "chat", Some("none"))
+            .unwrap();
+        assert_eq!(store.curator_model(2).unwrap(), None);
+        assert_eq!(store.reasoning_override(2, "curator").unwrap(), None);
+        assert!(
+            store
+                .set_reasoning_override(1, "unknown", Some("high"))
+                .is_err()
+        );
+        assert!(
+            store
+                .set_reasoning_override(1, "curator", Some("invalid"))
+                .is_err()
+        );
+        assert!(
+            store
+                .set_reasoning_override(2, "compact", Some("inherit"))
+                .is_err()
+        );
+        store
+            .set_reasoning_override(2, "curator", Some("inherit"))
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.reasoning_override(2, "curator").unwrap().as_deref(),
+            Some("inherit")
+        );
+        assert_eq!(
+            store.curator_model(1).unwrap().as_deref(),
+            Some("codex/gpt-6-luna")
+        );
+        assert_eq!(
+            store.reasoning_override(1, "curator").unwrap().as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            store.reasoning_override(1, "compact").unwrap().as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            store.reasoning_override(1, "chat").unwrap().as_deref(),
+            Some("none")
+        );
+        store.set_curator_model(1, None).unwrap();
+        store.set_reasoning_override(1, "curator", None).unwrap();
+        assert_eq!(store.curator_model(1).unwrap(), None);
+        assert_eq!(store.reasoning_override(1, "curator").unwrap(), None);
+        assert_eq!(
+            store.compactor_model(1, "configured-compact").unwrap(),
+            "configured-compact"
+        );
+        assert_eq!(
+            store.reasoning_override(1, "compact").unwrap().as_deref(),
+            Some("low")
+        );
+    }
+
+    #[test]
+    fn channel_work_is_isolated_across_inbox_workers_shells_and_ui() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("runtime.sqlite")).unwrap();
+        assert!(!store.has_channel_work(1).unwrap());
+        store
+            .admit(&Input {
+                id: "prompt".into(),
+                channel: 1,
+                user: 2,
+                text: "work".into(),
+            })
+            .unwrap();
+        assert!(store.has_channel_work(1).unwrap());
+        assert!(!store.has_channel_work(2).unwrap());
+        store.input_state("prompt", "done").unwrap();
+        assert!(!store.has_channel_work(1).unwrap());
+        for statement in [
+            "INSERT INTO tasks(id,batch,channel,user,task,state) VALUES('worker','batch','2','3','task','working'); INSERT INTO agent_runs(id,owner,state) VALUES('run','worker','running');",
+            "DELETE FROM agent_runs; INSERT INTO agent_inbox(id,owner,channel,user,text,created) VALUES('event','worker','2','3','report',0);",
+            "DELETE FROM agent_inbox; INSERT INTO shell_runs(id,owner,channel,user,command) VALUES('shell','worker','2','3','sleep');",
+        ] {
+            store.db.lock().unwrap().execute_batch(statement).unwrap();
+            assert!(store.has_channel_work(2).unwrap());
+            assert!(!store.has_channel_work(1).unwrap());
+        }
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM shell_runs", [])
+            .unwrap();
+        let context = crate::ui::ReplyContext::request("ui-work");
+        store
+            .present_agent("channel:2", 2, &context, "Coordinator", "test")
+            .unwrap();
+        store.agent_phase("channel:2", true, "Thinking").unwrap();
+        assert!(store.has_channel_work(2).unwrap());
+        assert!(!store.has_channel_work(1).unwrap());
+        store.agent_phase("channel:2", false, "Idle").unwrap();
+        assert!(!store.has_channel_work(2).unwrap());
+    }
 
     #[test]
     fn archived_workers_survive_restart_and_revive_with_their_identity() {

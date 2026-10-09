@@ -34,8 +34,11 @@ tables. Provider KV entries are remote and have their own retention policy.
 Codex requests send matching `session-id` and `prompt_cache_key` values. The
 hyphenated header supplies ChatGPT's cache affinity; a cache key alone does not
 provide the same routing behavior. Random UUIDs persist in `runtime.sqlite`, with
-separate identities for each coordinator, worker, channel compactor, and agent's
-hosted search. They survive fresh turns, worker resumptions and service restarts.
+separate identities for each coordinator, worker, channel compactor, agent's
+hosted search, channel curator and channel reviewer slot. They survive fresh turns, worker resumptions and service restarts.
+Private curator and reviewer hosted searches derive separate, stable identities
+from their persisted parent affinity, so research requests do not compete with
+their drafting or review prefix.
 Separate state databases receive separate identities. These values control routing
 only: every fresh turn still constructs a new provider transcript, and compaction
 can change its reusable prefix. Public API requests keep their existing contract.
@@ -61,3 +64,28 @@ Its 98.6% turn-cache figure is an Anthropic cache simulation, not a measured
 Pantheon result. These root-view changes do not adopt the recipe's separate
 16–32 KB compactor view, shared turn/compactor prompt, or four-line Anthropic
 blocks; Pantheon's existing compactor and API block policy remain as documented.
+
+## Skill catalogue and curator checks
+
+The complete active catalogue is the last system section. Its exact bytes and
+usage/refinement counter snapshots persist per channel. A successful skill load
+updates library counters, not the system string of a running turn or short-gap
+fresh turn. A fresh turn after the configured idle period may refresh this section
+once memory settles; that is an explicit prefix-change boundary, not a provider
+cache-TTL guarantee. Worker turns use the same channel catalogue generation.
+
+Approved changes produce appended notifications: idle notices occupy the final
+new-input block after the old memory view; active notices follow the complete
+native tool-result batch. Announcing a revision updates available guide data, not
+system or tool schemas. Root memory/native history remain authoritative; private
+forks have independent affinities and cannot overwrite root usage diagnostics.
+
+Bounded mock tests cover exact system/schema equality across counter updates,
+short-gap fresh turns and restart, an actual idle refresh, OpenAI encrypted items,
+Anthropic signatures, complete tool-result batches, and loadable announced revisions.
+The opt-in `curator_catalogue_cache_probe` makes five greeting-only requests with
+`codex/gpt-6-luna` by default: cold, frozen catalogue after a counter update,
+appended publication notice, an exact repeat of that request, then a fresh turn
+with a refreshed catalogue. It
+prints native input/cache/output counters and executes no tools. Run only this
+probe when checking the feature; do not run the entire ignored live suite.

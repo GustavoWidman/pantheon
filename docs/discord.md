@@ -12,12 +12,13 @@ Registered commands:
 | --- | --- |
 | `/context` | Inspect model-window and memory grids, token counts and prompt-cache reuse |
 | `/cache` | Inspect provider cache reads/writes, recent requests and fresh-view prefix stability |
-| `/model [kind] [provider] [model]` | Chat-local agent/compactor overrides; model and provider autocomplete |
-| `/reasoning [level]` | Select an effort advertised by this chat’s model, with autocomplete |
+| `/model [kind] [provider] [model]` | Chat-local chat/compactor/curator overrides; model and provider autocomplete |
+| `/reasoning [kind] [level]` | Select chat, compactor or curator effort with model-aware autocomplete |
 | `/stop` | Cancel the current run and its background agents |
 | `/status` | Inspect active agent phases, shell jobs, message queues, schedules and delivery |
 | `/subagents` | List background agents |
-| `/skills [id]` | Browse task guides or preview a selected guide |
+| `/skills [id]` | Private paginated skill dashboard: catalogue, content, resources, history and comparisons |
+| `/curator [action]` | This channel’s curation phase, queue, reviewer counts and run/cancel controls |
 | `/mcp` | Show integrations configured for this channel |
 | `/browser [action] [browser_id] [resume_token] [url]` | List/open desktops, hand off, explicitly resume, or close |
 | `/wakeup action [schedule] [prompt] [id]` | Add, list, or cancel durable prompts |
@@ -73,3 +74,17 @@ Protocol references: [Gateway](https://docs.discord.com/developers/events/gatewa
 Idle identities are hidden from `/subagents` after one hour by default, with history retained. Busy or queued workers remain visible. The agent-facing `list_agents` directory is paginated, can include archived identities, and supports coordinator discovery across channels; worker discovery stays local. `tell` automatically restores and wakes an idle identity; user input and scheduled notifications do the same. Incoming cross-channel coordinator messages have their own visible activity marker. A message that wakes a settled coordinator starts a new activity without replying to an old Discord message or automatically mentioning its author.
 
 Model selections are scoped to this chat and survive restart; `model:default` restores config defaults. See [model discovery](models.md) for catalog sources, reasoning compatibility and compactor transitions.
+
+## Curator publication and skill browsing
+
+Approved skill changes emit `✦ curator · created skill ...`, `↻ curator · modified
+skill ...` or `⊖ curator · retired skill ...` in the existing activity fences.
+They accumulate in chronological order and do not wake the orchestrator. Private
+research and reviewer reports never appear in Discord or main memory. Approved
+change summaries wait for actual input while idle, or steer at the next active
+model boundary. `/curator` exposes the separate channel-local queue/review lifecycle.
+
+The `/skills` home page and dropdowns paginate every active/retired guide. Complete
+bodies, supporting text, revision history and comparisons have bounded embed pages.
+Component IDs are bound to channel and user; authorization precedes Discord’s
+component-update acknowledgement. These controls edit only the private dashboard.

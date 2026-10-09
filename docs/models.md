@@ -1,7 +1,7 @@
 # Model selection and discovery
 
 `/model [kind] [provider] [model]` changes this Discord chat's model override.
-`kind` autocompletes `chat` and `compact`, defaulting to `chat`. Provider suggestions
+`kind` autocompletes `chat`, `compact` and `curator`, defaulting to `chat`. Provider suggestions
 include authenticated transports only. With a provider selected, model suggestions
 come from that provider; without one, they search all available providers. Suggested
 values contain the full `provider/model-id`, avoiding ambiguous names across providers.
@@ -18,7 +18,7 @@ recomputed because a model changed. Compactor reset removes the override so late
 config defaults can take effect. Model and reasoning commands serialize within each
 channel to prevent concurrent changes from overwriting one another.
 
-`/reasoning level` autocompletes the selected chat model's advertised efforts. Known
+`/reasoning [kind] level` autocompletes the selected chat, compactor or curator model's advertised efforts, defaulting to chat. Known
 unsupported manual choices fail with the available levels. Models exposing `max` or
 `ultra` can use those values. A model switch retains a compatible effort or selects an
 advertised default/compatible level. Legacy internal `minimal` requests can map to
@@ -26,6 +26,15 @@ advertised default/compatible level. Legacy internal `minimal` requests can map 
 For catalog entries with no effort metadata, autocomplete returns no guessed levels;
 manual levels retain transport validation. Claude catalogs advertising adaptive
 thinking use adaptive thinking and `output_config.effort` during inference.
+
+Curator overrides apply to newly started jobs; all parallel reviewers inherit
+that job’s pinned model and effort. `model:none` explicitly inherits the current
+main model even when configuration supplies a curator model. `model:default`
+clears the override to configuration. `level:inherit` explicitly inherits main
+effort for the curator; `level:default` clears a compactor/curator effort override.
+The actual effort `none` remains distinct from inheritance. Existing compactor
+model reset semantics are unchanged. Autocomplete restores channel-local kind
+selections before a channel actor is first opened after restart.
 
 Discovery runs in the background at startup and every five minutes. Interaction
 autocomplete reads a local snapshot and replies with Discord callback type 8 within

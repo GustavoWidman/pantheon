@@ -43,6 +43,14 @@ pub enum Inbound {
         name: String,
         options: Value,
     },
+    Component {
+        id: String,
+        token: String,
+        channel: u64,
+        user: u64,
+        custom_id: String,
+        values: Vec<String>,
+    },
 }
 
 impl std::fmt::Debug for Inbound {
@@ -68,6 +76,19 @@ impl std::fmt::Debug for Inbound {
                 .field("channel", channel)
                 .field("user", user)
                 .field("name", name)
+                .finish_non_exhaustive(),
+            Self::Component {
+                id,
+                channel,
+                user,
+                custom_id,
+                ..
+            } => f
+                .debug_struct("Component")
+                .field("id", id)
+                .field("channel", channel)
+                .field("user", user)
+                .field("custom_id", custom_id)
                 .finish_non_exhaustive(),
         }
     }
@@ -492,9 +513,19 @@ impl Discord {
     }
 
     /// Initial callback has a three-second deadline. Do not use slow durable delivery retries here.
-    async fn acknowledge_interaction(&self, id: &str, token: &str, authorized: bool) -> Result<()> {
+    async fn acknowledge_interaction(
+        &self,
+        id: &str,
+        token: &str,
+        authorized: bool,
+        component: bool,
+    ) -> Result<()> {
         let body = if authorized {
-            json!({"type": 5, "data": {"flags": 64}})
+            if component {
+                json!({"type": 6})
+            } else {
+                json!({"type": 5, "data": {"flags": 64}})
+            }
         } else {
             json!({"type": 4, "data": {"flags": 64, "content": "You are not authorized to use this bot.", "allowed_mentions": {"parse": []}}})
         };
@@ -823,15 +854,58 @@ impl Discord {
             }
             return;
         }
+        let component = event["type"] == 3;
+        let component_authorized = !component
+            || snowflake(&event["channel_id"])
+                .zip(user)
+                .is_some_and(|(channel, user)| {
+                    event["data"]["custom_id"].as_str().is_some_and(|id| {
+                        crate::skill_dashboard::validate_id(id, channel, user).is_ok()
+                    })
+                });
+        let authorized = authorized && component_authorized;
         if self
-            .acknowledge_interaction(id, token, authorized)
+            .acknowledge_interaction(id, token, authorized, component)
             .await
             .is_err()
         {
-            tracing::warn!("Discord slash command could not be acknowledged; command not executed");
+            tracing::warn!("Discord interaction could not be acknowledged; action not executed");
             return;
         }
         if !authorized {
+            return;
+        }
+        if component {
+            let Some(channel) = snowflake(&event["channel_id"]) else {
+                return;
+            };
+            let values = event["data"]["values"]
+                .as_array()
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if tx
+                .send(Inbound::Component {
+                    id: id.into(),
+                    token: token.into(),
+                    channel,
+                    user: user.expect("authorized user"),
+                    custom_id: event["data"]["custom_id"]
+                        .as_str()
+                        .expect("validated component")
+                        .into(),
+                    values,
+                })
+                .await
+                .is_err()
+            {
+                tracing::warn!("Discord component inbox closed");
+            }
             return;
         }
         let (Some(channel), Some(name)) = (
@@ -914,6 +988,16 @@ pub fn command_definitions() -> Value {
     };
     let mut browser_action = action(&["list", "open", "handoff", "resume", "close"]);
     browser_action["required"] = json!(false);
+    let mut skills_action = action(&[
+        "list",
+        "history",
+        "rollback",
+        "curator",
+        "curate",
+        "proposals",
+        "proposal",
+    ]);
+    skills_action["required"] = json!(false);
     json!([
         command(
             "context",
@@ -924,21 +1008,27 @@ pub fn command_definitions() -> Value {
             "model",
             "Show or change this channel's model",
             vec![
-                autocomplete_option("kind", "Chat agent or memory compactor (default: chat)"),
+                autocomplete_option(
+                    "kind",
+                    "Chat, memory compactor or skill curator (default: chat)"
+                ),
                 autocomplete_option("provider", "Available authenticated provider"),
                 autocomplete_option(
                     "model",
-                    "Model ID, or default to clear this chat's override"
+                    "Model ID; default restores defaults, curator none inherits chat"
                 )
             ]
         ),
         command(
             "reasoning",
             "Show or change reasoning effort",
-            vec![autocomplete_option(
-                "level",
-                "Efforts supported by this chat's model"
-            )]
+            vec![
+                autocomplete_option(
+                    "kind",
+                    "Chat, memory compactor or skill curator (default: chat)"
+                ),
+                autocomplete_option("level", "Supported effort, or inherit for the curator")
+            ]
         ),
         command(
             "stop",
@@ -953,8 +1043,21 @@ pub fn command_definitions() -> Value {
         ),
         command(
             "skills",
-            "Browse available task guides",
-            vec![string_option("id", "Skill ID to inspect", false)]
+            "Open the skill library dashboard or inspect revisions",
+            vec![
+                string_option("id", "Skill ID or proposal attempt ID", false),
+                skills_action,
+                json!({"type":4,"name":"revision","description":"Revision to restore with rollback","required":false,"min_value":1}),
+            ]
+        ),
+        command(
+            "curator",
+            "Show this channel's skill curation queue and reviewers",
+            {
+                let mut option = action(&["status", "run", "cancel"]);
+                option["required"] = json!(false);
+                vec![option]
+            }
         ),
         command(
             "mcp",
@@ -1398,6 +1501,51 @@ mod tests {
         assert!(rx.try_recv().is_err());
         assert_eq!(captured.lock().await[1]["type"], 4);
         assert_eq!(captured.lock().await[1]["data"]["flags"], 64);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn components_defer_updates_and_enforce_dashboard_owner_and_channel() {
+        use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let app = Router::new()
+            .route(
+                "/interactions/123/private-token/callback",
+                post(
+                    |State(c): State<Arc<tokio::sync::Mutex<Vec<Value>>>>,
+                     Json(body): Json<Value>| async move {
+                        c.lock().await.push(body);
+                        StatusCode::NO_CONTENT
+                    },
+                ),
+            )
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut discord = Discord::new("test".into(), 1, vec![42, 43]).unwrap();
+        discord.api = format!("http://{address}");
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut event = json!({"type":3,"id":"123","token":"private-token","channel_id":"1","user":{"id":"42"},"data":{"custom_id":"sk1:1:42:pick:-:0","values":["0123456789abcdef"]}});
+        discord.interaction(event.clone(), tx.clone()).await;
+        let received = rx.try_recv().unwrap();
+        assert!(!format!("{received:?}").contains("private-token"));
+        assert!(
+            matches!(received,Inbound::Component { values, .. } if values == vec!["0123456789abcdef"])
+        );
+        assert_eq!(captured.lock().await[0], json!({"type":6}));
+        event["user"]["id"] = json!("43");
+        discord.interaction(event.clone(), tx.clone()).await;
+        event["user"]["id"] = json!("42");
+        event["channel_id"] = json!("2");
+        discord.interaction(event.clone(), tx.clone()).await;
+        event["channel_id"] = json!("1");
+        event["user"]["id"] = json!("666");
+        discord.interaction(event, tx).await;
+        assert!(rx.try_recv().is_err());
+        for denial in &captured.lock().await[1..] {
+            assert_eq!(denial["type"], 4);
+            assert_eq!(denial["data"]["flags"], 64);
+        }
         server.abort();
     }
     #[tokio::test]

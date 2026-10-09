@@ -67,6 +67,40 @@ pub(crate) fn copy_context(db: &Connection, from: &str, to: &str) -> Result<()> 
     Ok(())
 }
 impl Store {
+    /// Publication is presentation only: never admit an inbox item or write chat memory.
+    /// Replayed publication receipts preserve their original chronological position.
+    pub fn curator_activity(&self, channel: u64, event_id: &str, label: &str) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ui_events e JOIN ui_segments s ON s.id=e.segment WHERE s.channel=?1 AND e.event=?2)",
+            params![channel.to_string(),event_id], |r| r.get(0),
+        )?;
+        if exists {
+            return Ok(());
+        }
+        // Join the current fence, even when its activity originated in another
+        // request; creating a new activity would fragment the user's timeline.
+        let activity: Option<String> = tx.query_row(
+            "SELECT activity FROM ui_segments WHERE channel=?1 AND open=1 ORDER BY rowid DESC LIMIT 1",
+            [channel.to_string()], |r|r.get(0),
+        ).optional()?;
+        let context = ReplyContext {
+            reply_to: None,
+            activity: activity.unwrap_or_else(|| format!("curator:{channel}")),
+        };
+        activity_event_transaction(
+            &tx,
+            &context,
+            channel,
+            event_id,
+            label,
+            "event",
+            Duration::ZERO,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
     pub fn start_tool_activity(
         &self,
         owner: &str,
@@ -888,6 +922,54 @@ pub fn context_card(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn curator_publication_joins_fence_once_and_preserves_chronology() {
+        let d = tempfile::tempdir().unwrap();
+        let store = Store::open(&d.path().join("db")).unwrap();
+        let context = ReplyContext::request("100");
+        store
+            .activity_event(
+                &context,
+                1,
+                "first",
+                "incoming message",
+                "event",
+                Duration::ZERO,
+            )
+            .unwrap();
+        store
+            .curator_activity(1, "curator:job:guide:2", "↻ curator · modified skill guide")
+            .unwrap();
+        store
+            .activity_event(&context, 1, "last", "wakeup", "event", Duration::ZERO)
+            .unwrap();
+        store
+            .curator_activity(1, "curator:job:guide:2", "↻ curator · modified skill guide")
+            .unwrap();
+        let db = store.db.lock().unwrap();
+        let count: i64 = db
+            .query_row(
+                "SELECT count(*) FROM ui_events WHERE event='curator:job:guide:2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let text: String = db
+            .query_row(
+                "SELECT text FROM outbox WHERE id LIKE 'segment:%' ORDER BY rowid LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(text.starts_with("```text\n"));
+        assert!(text.find("incoming message").unwrap() < text.find("↻ curator").unwrap());
+        assert!(text.find("↻ curator").unwrap() < text.find("wakeup").unwrap());
+        let inbox: i64 = db
+            .query_row("SELECT count(*) FROM inbox", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(inbox, 0);
+    }
     fn shell_call() -> crate::provider::ToolCall {
         crate::provider::ToolCall {
             id: "native-call".into(),
