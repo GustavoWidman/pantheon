@@ -26,6 +26,30 @@ use tokio_util::sync::CancellationToken;
 
 const API: &str = "https://discord.com/api/v10";
 const MESSAGE_LIMIT: usize = 2000;
+fn ensure_caption(text: &str) -> Result<()> {
+    anyhow::ensure!(
+        utf16_len(text) <= MESSAGE_LIMIT,
+        "file caption exceeds Discord’s 2000 UTF-16 unit limit"
+    );
+    Ok(())
+}
+
+#[derive(Debug)]
+pub struct PermanentDelivery(pub u16);
+impl std::fmt::Display for PermanentDelivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Discord rejected the file delivery (HTTP {})", self.0)
+    }
+}
+impl std::error::Error for PermanentDelivery {}
+#[derive(Debug)]
+pub struct FileRateLimit(pub u64);
+impl std::fmt::Display for FileRateLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Discord file upload rate limited for {} seconds", self.0)
+    }
+}
+impl std::error::Error for FileRateLimit {}
 
 #[derive(Clone)]
 pub enum Inbound {
@@ -34,6 +58,7 @@ pub enum Inbound {
         channel: u64,
         user: u64,
         text: String,
+        attachments: Vec<crate::attachments::IncomingFile>,
     },
     Command {
         id: String,
@@ -138,6 +163,16 @@ impl Ingress {
         if application != application_id.to_string() {
             bail!("Discord ingress state belongs to another application");
         }
+        let columns = db
+            .prepare("PRAGMA table_info(gateway_pending)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if !columns.iter().any(|c| c == "attachments") {
+            db.execute(
+                "ALTER TABLE gateway_pending ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
+                [],
+            )?;
+        }
         Ok(Self { db: Mutex::new(db) })
     }
     fn load(&self) -> Result<(Session, VecDeque<Inbound>)> {
@@ -156,24 +191,27 @@ impl Ingress {
             .map(|data| serde_json::from_str(&data))
             .transpose()?
             .unwrap_or_default();
-        let mut statement =
-            db.prepare("SELECT id,channel,user,text FROM gateway_pending ORDER BY rowid")?;
+        let mut statement = db.prepare(
+            "SELECT id,channel,user,text,attachments FROM gateway_pending ORDER BY rowid",
+        )?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
             ))
         })?;
         let pending = rows
             .map(|row| {
-                let (id, channel, user, text) = row?;
+                let (id, channel, user, text, attachments) = row?;
                 Ok(Inbound::Prompt {
                     id,
                     channel: channel.parse()?,
                     user: user.parse()?,
                     text,
+                    attachments: serde_json::from_str(&attachments)?,
                 })
             })
             .collect::<Result<_>>()?;
@@ -190,11 +228,12 @@ impl Ingress {
             channel,
             user,
             text,
+            attachments,
         }) = prompt
         {
             transaction.execute(
-                "INSERT OR IGNORE INTO gateway_pending(id,channel,user,text) VALUES(?1,?2,?3,?4)",
-                params![id, channel.to_string(), user.to_string(), text],
+                "INSERT OR IGNORE INTO gateway_pending(id,channel,user,text,attachments) VALUES(?1,?2,?3,?4,?5)",
+                params![id, channel.to_string(), user.to_string(), text, serde_json::to_string(attachments)?],
             )?;
         }
         transaction.execute("INSERT INTO gateway_state(singleton,data) VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET data=excluded.data", [serde_json::to_string(session)?])?;
@@ -220,6 +259,12 @@ impl std::fmt::Display for IngressFailure {
 impl std::error::Error for IngressFailure {}
 
 impl Discord {
+    #[cfg(test)]
+    pub(crate) fn mock_api(mut self, api: String) -> Self {
+        self.api = api;
+        self.bot_id.store(1, Ordering::Relaxed);
+        self
+    }
     pub fn new(token: String, application_id: u64, allowed_users: Vec<u64>) -> Result<Self> {
         if token.trim().is_empty() || application_id == 0 || allowed_users.is_empty() {
             bail!("Discord requires a token, application ID, and at least one allowed user");
@@ -320,6 +365,107 @@ impl Discord {
     }
 
     /// One outbox item per call. Content is already segmented; mention only grants ping permission.
+    pub async fn message(&self, channel: u64, message: &str) -> Result<Value> {
+        let message = message
+            .parse::<u64>()
+            .context("invalid Discord message ID")?;
+        self.request(
+            Method::GET,
+            &format!("/channels/{channel}/messages/{message}"),
+            None,
+        )
+        .await
+    }
+
+    /// Stream immutable outbox bytes. Discord, rather than a harness ceiling, governs upload size.
+    pub async fn send_file(
+        &self,
+        out: &crate::store::Outbound,
+        file: &crate::attachments::FileRecord,
+        path: &Path,
+    ) -> Result<String> {
+        ensure_caption(&out.text)?;
+        let nonce = hex::encode(Sha256::digest(out.nonce.as_bytes()))[..25].to_owned();
+        // Discord only deduplicates recent nonces. An old ambiguous attempt must not be replayed blindly.
+        if out.attempted_at > 0 && crate::store::now() - out.attempted_at >= 120 {
+            let messages = self
+                .request(
+                    Method::GET,
+                    &format!("/channels/{}/messages?limit=100", out.channel),
+                    None,
+                )
+                .await?;
+            if let Some(receipt) = messages
+                .as_array()
+                .and_then(|messages| {
+                    messages.iter().find(|m| {
+                        m["nonce"].as_str() == Some(&nonce)
+                            && snowflake(&m["author"]["id"])
+                                == Some(self.bot_id.load(Ordering::Relaxed))
+                    })
+                })
+                .and_then(|m| m["id"].as_str())
+            {
+                return Ok(receipt.into());
+            }
+            bail!(PermanentDelivery(409));
+        }
+        let mut payload = json!({"content":out.text,"nonce":nonce,"enforce_nonce":true,"attachments":[{"id":0,"filename":file.filename}],"allowed_mentions":{"parse":[],"users":[out.user.unwrap_or(0).to_string()],"replied_user":out.reply_to.is_some()}});
+        if let Some(message) = out.reply_to {
+            payload["message_reference"] = json!({"message_id":message.to_string(),"channel_id":out.channel.to_string(),"fail_if_not_exists":false});
+        }
+        let source = tokio::fs::File::open(path)
+            .await
+            .context("attachment snapshot unavailable")?;
+        let stream = tokio_util::io::ReaderStream::new(source);
+        let part = reqwest::multipart::Part::stream_with_length(
+            reqwest::Body::wrap_stream(stream),
+            file.size,
+        )
+        .file_name(file.filename.clone())
+        .mime_str(&file.mime)?;
+        let form = reqwest::multipart::Form::new()
+            .text("payload_json", serde_json::to_string(&payload)?)
+            .part("files[0]", part);
+        let response = self
+            .client
+            .post(format!("{}/channels/{}/messages", self.api, out.channel))
+            .header("Authorization", format!("Bot {}", self.token))
+            .timeout(Duration::from_secs(3600))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|_| anyhow!("Discord file transport interrupted"))?;
+        let status = response.status();
+        if status.as_u16() == 429 {
+            let body: Value = response.json().await.unwrap_or_default();
+            let delay = body["retry_after"]
+                .as_f64()
+                .filter(|s| s.is_finite() && *s >= 0.0)
+                .unwrap_or(1.0)
+                .ceil()
+                .clamp(1.0, 86400.0) as u64;
+            bail!(FileRateLimit(delay));
+        }
+        if status.is_client_error() && status.as_u16() != 429 && status.as_u16() != 408 {
+            bail!(PermanentDelivery(status.as_u16()));
+        }
+        if !status.is_success() {
+            bail!(
+                "Discord file delivery awaiting retry (HTTP {})",
+                status.as_u16()
+            );
+        }
+        let response: Value = response
+            .json()
+            .await
+            .map_err(|_| anyhow!("Discord file receipt interrupted"))?;
+        response["id"]
+            .as_str()
+            .map(str::to_owned)
+            .context("Discord file response omitted message ID")
+    }
+
     pub async fn send(
         &self,
         channel: u64,
@@ -809,7 +955,19 @@ impl Discord {
             .replace(&format!("<@!{bot_id}>"), "")
             .trim()
             .to_owned();
-        if text.is_empty() {
+        let attachments = message["attachments"]
+            .as_array()
+            .map(|files| {
+                files
+                    .iter()
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .collect::<std::result::Result<Vec<crate::attachments::IncomingFile>, _>>()
+            })
+            .transpose()
+            .ok()?
+            .unwrap_or_default();
+        if text.is_empty() && attachments.is_empty() {
             return None;
         }
         Some(Inbound::Prompt {
@@ -817,6 +975,7 @@ impl Discord {
             channel: snowflake(&message["channel_id"])?,
             user,
             text,
+            attachments,
         })
     }
 
@@ -1240,6 +1399,181 @@ pub fn split_message(content: &str, mention: Option<u64>) -> Vec<String> {
 mod tests {
     use super::*;
     #[test]
+    fn attachment_only_prompt_preserves_authorization_and_gateway_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let bot = Discord::new("secret".into(), 1, vec![42])
+            .unwrap()
+            .with_state_dir(dir.path())
+            .unwrap();
+        bot.bot_id.store(1, Ordering::Relaxed);
+        let mut message = json!({"id":"100","channel_id":"10","content":"","author":{"id":"42"},"attachments":[{"id":"200","filename":"report.pdf","size":500000000,"url":"https://cdn.discordapp.com/attachments/x/report.pdf?secret"}]});
+        let prompt = bot.prompt(&message).unwrap();
+        assert!(!format!("{prompt:?}").contains("secret"));
+        bot.checkpoint(
+            &Session {
+                sequence: Some(17),
+                ..Default::default()
+            },
+            Some(&prompt),
+        )
+        .unwrap();
+        drop(bot);
+        let bot = Discord::new("secret".into(), 1, vec![42])
+            .unwrap()
+            .with_state_dir(dir.path())
+            .unwrap();
+        let (session, pending) = bot.ingress.as_ref().unwrap().load().unwrap();
+        assert_eq!(session.sequence, Some(17));
+        assert!(
+            matches!(&pending[0],Inbound::Prompt{attachments,..} if attachments[0].size==500000000)
+        );
+        message["author"]["id"] = json!("43");
+        assert!(bot.prompt(&message).is_none());
+        message["author"]["id"] = json!("42");
+        message["guild_id"] = json!("99");
+        message["mentions"] = json!([]);
+        assert!(bot.prompt(&message).is_none());
+        message["mentions"] = json!([{"id":"1"}]);
+        bot.bot_id.store(1, Ordering::Relaxed);
+        assert!(bot.prompt(&message).is_some());
+    }
+    #[tokio::test]
+    async fn multipart_snapshot_nonce_receipt_and_terminal_errors() {
+        use axum::{
+            Json, Router, body::Bytes, extract::State, http::StatusCode, response::IntoResponse,
+            routing::post,
+        };
+        let bodies = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler = move |State(bodies): State<Arc<tokio::sync::Mutex<Vec<String>>>>,
+                            body: Bytes| {
+            let counter = counter.clone();
+            async move {
+                bodies
+                    .lock()
+                    .await
+                    .push(String::from_utf8(body.to_vec()).unwrap());
+                match counter.fetch_add(1, Ordering::SeqCst) {
+                    0 => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({}))).into_response(),
+                    1 => Json(json!({"id":"999"})).into_response(),
+                    2 => (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        Json(json!({"retry_after":4.2})),
+                    )
+                        .into_response(),
+                    _ => StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+                }
+            }
+        };
+        let reconcile = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delivered = reconcile.clone();
+        let receipts = bodies.clone();
+        let app = Router::new()
+            .route(
+                "/channels/10/messages",
+                post(handler).get(move || {
+                    let delivered = delivered.clone();
+                    let receipts = receipts.clone();
+                    async move {
+                        if !delivered.load(Ordering::SeqCst) {
+                            return Json(json!([]));
+                        }
+                        let bodies = receipts.lock().await;
+                        let payload: Value = serde_json::from_str(
+                            bodies[0]
+                                .split("\r\n\r\n")
+                                .nth(1)
+                                .unwrap()
+                                .split("\r\n--")
+                                .next()
+                                .unwrap(),
+                        )
+                        .unwrap();
+                        Json(json!([{"id":"999","nonce":payload["nonce"],"author":{"id":"1"}}]))
+                    }
+                }),
+            )
+            .with_state(bodies.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(&dir.path().join("runtime.sqlite")).unwrap();
+        let files =
+            crate::attachments::Attachments::open(dir.path(), dir.path(), Default::default())
+                .unwrap();
+        let source = dir.path().join("report.txt");
+        std::fs::write(&source, "frozen bytes").unwrap();
+        let file = files.snapshot(10, "snapshot", &source).await.unwrap();
+        store
+            .enqueue_file("delivery", 10, 42, "caption", "snapshot", Some(100))
+            .unwrap();
+        std::fs::write(&source, "modified source").unwrap();
+        let bot = Discord::new("secret".into(), 1, vec![42])
+            .unwrap()
+            .mock_api(format!("http://{address}"));
+        let mut out = store.next_outbound().unwrap().unwrap();
+        assert!(
+            bot.send_file(&out, &file, &files.outgoing_path(&file))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            bot.send_file(&out, &file, &files.outgoing_path(&file))
+                .await
+                .unwrap(),
+            "999"
+        );
+        let captured = bodies.lock().await;
+        for body in captured.iter() {
+            assert!(body.contains("name=\"files[0]\"; filename=\"report.txt\""));
+            assert!(body.contains("frozen bytes"));
+            assert!(!body.contains("modified source"));
+            assert!(body.contains("\"enforce_nonce\":true"));
+            assert!(body.contains("\"message_id\":\"100\""));
+        }
+        let payload = |body: &str| {
+            serde_json::from_str::<Value>(
+                body.split("\r\n\r\n")
+                    .nth(1)
+                    .unwrap()
+                    .split("\r\n--")
+                    .next()
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(payload(&captured[0]), payload(&captured[1]));
+        drop(captured);
+        let error = bot
+            .send_file(&out, &file, &files.outgoing_path(&file))
+            .await
+            .unwrap_err();
+        assert_eq!(error.downcast_ref::<FileRateLimit>().unwrap().0, 5);
+        let error = bot
+            .send_file(&out, &file, &files.outgoing_path(&file))
+            .await
+            .unwrap_err();
+        assert_eq!(error.downcast_ref::<PermanentDelivery>().unwrap().0, 413);
+        out.attempted_at = crate::store::now() - 200;
+        let error = bot
+            .send_file(&out, &file, &files.outgoing_path(&file))
+            .await
+            .unwrap_err();
+        assert_eq!(error.downcast_ref::<PermanentDelivery>().unwrap().0, 409);
+        assert_eq!(bodies.lock().await.len(), 4);
+        reconcile.store(true, Ordering::SeqCst);
+        assert_eq!(
+            bot.send_file(&out, &file, &files.outgoing_path(&file))
+                .await
+                .unwrap(),
+            "999"
+        );
+        assert_eq!(bodies.lock().await.len(), 4);
+        // GET reconciliation must not require another POST.
+        server.abort();
+    }
+    #[test]
     fn durable_ingress_replays_until_runtime_acknowledges() {
         let directory = tempfile::tempdir().unwrap();
         let prompt = Inbound::Prompt {
@@ -1247,6 +1581,7 @@ mod tests {
             channel: 10,
             user: 42,
             text: "Keep this through a crash".into(),
+            attachments: vec![],
         };
         {
             let discord = Discord::new("SECRET_TOKEN".into(), 1, vec![42])
@@ -1315,6 +1650,7 @@ mod tests {
             channel: 10,
             user: 42,
             text: "atomic".into(),
+            attachments: vec![],
         };
         let error = discord.checkpoint(&session, Some(&prompt)).unwrap_err();
         assert!(error.downcast_ref::<IngressFailure>().is_some());
@@ -1357,6 +1693,7 @@ mod tests {
             channel: 10,
             user: 42,
             text: "durable".into(),
+            attachments: vec![],
         };
         discord
             .checkpoint(&Session::default(), Some(&prompt))

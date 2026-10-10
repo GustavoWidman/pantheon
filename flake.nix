@@ -47,6 +47,7 @@
               pkgs.ripgrep
               pkgs.curl
               pkgs.codex
+              pkgs.poppler-utils
               pkgs.findutils
               browser
             ];

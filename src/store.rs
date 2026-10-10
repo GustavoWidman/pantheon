@@ -24,6 +24,8 @@ pub struct Outbound {
     pub nonce: String,
     pub receipt: Option<String>,
     pub reply_to: Option<u64>,
+    pub attachment: Option<String>,
+    pub attempted_at: i64,
 }
 #[derive(Clone, Debug)]
 pub struct Job {
@@ -89,11 +91,35 @@ impl Store {
         db.execute_batch("CREATE TABLE IF NOT EXISTS compactor_settings(channel TEXT PRIMARY KEY,model TEXT NOT NULL);")?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS curator_settings(channel TEXT PRIMARY KEY,model TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS reasoning_overrides(channel TEXT NOT NULL,kind TEXT NOT NULL,reasoning TEXT NOT NULL,PRIMARY KEY(channel,kind));")?;
+        let columns = db
+            .prepare("PRAGMA table_info(outbox)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if !columns.iter().any(|c| c == "attachment") {
+            db.execute("ALTER TABLE outbox ADD COLUMN attachment TEXT", [])?;
+        }
+        if !columns.iter().any(|c| c == "attempted_at") {
+            db.execute(
+                "ALTER TABLE outbox ADD COLUMN attempted_at INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        crate::attachments::initialize(&db)?;
         Ok(Self { db: Mutex::new(db) })
     }
     pub fn admit(&self, input: &Input) -> Result<bool> {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
+        let receiving: Option<bool> = tx
+            .query_row(
+                "SELECT state='pending' FROM attachment_ingress WHERE id=?1",
+                [&input.id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if receiving == Some(false) {
+            return Ok(false);
+        }
         let admitted = tx.execute(
             "INSERT OR IGNORE INTO inbox(id,channel,user,text,created) VALUES(?1,?2,?3,?4,?5)",
             params![
@@ -120,6 +146,10 @@ impl Store {
                 )?;
             }
         }
+        tx.execute(
+            "UPDATE attachment_ingress SET state='done',files='[]' WHERE id=?1 AND state='pending'",
+            [&input.id],
+        )?;
         tx.commit()?;
         Ok(admitted)
     }
@@ -165,12 +195,12 @@ impl Store {
             .collect::<std::result::Result<_, _>>()?)
     }
     pub fn has_active_work(&self) -> Result<bool> {
-        Ok(self.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM inbox WHERE state IN ('queued','running')) OR EXISTS(SELECT 1 FROM agent_runs WHERE state='running') OR EXISTS(SELECT 1 FROM agent_inbox WHERE state='queued') OR EXISTS(SELECT 1 FROM shell_runs WHERE state='running') OR EXISTS(SELECT 1 FROM ui_agents WHERE active=1)", [], |r|r.get(0))?)
+        Ok(self.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM attachment_ingress WHERE state='pending') OR EXISTS(SELECT 1 FROM inbox WHERE state IN ('queued','running')) OR EXISTS(SELECT 1 FROM agent_runs WHERE state='running') OR EXISTS(SELECT 1 FROM agent_inbox WHERE state='queued') OR EXISTS(SELECT 1 FROM shell_runs WHERE state='running') OR EXISTS(SELECT 1 FROM ui_agents WHERE active=1)", [], |r|r.get(0))?)
     }
     /// Ordinary work in one channel only; private curators use their own queue.
     pub fn has_channel_work(&self, channel: u64) -> Result<bool> {
         Ok(self.db.lock().unwrap().query_row(
-            "SELECT EXISTS(SELECT 1 FROM inbox WHERE channel=?1 AND state IN ('queued','running'))
+            "SELECT EXISTS(SELECT 1 FROM attachment_ingress WHERE channel=?1 AND state='pending') OR EXISTS(SELECT 1 FROM inbox WHERE channel=?1 AND state IN ('queued','running'))
              OR EXISTS(SELECT 1 FROM agent_runs r JOIN tasks t ON t.id=r.owner WHERE t.channel=?1 AND r.state='running')
              OR EXISTS(SELECT 1 FROM agent_inbox WHERE channel=?1 AND state='queued')
              OR EXISTS(SELECT 1 FROM shell_runs WHERE channel=?1 AND state='running')
@@ -202,7 +232,12 @@ impl Store {
             params![channel.to_string(),context.as_ref().map(|(_,activity)|activity)],
             |r| r.get(0),
         )?;
-        if queued != 0 {
+        let receiving: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM attachment_ingress WHERE channel=?1 AND state='pending')",
+            [channel.to_string()],
+            |r| r.get(0),
+        )?;
+        if queued != 0 || receiving {
             return Ok(false);
         }
         let recipient: String = context
@@ -281,6 +316,47 @@ impl Store {
     pub fn next_outbound(&self) -> Result<Option<Outbound>> {
         self.next_outbound_excluding(&[])
     }
+    pub fn enqueue_file(
+        &self,
+        id: &str,
+        channel: u64,
+        user: u64,
+        caption: &str,
+        attachment: &str,
+        reply_to: Option<u64>,
+    ) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        crate::ui::close_segments(&tx, channel)?;
+        let hash = Sha256::digest(id.as_bytes());
+        let nonce = u64::from_le_bytes(hash[..8].try_into().unwrap()).to_string();
+        tx.execute("INSERT OR IGNORE INTO outbox(id,channel,user,text,nonce,reply_to,attachment) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![id,channel.to_string(),user.to_string(),caption,nonce,reply_to.map(|id|id.to_string()),attachment])?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn attachment_attempt(&self, id: &str) -> Result<()> {
+        self.db.lock().unwrap().execute(
+            "UPDATE outbox SET attempted_at=?2 WHERE id=?1 AND attempted_at=0",
+            params![id, now()],
+        )?;
+        Ok(())
+    }
+    pub fn rate_limited_file(&self, id: &str, seconds: u64) -> Result<()> {
+        self.db.lock().unwrap().execute(
+            "UPDATE outbox SET next_try=?2,attempted_at=0 WHERE id=?1",
+            params![id, now().saturating_add(seconds as i64)],
+        )?;
+        Ok(())
+    }
+    pub fn fail_file(&self, out: &Outbound, reason: &str) -> Result<()> {
+        // Durable steering reports terminal transport failure to the root; it does not retry the mutation.
+        self.admit(&Input{id:format!("file-failed:{}",out.id),channel:out.channel,user:out.user.unwrap_or(0),text:format!("[harness attachment delivery] File delivery {} failed: {reason}. Do not claim it was delivered or automatically repeat an ambiguous send.",out.id)})?;
+        self.db
+            .lock()
+            .unwrap()
+            .execute("UPDATE outbox SET state='failed' WHERE id=?1", [&out.id])?;
+        Ok(())
+    }
     pub fn next_outbound_excluding(&self, channels: &[u64]) -> Result<Option<Outbound>> {
         self.next_outbound_with_ui_budget(channels, &[])
     }
@@ -290,7 +366,7 @@ impl Store {
         ui_throttled: &[u64],
     ) -> Result<Option<Outbound>> {
         // New messages preserve order and can pass edits of existing activity.
-        Ok(self.db.lock().unwrap().query_row("SELECT id,channel,user,text,nonce,receipt,reply_to FROM outbox o WHERE state='queued' AND next_try<=?1 AND channel NOT IN (SELECT value FROM json_each(?2)) AND (o.id NOT LIKE '%:activity:%' OR o.receipt IS NULL OR channel NOT IN (SELECT value FROM json_each(?3))) AND NOT EXISTS(SELECT 1 FROM outbox p WHERE p.channel=o.channel AND p.state='queued' AND p.seq<o.seq AND (p.id NOT LIKE '%:activity:%' OR p.receipt IS NULL)) ORDER BY seq LIMIT 1",params![now(),serde_json::to_string(&channels.iter().map(|c|c.to_string()).collect::<Vec<_>>())?,serde_json::to_string(&ui_throttled.iter().map(|c|c.to_string()).collect::<Vec<_>>())?],|r|Ok(Outbound{id:r.get(0)?,channel:r.get::<_,String>(1)?.parse().unwrap_or(0),user:r.get::<_,Option<String>>(2)?.and_then(|s|s.parse().ok()),text:r.get(3)?,nonce:r.get(4)?,receipt:r.get(5)?,reply_to:r.get::<_,Option<String>>(6)?.and_then(|s|s.parse().ok())})).optional()?)
+        Ok(self.db.lock().unwrap().query_row("SELECT id,channel,user,text,nonce,receipt,reply_to,attachment,attempted_at FROM outbox o WHERE state='queued' AND next_try<=?1 AND channel NOT IN (SELECT value FROM json_each(?2)) AND (o.id NOT LIKE '%:activity:%' OR o.receipt IS NULL OR channel NOT IN (SELECT value FROM json_each(?3))) AND NOT EXISTS(SELECT 1 FROM outbox p WHERE p.channel=o.channel AND p.state='queued' AND p.seq<o.seq AND (p.id NOT LIKE '%:activity:%' OR p.receipt IS NULL)) ORDER BY seq LIMIT 1",params![now(),serde_json::to_string(&channels.iter().map(|c|c.to_string()).collect::<Vec<_>>())?,serde_json::to_string(&ui_throttled.iter().map(|c|c.to_string()).collect::<Vec<_>>())?],|r|Ok(Outbound{id:r.get(0)?,channel:r.get::<_,String>(1)?.parse().unwrap_or(0),user:r.get::<_,Option<String>>(2)?.and_then(|s|s.parse().ok()),text:r.get(3)?,nonce:r.get(4)?,receipt:r.get(5)?,reply_to:r.get::<_,Option<String>>(6)?.and_then(|s|s.parse().ok()),attachment:r.get(7)?,attempted_at:r.get(8)?})).optional()?)
     }
     pub fn delivered(&self, item: &Outbound, receipt: &str) -> Result<()> {
         self.db.lock().unwrap().execute("UPDATE outbox SET receipt=?2,state=CASE WHEN text=?3 THEN 'sent' ELSE 'queued' END,next_try=0 WHERE id=?1",params![item.id,receipt,item.text])?;

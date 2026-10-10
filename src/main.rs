@@ -252,7 +252,14 @@ fn doctor(config: &Config) -> Result<()> {
             missing.push("official Codex CLI (auth.codex_cli)".into());
         }
     }
-    for binary in ["bash", "Xvfb", "x11vnc", "websockify"] {
+    for binary in [
+        "bash",
+        "Xvfb",
+        "x11vnc",
+        "websockify",
+        "pdftotext",
+        "pdftoppm",
+    ] {
         if !std::env::var_os("PATH")
             .unwrap_or_default()
             .to_string_lossy()

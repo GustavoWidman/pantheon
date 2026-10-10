@@ -134,3 +134,5 @@ packaged browser. Opt-in credential-dependent tests remain opt-in.
 
 Superseded PR check runs are cancelled; reusable release checks use a unique
 run group and are never cancelled by a newer PR or release run.
+
+Discord supports [receiving and sending attachments](docs/attachments.md), native image/document input where supported, durable `send_file` deliveries, and managed cleanup. Incoming attachments have no harness size ceiling.
