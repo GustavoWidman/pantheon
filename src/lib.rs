@@ -1,4 +1,5 @@
 pub mod activity;
+pub mod attachments;
 pub mod auth;
 pub mod browser;
 pub mod cache;

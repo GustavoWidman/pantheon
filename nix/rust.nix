@@ -4,6 +4,7 @@
   stdenv,
   cacert,
   python3,
+  poppler-utils,
 }:
 rustPlatform.buildRustPackage {
   pname = "pantheon-unwrapped";
@@ -22,7 +23,10 @@ rustPlatform.buildRustPackage {
     ];
   };
   cargoLock.lockFile = ../Cargo.lock;
-  nativeCheckInputs = [ python3 ];
+  nativeCheckInputs = [
+    python3
+    poppler-utils
+  ];
   SSL_CERT_FILE = "${cacert}/etc/ssl/certs/ca-bundle.crt";
   # cargo test cannot use panic=abort, so release tests rebuild dependencies
   # anyway. Use Cargo's normal test profile instead of paying for thin LTO and

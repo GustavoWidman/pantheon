@@ -12,6 +12,7 @@
   curl,
   findutils,
   codex,
+  poppler-utils,
 }:
 symlinkJoin {
   pname = "pantheon";
@@ -24,6 +25,8 @@ symlinkJoin {
     wrapProgram "$out/bin/pantheon" \
       --set-default SSL_CERT_FILE "${cacert}/etc/ssl/certs/ca-bundle.crt" \
       --set PANTHEON_CODEX_CLI "${codex}/bin/codex" \
+      --set PANTHEON_PDFTOTEXT "${poppler-utils}/bin/pdftotext" \
+      --set PANTHEON_PDFTOPPM "${poppler-utils}/bin/pdftoppm" \
       --set PANTHEON_BROWSER_PYTHON "${browser}/bin/pantheon-browser-python" \
       --set PANTHEON_NOVNC_WEB "${browser}/share/novnc" \
       --set PANTHEON_CAMOUFOX "${browser}/libexec/camoufox/camoufox-bin" \
@@ -39,6 +42,7 @@ symlinkJoin {
           curl
           findutils
           codex
+          poppler-utils
         ]
       }" \
       --set PANTHEON_BROWSER_WORKER "$out/libexec/pantheon/browser-worker.py"

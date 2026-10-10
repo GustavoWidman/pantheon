@@ -12,6 +12,7 @@ pub struct Config {
     pub workspace: PathBuf,
     pub instructions_file: Option<PathBuf>,
     pub discord: DiscordConfig,
+    pub attachments: crate::attachments::AttachmentConfig,
     pub agent: AgentConfig,
     pub auth: crate::auth::AuthConfig,
     pub web: crate::web::WebConfig,
@@ -54,6 +55,7 @@ impl Default for Config {
             workspace: ".".into(),
             instructions_file: None,
             discord: DiscordConfig::default(),
+            attachments: Default::default(),
             agent: AgentConfig::default(),
             auth: Default::default(),
             web: Default::default(),
@@ -129,6 +131,7 @@ impl Config {
             ensure!(*tokens > 0, "context window limits must be positive");
         }
         config.auth.validate()?;
+        config.attachments.validate()?;
         config.web.validate()?;
         config.skills.validate()?;
         config.curator.validate()?;

@@ -98,6 +98,7 @@ impl Fixture {
         cancel: &'a CancellationToken,
     ) -> Environment<'a> {
         Environment {
+            attachments: None,
             provider: Provider::mock(server.endpoint.clone()),
             reviewer_providers: (0..config.reviewers)
                 .map(|_| Provider::mock(server.endpoint.clone()))
@@ -660,6 +661,7 @@ async fn frozen_read_only_memory_and_workspace_reads_do_not_follow_main_writes()
                 arguments: json!({"id":0,"n":1}),
             },
             &skills,
+            crate::attachments::remaining_budget(env.model, &[]),
         )
         .await
         .unwrap();
@@ -673,6 +675,7 @@ async fn frozen_read_only_memory_and_workspace_reads_do_not_follow_main_writes()
                 arguments: json!({"id":0}),
             },
             &skills,
+            crate::attachments::remaining_budget(env.model, &[]),
         )
         .await
         .unwrap();
@@ -685,6 +688,7 @@ async fn frozen_read_only_memory_and_workspace_reads_do_not_follow_main_writes()
                 arguments: json!({"path":"evidence.txt"}),
             },
             &skills,
+            crate::attachments::remaining_budget(env.model, &[]),
         )
         .await
         .unwrap();
@@ -944,4 +948,60 @@ async fn fixed_deadline_releases_a_hung_draft_without_publication() {
             .contains("deadline exceeded")
     );
     assert_eq!(f.library.proposal("42", &job.id).unwrap().changes.len(), 1);
+}
+
+#[tokio::test]
+async fn native_research_finishes_the_tool_batch_without_changing_memory_or_cache_prefix() {
+    let f = Fixture::new();
+    let state = f._root.path().join("state");
+    let _store = crate::store::Store::open(&state.join("runtime.sqlite")).unwrap();
+    let attachments =
+        crate::attachments::Attachments::open(&state, &f.workspace, Default::default()).unwrap();
+    let discord = crate::discord::Discord::new("unused".into(), 1, vec![2]).unwrap();
+    // Transport bytes exceed the text guard; only guide text counts toward that guard.
+    std::fs::write(f.workspace.join("document.pdf"), vec![b'x'; 64_000]).unwrap();
+    let calls = vec![
+        ToolCall {
+            id: "file-evidence".into(),
+            name: "read".into(),
+            arguments: json!({"path":"document.pdf"}),
+        },
+        ToolCall {
+            id: "text-evidence".into(),
+            name: "read".into(),
+            arguments: json!({"path":"evidence.txt"}),
+        },
+    ];
+    let server = Mock::new(vec![response(calls, 100), response(vec![], 100)], vec![], 0).await;
+    let config = CuratorConfig {
+        max_input_chars: 20_000,
+        ..Default::default()
+    };
+    let cancel = CancellationToken::new();
+    let before = f.memory.export_html();
+    let mut environment = f.environment(&server, &config, &cancel);
+    environment.attachments = Some((&attachments, &discord, 42));
+    run(environment, &f.job(), f.frozen.clone()).await.unwrap();
+    assert_eq!(current_status(&f)["status"], "no_change");
+    assert_eq!(f.memory.export_html(), before);
+    let requests = server.state.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["instructions"], requests[1]["instructions"]);
+    assert_eq!(requests[0]["tools"], requests[1]["tools"]);
+    let first = requests[0]["input"].as_array().unwrap();
+    let second = requests[1]["input"].as_array().unwrap();
+    assert_eq!(second[..first.len()], *first);
+    let results: Vec<_> = second
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item["type"] == "function_call_output")
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].1["call_id"], "file-evidence");
+    assert_eq!(results[1].1["call_id"], "text-evidence");
+    assert!(!results[0].1["output"].as_str().unwrap().contains("base64"));
+    let evidence = second.last().unwrap();
+    assert_eq!(evidence["role"], "user");
+    assert!(results[1].0 < second.len() - 1);
+    assert_eq!(evidence["content"][1]["type"], "input_file");
 }

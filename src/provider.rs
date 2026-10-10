@@ -377,6 +377,17 @@ impl Provider {
     pub fn user(vendor: &str, text: &str) -> Value {
         json!({"role":"user","content":[{"type":if vendor=="openai" {"input_text"} else {"text"},"text":text}]})
     }
+    pub fn attach_user_parts(item: &mut Value, parts: Vec<Value>) -> Result<()> {
+        ensure!(
+            item["role"] == "user",
+            "attachments require a user content item"
+        );
+        item["content"]
+            .as_array_mut()
+            .context("user content must be an array")?
+            .extend(parts);
+        Ok(())
+    }
     pub fn result(vendor: &str, call: &ToolCall, result: &str, error: bool) -> Value {
         if vendor == "openai" {
             json!({"type":"function_call_output","call_id":call.id,"output":result})

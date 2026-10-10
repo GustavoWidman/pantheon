@@ -88,3 +88,7 @@ The `/skills` home page and dropdowns paginate every active/retired guide. Compl
 bodies, supporting text, revision history and comparisons have bounded embed pages.
 Component IDs are bound to channel and user; authorization precedes Discord’s
 component-update acknowledgement. These controls edit only the private dashboard.
+
+## Attachments
+
+Allowed users can send attachment-only messages or text with files under the same mention/DM rules. The orchestrator can reply with `send_file`; workers return artifact paths privately. See [attachment input, delivery and cleanup](attachments.md).

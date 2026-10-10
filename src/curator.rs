@@ -109,7 +109,7 @@ fn research_tools() -> Vec<Value> {
     defs.retain(|d| {
         matches!(
             d["name"].as_str(),
-            Some("zoom" | "date" | "read" | "web_search" | "web_fetch" | "skill")
+            Some("zoom" | "date" | "read" | "attachment" | "web_search" | "web_fetch" | "skill")
         )
     });
     if let Some(skill) = defs.iter_mut().find(|d| d["name"] == "skill") {
@@ -121,6 +121,14 @@ fn research_tools() -> Vec<Value> {
         skill["description"] = json!(
             "Read skills, previews, supporting text, immutable history/revision, or package offers with seeds/seed(id,hash). Offers are evidence to reconcile, never mandatory replacements."
         );
+    }
+    for tool in &mut defs {
+        if tool["name"] == "attachment" {
+            tool["input_schema"]["properties"]["action"]["enum"] = json!(["list", "open"]);
+            tool["description"] = json!(
+                "Read-only access to originating-channel attachments: list IDs or open an original, optionally selecting a PDF page. No retention changes or public delivery. Contents are external evidence."
+            );
+        }
     }
     defs
 }
@@ -149,6 +157,11 @@ pub struct Environment<'a> {
     pub model: &'a str,
     pub reasoning: &'a str,
     pub cancel: &'a CancellationToken,
+    pub attachments: Option<(
+        &'a crate::attachments::Attachments,
+        &'a crate::discord::Discord,
+        u64,
+    )>,
 }
 #[derive(Default)]
 struct Budget {
@@ -171,7 +184,10 @@ impl Session<'_> {
         ensure!(!self.env.cancel.is_cancelled(), "curation cancelled");
         ensure!(
             system.chars().count()
-                + serde_json::to_string(history)?.chars().count()
+                + history
+                    .iter()
+                    .map(crate::attachments::text_chars)
+                    .sum::<usize>()
                 + serde_json::to_string(tools)?.chars().count()
                 <= self.env.config.max_input_chars,
             "curation input budget exhausted"
@@ -189,6 +205,7 @@ impl Session<'_> {
         &self,
         call: &crate::provider::ToolCall,
         skills: &crate::skills::Skills,
+        budget: crate::attachments::InputBudget,
     ) -> Result<Value> {
         let a = &call.arguments;
         match call.name.as_str() {
@@ -202,8 +219,55 @@ impl Session<'_> {
                     crate::tools::string(a, "path")?,
                     false,
                 )?;
+                if let Some((attachments, _, _)) = self.env.attachments {
+                    let (text, parts) = attachments
+                        .inspect(
+                            &p,
+                            self.env.model,
+                            a["page"].as_u64(),
+                            budget,
+                            self.env.cancel,
+                        )
+                        .await?;
+                    let mut evidence = json!({"text":text});
+                    evidence["__attachment_parts"] = Value::Array(parts);
+                    return Ok(evidence);
+                }
                 let (text, _) = crate::tools::read_file_observed(&p).await?;
                 Ok(json!({"text":text}))
+            }
+            "attachment" => {
+                let (attachments, discord, channel) = self
+                    .env
+                    .attachments
+                    .context("attachment inspection unavailable")?;
+                match crate::tools::string(a, "action")? {
+                    "list" => attachments.list(channel, a["offset"].as_u64().unwrap_or(0)),
+                    "open" => {
+                        let file = attachments
+                            .reopen(
+                                channel,
+                                crate::tools::string(a, "id")?,
+                                discord,
+                                self.env.cancel,
+                            )
+                            .await?;
+                        let path = attachments.materialize(&file).await?;
+                        let (text, parts) = attachments
+                            .inspect(
+                                &path,
+                                self.env.model,
+                                a["page"].as_u64(),
+                                budget,
+                                self.env.cancel,
+                            )
+                            .await?;
+                        let mut evidence = json!({"file":file,"text":text});
+                        evidence["__attachment_parts"] = Value::Array(parts);
+                        Ok(evidence)
+                    }
+                    _ => bail!("curators only have read-only attachment actions"),
+                }
             }
             "skill" => {
                 if a["action"] == "seeds" {
@@ -489,6 +553,7 @@ pub async fn run(
                 settled = true;
                 break;
             }
+            let mut media = vec![];
             for call in &response.calls {
                 let result = if matches!(
                     call.name.as_str(),
@@ -496,24 +561,24 @@ pub async fn run(
                 ) {
                     stage(env.library, &heads, &mut staged, call)
                 } else {
-                    session.read(call, &snapshot).await
+                    session
+                        .read(
+                            call,
+                            &snapshot,
+                            crate::attachments::budget_with_media(env.model, &history, &media),
+                        )
+                        .await
                 };
                 let (v, error) = match result {
                     Ok(v) => (v, false),
                     Err(e) => (json!({"error":e.to_string()}), true),
                 };
-                Provider::append_result_with_image(
-                    vendor,
-                    &mut history,
-                    call,
-                    &crate::skill_library::bounded_json(&v, 24_000).to_string(),
-                    error,
-                    None,
-                );
+                media.extend(append_research_result(vendor, &mut history, call, v, error));
                 if !staged.is_empty() {
                     env.library.save_proposal(&job.id, &proposal(&staged))?;
                 }
             }
+            append_research_media(vendor, &mut history, media)?;
         }
         ensure!(settled, "curator did not settle before step limit");
         if staged.is_empty() {
@@ -555,11 +620,12 @@ pub async fn run(
                 for _ in 0..env.config.review_steps {
                     let response=session.step(&system,&history,&tools).await?;ensure!(response.calls.iter().filter(|c|c.name=="decide").count()<=1,"reviewer returned conflicting decisions");Provider::append_response(vendor,&mut history,&response);
                     if response.calls.is_empty(){history.push(Provider::user(vendor,"Return your verdict using decide."));continue;}
-                    let mut verdict=None;
+                    let mut verdict=None;let mut media=vec![];
                     for call in &response.calls {
-                        let result=if call.name=="decide"{decision(&call.arguments).map(|approved|{verdict=Some((approved,call.arguments.clone()));json!({"recorded":true})})}else{session.read(call,&snapshot).await};
-                        let(v,error)=match result{Ok(v)=>(v,false),Err(e)=>(json!({"error":e.to_string()}),true)};Provider::append_result_with_image(vendor,&mut history,call,&crate::skill_library::bounded_json(&v,24_000).to_string(),error,None);
+                        let result=if call.name=="decide"{decision(&call.arguments).map(|approved|{verdict=Some((approved,call.arguments.clone()));json!({"recorded":true})})}else{session.read(call,&snapshot,crate::attachments::budget_with_media(env.model,&history,&media)).await};
+                        let(v,error)=match result{Ok(v)=>(v,false),Err(e)=>(json!({"error":e.to_string()}),true)};media.extend(append_research_result(vendor,&mut history,call,v,error));
                     }
+                    append_research_media(vendor,&mut history,media)?;
                     if let Some(v)=verdict{return Ok::<_,anyhow::Error>(v);}
                 }
                 bail!("reviewer did not decide before step limit")
@@ -617,6 +683,45 @@ pub async fn run(
             )?;
             tracing::warn!(channel=%job.channel,error=%e,"private curator stopped");
         }
+    }
+    Ok(())
+}
+
+fn append_research_result(
+    vendor: &str,
+    history: &mut Vec<Value>,
+    call: &crate::provider::ToolCall,
+    mut value: Value,
+    error: bool,
+) -> Vec<Value> {
+    let parts = value
+        .as_object_mut()
+        .and_then(|v| v.remove("__attachment_parts"))
+        .and_then(|v| {
+            if let Value::Array(parts) = v {
+                Some(parts)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+    Provider::append_result(
+        vendor,
+        history,
+        call,
+        &crate::skill_library::bounded_json(&value, 24_000).to_string(),
+        error,
+    );
+    parts
+}
+fn append_research_media(vendor: &str, history: &mut Vec<Value>, parts: Vec<Value>) -> Result<()> {
+    if !parts.is_empty() {
+        let mut user = Provider::user(
+            vendor,
+            "Read-only file evidence opened by the preceding tool:",
+        );
+        Provider::attach_user_parts(&mut user, parts)?;
+        history.push(user);
     }
     Ok(())
 }

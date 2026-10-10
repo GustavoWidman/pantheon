@@ -9,6 +9,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
+use sha2::Digest;
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
@@ -24,6 +25,8 @@ pub struct Harness {
     pub config: Config,
     pub store: Store,
     pub discord: Arc<Discord>,
+    attachments: Arc<crate::attachments::Attachments>,
+    attachment_jobs: Mutex<HashMap<u64, CancellationToken>>,
     provider: Provider,
     web: crate::web::Web,
     browser: BrowserManager,
@@ -76,6 +79,7 @@ struct Run {
     inputs: Vec<String>,
     trace: Option<Memory>,
     steering: Vec<String>,
+    media: Vec<Value>,
     context: crate::ui::ReplyContext,
     skills: Arc<crate::skills::Skills>,
     task: String,
@@ -173,7 +177,23 @@ impl Harness {
             crate::skill_library::INDEX,
             skills.catalogue(config.curator.description_chars)?
         );
+        let attachments = Arc::new(crate::attachments::Attachments::open(
+            &config.state_dir,
+            &config.workspace,
+            config.attachments.clone(),
+        )?);
+        attachments.protect_curators(&if config.curator.enabled {
+            skills
+                .queued_channels()?
+                .into_iter()
+                .filter_map(|c| c.parse::<u64>().ok())
+                .collect()
+        } else {
+            HashSet::new()
+        })?;
         let h = Self {
+            attachments,
+            attachment_jobs: Mutex::new(HashMap::new()),
             provider: Provider::new(config.agent.request_timeout_seconds)?
                 .with_request_retries(
                     config.agent.request_max_attempts,
@@ -296,6 +316,13 @@ impl Harness {
         let reactions = tokio::spawn(async move { h.reaction_worker().await });
         let h = self.clone();
         let curation = tokio::spawn(async move { h.curator_worker().await });
+        let h = self.clone();
+        let attachments = tokio::spawn(async move {
+            if let Err(e) = h.clone().attachment_worker().await {
+                tracing::error!(error=%e,"attachment worker stopped");
+                h.shutdown.cancel();
+            }
+        });
         let mut commands = tokio::task::JoinSet::new();
         let command_capacity = Arc::new(Semaphore::new(16));
         for id in self.store.queued_channels()? {
@@ -308,8 +335,9 @@ impl Harness {
                 input=inbound.recv()=>{
                     let Some(input)=input else{break;};
                     match input {
-                        Inbound::Prompt{id,channel,user,text}=>{
-                            let admitted=self.admit_prompt(&Input{id:id.clone(),channel,user,text})?;self.discord.acknowledge(&id)?;if admitted {self.channel(channel).await?.incoming.notify_one();}
+                        Inbound::Prompt{id,channel,user,text,attachments}=>{
+                            self.attachments.queue(&Input{id:id.clone(),channel,user,text},&attachments)?;
+                            self.discord.acknowledge(&id)?;
                         }
                         Inbound::Command{id:_,token,channel,user,name,options}=>{
                             let h=self.clone();let permit=command_capacity.clone().try_acquire_owned();
@@ -350,6 +378,7 @@ impl Harness {
             let _ = progress.await;
             let _ = reactions.await;
             let _ = curation.await;
+            let _ = attachments.await;
         })
         .await;
         Ok(())
@@ -407,11 +436,26 @@ impl Harness {
         self.discord.models.validate_effort(&model, &effort)?;
         Ok((model, effort))
     }
+    // Only short map/SQLite operations run under this lock. GC hashes files independently.
+    async fn refresh_attachment_curators(&self) -> Result<()> {
+        let curators = self.curators.lock().await;
+        let mut protected: HashSet<u64> = curators.keys().copied().collect();
+        if self.config.curator.enabled {
+            protected.extend(
+                self.skills
+                    .queued_channels()?
+                    .into_iter()
+                    .filter_map(|c| c.parse::<u64>().ok()),
+            );
+        }
+        self.attachments.protect_curators(&protected)
+    }
     async fn cancel_curator(&self, channel: u64) -> Result<()> {
         if let Some(cancel) = self.curators.lock().await.get(&channel) {
             cancel.cancel();
         }
         self.skills.cancel_channel_forks(&channel.to_string())?;
+        self.refresh_attachment_curators().await?;
         Ok(())
     }
     async fn curator_worker(self: Arc<Self>) {
@@ -470,11 +514,16 @@ impl Harness {
                         Arc::new(m.snapshot()?)
                     };
                     // Claim under channel-specific state. Other channels continue independently.
-                    let Some(job) = self.skills.take_fork(&channel)? else {
-                        continue;
-                    };
                     let cancel = self.shutdown.child_token();
-                    self.curators.lock().await.insert(id, cancel.clone());
+                    let job = {
+                        // Keep the queued -> active reader-protection transition atomic.
+                        let mut curators = self.curators.lock().await;
+                        let Some(job) = self.skills.take_fork(&channel)? else {
+                            continue;
+                        };
+                        curators.insert(id, cancel.clone());
+                        job
+                    };
                     let h = self.clone();
                     tokio::spawn(async move {
                         let result: Result<()> = async {
@@ -505,6 +554,7 @@ impl Harness {
                                     model: &settings.0,
                                     reasoning: &settings.1,
                                     cancel: &cancel,
+                                    attachments: Some((&h.attachments, &h.discord, id)),
                                 },
                                 &job,
                                 memory,
@@ -522,6 +572,9 @@ impl Harness {
                             tracing::warn!(channel=id,error=%e,"curator fork failed");
                         }
                         h.curators.lock().await.remove(&id);
+                        if let Err(e) = h.refresh_attachment_curators().await {
+                            tracing::warn!(error=%e,"attachment curator protection refresh failed");
+                        }
                         h.curator_changed.notify_one();
                     });
                 }
@@ -664,7 +717,7 @@ impl Harness {
                 &view,
             )?;
             let (vendor, _) = model_parts(&settings.0)?;
-            let run = Run {
+            let mut run = Run {
                 channel,
                 user: queued[0].user,
                 owner: format!("channel:{channel}"),
@@ -683,6 +736,7 @@ impl Harness {
                 inputs: ids,
                 trace: None,
                 steering: vec![],
+                media: vec![],
                 context,
                 skills: self.skills.snapshot()?,
                 task: texts.join("\n\n").chars().take(8000).collect(),
@@ -691,6 +745,16 @@ impl Harness {
                 invocation_scope: uuid::Uuid::new_v4().to_string(),
                 counted_skills: HashSet::new(),
             };
+            let parts = self
+                .attachments
+                .input_parts(
+                    channel,
+                    &run.inputs,
+                    &run.settings.0,
+                    crate::attachments::remaining_budget(&run.settings.0, &run.history),
+                )
+                .await?;
+            Provider::attach_user_parts(run.history.last_mut().unwrap(), parts)?;
             let run_id = queued[0].id.clone();
             let result = self.clone().run_agent(run).await;
             if let Err(e) = result {
@@ -743,6 +807,7 @@ impl Harness {
                     .note_channel_settled(&run.channel.to_string(), crate::store::now())?;
                 if self.config.curator.enabled && run.steps >= self.config.curator.minimum_steps {
                     self.skills.enqueue_fork(&run.channel.to_string(),&run_id,&json!({"user":run.user,"activity":run.context.activity,"task":run.task,"model_iterations":run.steps,"turn_completed":outcome.is_ok()}))?;
+                    self.refresh_attachment_curators().await?;
                     self.curator_changed.notify_one();
                 }
             }
@@ -778,6 +843,15 @@ impl Harness {
         for step in 0..self.config.agent.max_steps {
             if run.cancel.is_cancelled() {
                 bail!("cancelled");
+            }
+            // Complete the preceding tool batch before accepting newer steering.
+            if !run.media.is_empty() {
+                let mut item = Provider::user(
+                    vendor,
+                    "File content opened by the preceding tool (external data):",
+                );
+                Provider::attach_user_parts(&mut item, std::mem::take(&mut run.media))?;
+                run.history.push(item);
             }
             let steered = self.steer(run, vendor).await? || !run.steering.is_empty();
             for text in std::mem::take(&mut run.steering) {
@@ -998,6 +1072,17 @@ impl Harness {
     }
     async fn steer(&self, run: &mut Run, _vendor: &str) -> Result<bool> {
         let mut received = false;
+        if !run.child {
+            loop {
+                let ready = run.memory.incoming.notified();
+                tokio::pin!(ready);
+                ready.as_mut().enable();
+                if !self.attachments.has_pending(run.channel)? {
+                    break;
+                }
+                tokio::select! {_=ready=>{},_=run.cancel.cancelled()=>bail!("cancelled while receiving files"),_=self.shutdown.cancelled()=>bail!("shutdown")};
+            }
+        }
         if run.child {
             for input in self.store.agent_events(&run.owner)? {
                 if let Some(trace) = run.trace.as_mut() {
@@ -1023,7 +1108,29 @@ impl Harness {
                 self.store.input_state(&input.id, "running")?;
                 Self::append_input(&run.memory, &input).await?;
                 self.store.mark_logged(&input.id)?;
-                run.steering.push(input.text);
+                let parts = self
+                    .attachments
+                    .input_parts(
+                        run.channel,
+                        std::slice::from_ref(&input.id),
+                        &run.settings.0,
+                        crate::attachments::budget_with_media(
+                            &run.settings.0,
+                            &run.history,
+                            &run.media,
+                        ),
+                    )
+                    .await?;
+                if parts.is_empty() {
+                    run.steering.push(input.text);
+                } else {
+                    for text in std::mem::take(&mut run.steering) {
+                        run.history.push(Provider::user(_vendor, &text));
+                    }
+                    let mut item = Provider::user(_vendor, &input.text);
+                    Provider::attach_user_parts(&mut item, parts)?;
+                    run.history.push(item);
+                }
                 run.inputs.push(input.id);
                 received = true;
             }
@@ -1099,11 +1206,109 @@ impl Harness {
                     tools::string(a, "path")?,
                     false,
                 )?;
-                let (text, lines) = tools::read_file_observed(&p).await?;
+                let (text, parts) = self
+                    .attachments
+                    .inspect(
+                        &p,
+                        &run.settings.0,
+                        a["page"].as_u64(),
+                        crate::attachments::budget_with_media(
+                            &run.settings.0,
+                            &run.history,
+                            &run.media,
+                        ),
+                        &run.cancel,
+                    )
+                    .await?;
+                run.media.extend(parts);
+                let lines = text.lines().count() as u64;
                 if let Some(id) = tool_id {
                     self.store.tool_output_lines(id, lines)?;
                 }
                 return Ok(text);
+            }
+            "attachment" => {
+                let action = tools::string(a, "action")?;
+                match action {
+                    "list" => self
+                        .attachments
+                        .list(run.channel, a["offset"].as_u64().unwrap_or(0))?,
+                    "keep" | "release" => serde_json::to_value(self.attachments.keep(
+                        run.channel,
+                        tools::string(a, "id")?,
+                        action == "keep",
+                    )?)?,
+                    "open" => {
+                        let file = self
+                            .attachments
+                            .reopen(
+                                run.channel,
+                                tools::string(a, "id")?,
+                                &self.discord,
+                                &run.cancel,
+                            )
+                            .await?;
+                        let path = self.attachments.materialize(&file).await?;
+                        let (text, parts) = self
+                            .attachments
+                            .inspect(
+                                &path,
+                                &run.settings.0,
+                                a["page"].as_u64(),
+                                crate::attachments::budget_with_media(
+                                    &run.settings.0,
+                                    &run.history,
+                                    &run.media,
+                                ),
+                                &run.cancel,
+                            )
+                            .await?;
+                        run.media.extend(parts);
+                        json!({"file":file,"path":self.attachments.relative_path(&file),"inspection":text})
+                    }
+                    _ => bail!("unknown attachment action"),
+                }
+            }
+            "send_file" => {
+                ensure!(!run.child, "only the orchestrator publishes files");
+                let path = tools::workspace_path(
+                    &self.config.workspace,
+                    tools::string(a, "path")?,
+                    false,
+                )?;
+                ensure!(
+                    path.is_file(),
+                    "send_file requires a regular workspace file"
+                );
+                let caption = a["caption"].as_str().unwrap_or("");
+                ensure!(
+                    caption.encode_utf16().count() <= 2000,
+                    "caption exceeds Discord’s limit"
+                );
+                let id = format!(
+                    "file-{}",
+                    hex::encode(sha2::Sha256::digest(
+                        format!("{}:{}", run.invocation_scope, call.id).as_bytes()
+                    ))
+                );
+                ensure!(!run.cancel.is_cancelled(), "file snapshot cancelled");
+                let file = tokio::select! {
+                    _ = run.cancel.cancelled() => bail!("file snapshot cancelled"),
+                    file = self.attachments.snapshot(run.channel, &id, &path) => file?,
+                };
+                ensure!(
+                    !run.cancel.is_cancelled(),
+                    "file delivery cancelled before queuing"
+                );
+                self.store.enqueue_file(
+                    &id,
+                    run.channel,
+                    run.user,
+                    caption,
+                    &file.id,
+                    run.context.reply_to,
+                )?;
+                json!({"delivery_id":id,"state":"queued","filename":file.filename,"bytes":file.size})
             }
             "write" => {
                 let p =
@@ -1401,7 +1606,7 @@ impl Harness {
                 let (vendor,_)=model_parts(&settings.0)?;
                 let catalogue=h.skills.cache_catalogue(&channel.to_string(),&h.skills.catalogue(h.config.curator.description_chars)?,false)?;
                 let worker_system=system_prompt(true,false,&format!("{}\n{catalogue}",crate::skill_library::INDEX),&h.curator_instructions);
-                let run=Run {channel,user,owner:id.clone(),child:true,memory:memory.clone(),cancel,settings:settings.clone(),history:Provider::start(vendor,&view,&prompt),inputs:vec![],trace:Some(trace),steering:vec![],context:context.clone(),skills:h.skills.snapshot()?,task:prompt.chars().take(8000).collect(),system:Some(worker_system),steps:0,invocation_scope:uuid::Uuid::new_v4().to_string(),counted_skills:HashSet::new()};
+                let run=Run {channel,user,owner:id.clone(),child:true,memory:memory.clone(),cancel,settings:settings.clone(),history:Provider::start(vendor,&view,&prompt),inputs:vec![],trace:Some(trace),steering:vec![],media:vec![],context:context.clone(),skills:h.skills.snapshot()?,task:prompt.chars().take(8000).collect(),system:Some(worker_system),steps:0,invocation_scope:uuid::Uuid::new_v4().to_string(),counted_skills:HashSet::new()};
                 h.clone().run_agent(run).await
             }.await;
             let successful = outcome.is_ok();
@@ -2104,6 +2309,10 @@ impl Harness {
             }
 
             "stop" => {
+                self.attachments.cancel_channel(channel)?;
+                if let Some(cancel) = self.attachment_jobs.lock().await.get(&channel) {
+                    cancel.cancel();
+                }
                 for (job_channel, cancel) in self.shell_jobs.lock().await.values() {
                     if *job_channel == channel {
                         cancel.cancel();
@@ -2321,7 +2530,78 @@ impl Harness {
         workers.abort_all();
         Ok(())
     }
-    async fn outbox_worker(&self) -> Result<()> {
+    async fn attachment_worker(self: Arc<Self>) -> Result<()> {
+        let mut workers = tokio::task::JoinSet::new();
+        let mut active = HashSet::new();
+        let mut last_cleanup = Instant::now();
+        let mut cleanup = tokio::task::JoinSet::new();
+        loop {
+            if self.shutdown.is_cancelled() {
+                break;
+            }
+            while workers.len() < 8 {
+                let Some(pending) = self.attachments.next(&active)? else {
+                    break;
+                };
+                let channel = pending.input.channel;
+                active.insert(channel);
+                let cancel = self.shutdown.child_token();
+                {
+                    let mut jobs = self.attachment_jobs.lock().await;
+                    if !self.attachments.pending(&pending.input.id)? {
+                        active.remove(&channel);
+                        continue;
+                    }
+                    jobs.insert(channel, cancel.clone());
+                }
+                let h = self.clone();
+                workers.spawn(async move {
+                    let result = h.attachments.receive(&pending, &h.discord, &cancel).await;
+                    (pending, result, cancel)
+                });
+            }
+            while let Some(done) = cleanup.try_join_next() {
+                match done {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!(error=%e,"attachment cleanup failed"),
+                    Err(e) => tracing::warn!(error=%e,"attachment cleanup task failed"),
+                }
+            }
+            if cleanup.is_empty()
+                && last_cleanup.elapsed()
+                    >= Duration::from_secs(self.config.attachments.cleanup_interval_seconds)
+            {
+                let attachments = self.attachments.clone();
+                let protected = active.clone();
+                let cancel = self.shutdown.clone();
+                cleanup
+                    .spawn(async move { attachments.clean_with_cancel(&protected, &cancel).await });
+                last_cleanup = Instant::now();
+            }
+            tokio::select! {
+                Some(done)=workers.join_next(),if !workers.is_empty()=>{
+                    let (pending,result,cancel)=done.context("attachment task failed")?;
+                    let channel=pending.input.channel;
+                    active.remove(&channel);
+                    self.attachment_jobs.lock().await.remove(&channel);
+                    if !cancel.is_cancelled() && self.attachments.pending(&pending.input.id)? {
+                        let input=result?;
+                        self.admit_prompt(&input)?;
+                        self.attachments.finish(&input.id)?;
+                        self.channel(channel).await?.incoming.notify_one();
+                    }
+                },
+                _=self.shutdown.cancelled()=>break,
+                _=tokio::time::sleep(Duration::from_millis(100))=>{},
+            }
+        }
+        workers.abort_all();
+        while workers.join_next().await.is_some() {}
+        while cleanup.join_next().await.is_some() {}
+        Ok(())
+    }
+
+    async fn outbox_worker(self: &Arc<Self>) -> Result<()> {
         let mut workers = tokio::task::JoinSet::new();
         let mut active = HashSet::new();
         let mut ui_sent = HashMap::<u64, Instant>::new();
@@ -2343,8 +2623,23 @@ impl Harness {
                 };
                 active.insert(out.channel);
                 let discord = self.discord.clone();
+                let file = out
+                    .attachment
+                    .as_deref()
+                    .map(|id| self.attachments.get(out.channel, id))
+                    .transpose()?;
+                let path = file.as_ref().map(|f| self.attachments.outgoing_path(f));
+                if file.is_some() {
+                    self.store.attachment_attempt(&out.id)?;
+                }
                 workers.spawn(async move {
-                    let result = if out.id.contains(":activity:") {
+                    let result = if let Some(file) = file {
+                        if path.as_ref().unwrap().is_file() {
+                            discord.send_file(&out, &file, path.as_ref().unwrap()).await
+                        } else {
+                            Err(crate::discord::PermanentDelivery(410).into())
+                        }
+                    } else if out.id.contains(":activity:") {
                         discord
                             .activity(
                                 out.channel,
@@ -2368,7 +2663,7 @@ impl Harness {
                 Some(done)=workers.join_next(),if !workers.is_empty()=>{
                     let (out,result)=done.context("delivery worker failed")?;active.remove(&out.channel);
                     if out.id.contains(":activity:"){ui_sent.insert(out.channel,Instant::now());}
-                    match result {Ok(receipt)=>self.store.delivered(&out,&receipt)?,Err(_)=>{self.store.retry_outbound(&out.id)?;tracing::warn!(channel=out.channel,"Discord delivery pending retry");}}
+                    match result {Ok(receipt)=>self.store.delivered(&out,&receipt)?,Err(e)=>{if let Some(rate)=e.downcast_ref::<crate::discord::FileRateLimit>() {self.store.rate_limited_file(&out.id,rate.0)?;}else if out.attachment.is_some() && let Some(permanent)=e.downcast_ref::<crate::discord::PermanentDelivery>() {let reason=if permanent.0==409 {"Delivery outcome is ambiguous beyond Discord’s nonce window; recent-message reconciliation found no receipt.".into()}else{permanent.to_string()};self.store.fail_file(&out,&reason)?;self.channel(out.channel).await?.incoming.notify_one();self.notice(&format!("file-error:{}",out.id),out.channel,out.user,&reason)?;}else{self.store.retry_outbound(&out.id)?;tracing::warn!(channel=out.channel,"Discord delivery pending retry");}}}
                 },
                 _=tokio::time::sleep(Duration::from_millis(200))=>{},_=self.shutdown.cancelled()=>break,
             }
@@ -2716,6 +3011,7 @@ mod tests {
             inputs: vec![input.id],
             trace: None,
             steering: vec![],
+            media: vec![],
             skills: h.skills.snapshot().unwrap(),
             task: input.text.chars().take(8000).collect(),
             system: None,
@@ -4061,6 +4357,7 @@ for line in sys.stdin:
         );
         server.abort();
     }
+    include!("runtime_attachment_tests.rs");
     include!("runtime_curator_tests.rs");
     include!("runtime_request_retry_tests.rs");
 }
