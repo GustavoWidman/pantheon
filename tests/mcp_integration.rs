@@ -196,7 +196,9 @@ async fn cancelled_mutation_is_not_replayed_and_next_request_reconnects() {
     let task = m.execute(1, false, false, &call, &cancel);
     let stop = async {
         for _ in 0..100 {
-            if dir.path().join("effects").exists() {
+            if std::fs::read_to_string(dir.path().join("effects"))
+                .is_ok_and(|text| text == "issued\n")
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

@@ -75,8 +75,13 @@ The drafting fork receives only:
 - `create_skill`, `edit_skill`, `retire_skill`: private staged changes.
 
 Create/edit requires ID, name, description, body, a factual change summary and a
-purpose explaining when it helps. Optional supporting files replace only supplied
-paths; other resources and YAML metadata remain intact. Repeated edits collapse
+purpose explaining when it helps. `body` is the complete Markdown body without
+YAML front matter; the harness generates the header from the separate fields and
+preserves existing metadata. A leading YAML metadata block returns a staging error
+without changing the proposal, allowing correction in the same drafting pass
+before reviewers run. Markdown horizontal rules and fenced YAML examples are
+allowed. Optional supporting files replace only supplied paths; other resources
+and YAML metadata remain intact. Repeated edits collapse
 into one final before/after change. Retirements require summary and purpose.
 At most four related guides can change together, bounded to 48 KB of staged JSON.
 Drafting uses the pinned source revisions, so concurrent publications cause a

@@ -25,6 +25,10 @@ Unicode character limit displayed in the full system catalogue.
 
 Stage changes with create_skill/edit_skill/retire_skill. Each change requires a
 short factual summary of what changed and a purpose explaining when it helps.
+For create/edit, body is the complete Markdown body only, without YAML front
+matter. Pass name and description separately; the harness creates the header and
+preserves other existing metadata. When editing a loaded guide, omit its leading
+YAML block. If staging reports an error, correct the call and retry before settling.
 Those summaries will be reviewed and delivered to the main session only after
 publication. Preserve resources by supplying only supporting files you change.
 Repeated edits collapse into one final diff; at most four related guides can change

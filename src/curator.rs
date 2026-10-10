@@ -126,9 +126,9 @@ fn research_tools() -> Vec<Value> {
 }
 fn draft_tools() -> Vec<Value> {
     let mut defs = research_tools();
-    let fields = json!({"id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"body":{"type":"string"},"files":{"type":"object","additionalProperties":{"type":"string"}},"summary":{"type":"string"},"purpose":{"type":"string"}});
+    let fields = json!({"id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"body":{"type":"string","description":"Complete Markdown body only, without YAML front matter. Supply name and description separately; the harness generates the header and preserves existing metadata. When editing a loaded SKILL.md, omit its leading YAML block."},"files":{"type":"object","additionalProperties":{"type":"string"}},"summary":{"type":"string"},"purpose":{"type":"string"}});
     for name in ["create_skill", "edit_skill"] {
-        defs.push(tool(name,"Stage a complete main guide. files replaces supplied supporting paths; unspecified resources and YAML metadata are preserved. This never publishes. summary explains what changed; purpose explains when it helps. Descriptions are bounded by the displayed catalogue character limit.",fields.clone(),&["id","name","description","body","summary","purpose"]));
+        defs.push(tool(name,"Stage a complete Markdown body without YAML front matter; the harness generates the main guide header. files replaces supplied supporting paths; unspecified resources and YAML metadata are preserved. This never publishes. Correct staging errors and retry before settling. summary explains what changed; purpose explains when it helps. Descriptions are bounded by the displayed catalogue character limit.",fields.clone(),&["id","name","description","body","summary","purpose"]));
     }
     defs.push(tool("retire_skill","Stage a retirement supported by redundancy, obsolescence or harmful guidance. Never publishes directly.",json!({"id":{"type":"string"},"summary":{"type":"string"},"purpose":{"type":"string"}}),&["id","summary","purpose"]));
     defs
@@ -283,6 +283,34 @@ impl Session<'_> {
     }
 }
 fn guide(existing: Option<&str>, name: &str, description: &str, body: &str) -> Result<String> {
+    let leading = body.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    if let Some(rest) = leading
+        .strip_prefix("---\n")
+        .or_else(|| leading.strip_prefix("---\r\n"))
+    {
+        let block = rest
+            .lines()
+            .take_while(|line| !matches!(line.trim(), "---" | "..."))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mapping = serde_yaml_ng::from_str::<BTreeMap<String, Value>>(&block)
+            .is_ok_and(|header| !header.is_empty());
+        // Also reject a visibly intended header with invalid or incomplete YAML.
+        let metadata = block
+            .lines()
+            .find(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+            .and_then(|line| line.split_once(':'))
+            .is_some_and(|(key, _)| {
+                matches!(
+                    key.trim(),
+                    "name" | "description" | "metadata" | "disable-model-invocation"
+                )
+            });
+        ensure!(
+            !mapping && !metadata,
+            "body must contain Markdown only, without YAML front matter. Remove the leading YAML metadata block and retry; supply name and description separately. The harness generates the header and preserves existing metadata. Nothing from this call was staged."
+        );
+    }
     let mut header = match existing {
         Some(s) => serde_yaml_ng::from_str::<BTreeMap<String, Value>>(
             s.strip_prefix("---\n")
