@@ -266,6 +266,137 @@ fn assert_inactive(f: &Fixture, status: &str) {
     assert!(f.library.notifications("42").unwrap().is_empty());
 }
 
+#[test]
+fn frontmatter_is_rejected_without_replacing_previous_staged_changes() {
+    let f = Fixture::new();
+    let heads = f.library.heads().unwrap();
+    let mut staged = BTreeMap::new();
+    stage(
+        &f.library,
+        &heads,
+        &mut staged,
+        &call("edit_skill", "engineering", "A valid staged improvement."),
+    )
+    .unwrap();
+    let before = serde_json::to_value(proposal(&staged)).unwrap();
+    for body in [
+        "---\nname: engineering\ndescription: A guide\n---\nCheck observable state.",
+        "\r\n \u{feff}---\r\nname: engineering\r\ndescription: A guide\r\n---\r\nCheck state.",
+        "---\nname: [invalid YAML\ndescription: A guide\n---\nCheck state.",
+        "---\nname: engineering\ndescription: A guide",
+        "---\ncustom-marker: preserved\n---\nCheck state.",
+    ] {
+        for (tool, id) in [("edit_skill", "engineering"), ("create_skill", "new-guide")] {
+            let error = stage(&f.library, &heads, &mut staged, &call(tool, id, body))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("without YAML front matter"));
+            assert!(error.contains("retry"));
+            assert_eq!(serde_json::to_value(proposal(&staged)).unwrap(), before);
+        }
+    }
+}
+
+#[test]
+fn markdown_rules_and_fenced_yaml_are_preserved_with_existing_metadata() {
+    let f = Fixture::new();
+    let existing = f.library.revision_files("engineering", 1).unwrap();
+    for body in [
+        "---\n\n# Procedure\nCheck observable state.\n\n---\nReport evidence.",
+        "---\n```yaml\nname: example\ndescription: Example data\n```\nUse only as an example.",
+        "# Procedure\n\n```yaml\n---\nname: example\n---\n```\nCheck state.",
+    ] {
+        let text = guide(
+            Some(&existing["SKILL.md"]),
+            "Engineering",
+            "Check state",
+            body,
+        )
+        .unwrap();
+        let (header, actual_body) = text
+            .strip_prefix("---\n")
+            .unwrap()
+            .split_once("\n---\n")
+            .unwrap();
+        let metadata: Value = serde_yaml_ng::from_str(header).unwrap();
+        assert_eq!(metadata["disable-model-invocation"], true);
+        assert_eq!(metadata["custom-marker"], "preserved");
+        assert_eq!(actual_body, body);
+    }
+}
+
+#[tokio::test]
+async fn full_guide_staging_error_can_be_corrected_before_parallel_review() {
+    let f = Fixture::new();
+    let job = f.job();
+    let original = f.library.revision_files("engineering", 1).unwrap();
+    let markdown = original["SKILL.md"].split_once("\n---\n").unwrap().1;
+    let corrected = format!("{markdown}\nVerify archived refs before deleting merged branches.\n");
+    let duplicate = format!(
+        "{}\nVerify archived refs before deleting merged branches.\n",
+        original["SKILL.md"]
+    );
+    let server = Mock::new(
+        vec![
+            response(vec![call("edit_skill", "engineering", &duplicate)], 100),
+            response(vec![call("edit_skill", "engineering", &corrected)], 100),
+            response(vec![], 100),
+        ],
+        vec![
+            response(vec![verdict(true)], 100),
+            response(vec![verdict(true)], 100),
+        ],
+        2,
+    )
+    .await;
+    let config = CuratorConfig::default();
+    let cancel = CancellationToken::new();
+    let execution = run(
+        f.environment(&server, &config, &cancel),
+        &job,
+        f.frozen.clone(),
+    );
+    let inspect_error = async {
+        server.wait_paused().await;
+        assert!(f.library.proposal("42", &job.id).is_err());
+        assert_eq!(
+            f.library.revision_files("engineering", 1).unwrap(),
+            original
+        );
+        assert_eq!(current_status(&f)["reviewers_spawned"], 0);
+        assert!(f.library.notifications("42").unwrap().is_empty());
+        let requests = server.state.requests.lock().unwrap();
+        let output = requests[1]["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "function_call_output")
+            .unwrap();
+        assert!(
+            output["output"]
+                .as_str()
+                .unwrap()
+                .contains("without YAML front matter")
+        );
+        drop(requests);
+        server.state.release.notify_one();
+    };
+    let (result, ()) = tokio::join!(execution, inspect_error);
+    result.unwrap();
+    assert_eq!(current_status(&f)["status"], "published");
+    assert_eq!(current_status(&f)["reviewers_finished"], 2);
+    assert_eq!(server.state.requests.lock().unwrap().len(), 5);
+    let revised = f.library.revision_files("engineering", 2).unwrap();
+    assert_eq!(revised["checks.txt"], original["checks.txt"]);
+    assert!(revised["SKILL.md"].contains("disable-model-invocation: true"));
+    assert!(revised["SKILL.md"].contains("custom-marker: preserved"));
+    assert_eq!(
+        revised["SKILL.md"].split_once("\n---\n").unwrap().1,
+        corrected
+    );
+    assert_eq!(f.library.notifications("42").unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn staged_changes_accumulate_until_settle_then_parallel_review_publishes_atomic_notes() {
     let f = Fixture::new();
