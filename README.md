@@ -29,6 +29,10 @@ networking.firewall.interfaces.tailscale0.allowedTCPPortRanges = [
 
 The environment file contains `DISCORD_TOKEN` and any selected API provider keys (`OPENAI_API_KEY` / `ANTHROPIC_API_KEY`). `codex/model` instead uses a ChatGPT subscription login from the service account's Codex credential cache; the Nix package includes the official CLI for login/refresh. Keep secrets outside the Nix store. The service account owns `/var/lib/pantheon`; its configured workspace is the tool working directory. Browsers, Python driver, Xvfb, x11vnc and noVNC are all part of the pinned Nix closure, with no runtime browser download. See [provider authentication](docs/auth.md) for existing-login reuse and service setup.
 
+See [persistent service installation and migration](docs/service.md) for moving an
+existing instance with its memory, chats, skills and workspace intact, including
+running the Nix package as a boot-enabled systemd user service.
+
 Create a Discord bot, enable the **Message Content Intent**, and invite it with `bot` and `applications.commands` scopes and View Channel, Send Messages, Read Message History and Embed Links permissions. Only configured `allowedUsers` can invoke it. DMs are admitted directly; guild messages must mention the bot. Mention the bot again to steer a running guild turn. Replies from other bots are ignored.
 
 ## Development

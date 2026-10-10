@@ -897,14 +897,8 @@ impl Discord {
                             Some("MESSAGE_CREATE") => {
                                 prompt = self.prompt(&event["d"]);
                             }
-                            Some("INTERACTION_CREATE") if event["d"]["type"] == 2 || event["d"]["type"] == 4 => {
-                                    let discord = self.clone(); let data = event["d"].clone(); let tx = tx.clone(); let cancel = shutdown.clone();
-                                    interactions.spawn(async move {
-                                        tokio::select! {
-                                            _ = cancel.cancelled() => {},
-                                            _ = discord.interaction(data, tx) => {},
-                                        }
-                                    });
+                            Some("INTERACTION_CREATE") => {
+                                self.dispatch_interaction(&event["d"], tx, shutdown, interactions);
                             }
                             _ => {},
                             }
@@ -930,6 +924,30 @@ impl Discord {
                 }
             }
         }
+    }
+
+    // Commands, message components and autocomplete all arrive on the gateway.
+    // Acknowledge in a separate task so runtime work cannot delay Discord's deadline.
+    fn dispatch_interaction(
+        self: &Arc<Self>,
+        data: &Value,
+        tx: &mpsc::Sender<Inbound>,
+        shutdown: &CancellationToken,
+        interactions: &mut JoinSet<()>,
+    ) {
+        if !matches!(data["type"].as_u64(), Some(2..=4)) {
+            return;
+        }
+        let discord = self.clone();
+        let data = data.clone();
+        let tx = tx.clone();
+        let cancel = shutdown.clone();
+        interactions.spawn(async move {
+            tokio::select! {
+                _ = cancel.cancelled() => {},
+                _ = discord.interaction(data, tx) => {},
+            }
+        });
     }
 
     fn prompt(&self, message: &Value) -> Option<Inbound> {
@@ -1826,22 +1844,27 @@ mod tests {
         let mut discord = Discord::new("test".into(), 1, vec![42]).unwrap();
         discord.api = format!("http://{address}");
         let (tx, mut rx) = mpsc::channel(8);
-        let mut event = json!({"id":"123","token":"token","channel_id":"1","user":{"id":"42"},"data":{"name":"status"}});
-        discord.interaction(event.clone(), tx.clone()).await;
+        let discord = Arc::new(discord);
+        let shutdown = CancellationToken::new();
+        let mut interactions = JoinSet::new();
+        let mut event = json!({"type":2,"id":"123","token":"token","channel_id":"1","user":{"id":"42"},"data":{"name":"status"}});
+        discord.dispatch_interaction(&event, &tx, &shutdown, &mut interactions);
+        interactions.join_next().await.unwrap().unwrap();
         assert!(matches!(rx.try_recv(), Ok(Inbound::Command { name, .. }) if name == "status"));
         assert_eq!(
             captured.lock().await[0],
             json!({"type":5,"data":{"flags":64}})
         );
         event["user"]["id"] = json!("666");
-        discord.interaction(event, tx).await;
+        discord.dispatch_interaction(&event, &tx, &shutdown, &mut interactions);
+        interactions.join_next().await.unwrap().unwrap();
         assert!(rx.try_recv().is_err());
         assert_eq!(captured.lock().await[1]["type"], 4);
         assert_eq!(captured.lock().await[1]["data"]["flags"], 64);
         server.abort();
     }
     #[tokio::test]
-    async fn components_defer_updates_and_enforce_dashboard_owner_and_channel() {
+    async fn gateway_components_defer_updates_and_enforce_dashboard_owner_and_channel() {
         use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
         let captured = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
         let app = Router::new()
@@ -1862,8 +1885,12 @@ mod tests {
         let mut discord = Discord::new("test".into(), 1, vec![42, 43]).unwrap();
         discord.api = format!("http://{address}");
         let (tx, mut rx) = mpsc::channel(8);
+        let discord = Arc::new(discord);
+        let shutdown = CancellationToken::new();
+        let mut interactions = JoinSet::new();
         let mut event = json!({"type":3,"id":"123","token":"private-token","channel_id":"1","user":{"id":"42"},"data":{"custom_id":"sk1:1:42:pick:-:0","values":["0123456789abcdef"]}});
-        discord.interaction(event.clone(), tx.clone()).await;
+        discord.dispatch_interaction(&event, &tx, &shutdown, &mut interactions);
+        interactions.join_next().await.unwrap().unwrap();
         let received = rx.try_recv().unwrap();
         assert!(!format!("{received:?}").contains("private-token"));
         assert!(
@@ -1871,18 +1898,27 @@ mod tests {
         );
         assert_eq!(captured.lock().await[0], json!({"type":6}));
         event["user"]["id"] = json!("43");
-        discord.interaction(event.clone(), tx.clone()).await;
+        discord.dispatch_interaction(&event, &tx, &shutdown, &mut interactions);
+        interactions.join_next().await.unwrap().unwrap();
         event["user"]["id"] = json!("42");
         event["channel_id"] = json!("2");
-        discord.interaction(event.clone(), tx.clone()).await;
+        discord.dispatch_interaction(&event, &tx, &shutdown, &mut interactions);
+        interactions.join_next().await.unwrap().unwrap();
         event["channel_id"] = json!("1");
         event["user"]["id"] = json!("666");
-        discord.interaction(event, tx).await;
+        discord.dispatch_interaction(&event, &tx, &shutdown, &mut interactions);
+        interactions.join_next().await.unwrap().unwrap();
         assert!(rx.try_recv().is_err());
         for denial in &captured.lock().await[1..] {
             assert_eq!(denial["type"], 4);
             assert_eq!(denial["data"]["flags"], 64);
         }
+        for kind in [0, 1, 5] {
+            event["type"] = json!(kind);
+            discord.dispatch_interaction(&event, &tx, &shutdown, &mut interactions);
+        }
+        assert!(interactions.is_empty());
+        assert_eq!(captured.lock().await.len(), 4);
         server.abort();
     }
     #[tokio::test]
@@ -1911,15 +1947,20 @@ mod tests {
         discord.models.replace("codex", vec![model]);
         discord.models.set_chat_model(1, "codex/gpt-test");
         let (tx, mut rx) = mpsc::channel(8);
+        let discord = Arc::new(discord);
+        let shutdown = CancellationToken::new();
+        let mut interactions = JoinSet::new();
         let mut event = json!({"type":4,"id":"123","token":"token","channel_id":"1","user":{"id":"42"},"data":{"name":"model","options":[{"name":"provider","value":"codex"},{"name":"model","value":"gpt","focused":true}]}});
-        discord.interaction(event.clone(), tx.clone()).await;
+        discord.dispatch_interaction(&event, &tx, &shutdown, &mut interactions);
+        interactions.join_next().await.unwrap().unwrap();
         assert_eq!(
             captured.lock().await[0],
             json!({"type":8,"data":{"choices":[{"name":"gpt-test · codex","value":"codex/gpt-test"}]}})
         );
         event["data"] =
             json!({"name":"reasoning","options":[{"name":"level","value":"","focused":true}]});
-        discord.interaction(event.clone(), tx.clone()).await;
+        discord.dispatch_interaction(&event, &tx, &shutdown, &mut interactions);
+        interactions.join_next().await.unwrap().unwrap();
         assert_eq!(
             captured.lock().await[1]["data"]["choices"]
                 .as_array()
@@ -1928,7 +1969,8 @@ mod tests {
             2
         );
         event["user"]["id"] = json!("666");
-        discord.interaction(event, tx).await;
+        discord.dispatch_interaction(&event, &tx, &shutdown, &mut interactions);
+        interactions.join_next().await.unwrap().unwrap();
         assert_eq!(
             captured.lock().await[2],
             json!({"type":8,"data":{"choices":[]}})
