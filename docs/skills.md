@@ -97,6 +97,16 @@ scope. A denial, missing verdict, timeout, stale head or cancellation cannot pub
 One difficult task can teach a useful technique; there is no arbitrary repeat-count
 requirement or unrelated withheld-task gate.
 
+Curation extracts the smallest useful lesson supported by the work: a decision
+rule or a short refinement can be sufficient. Broad guides keep their applicability
+across the task family; specialized procedures use clear triggering conditions or
+optional supporting resources when their detail is worth retaining. Focused guides
+can still contain detailed, actionable steps. The curator explains the placement
+and amount of detail in its change purpose, and reviewers assess and explain both
+in their verdict. Transferability alone does not justify expanding a broad guide
+with a full workflow. This is editorial judgment, without a fixed length target or
+a requirement to observe the same task repeatedly.
+
 This is **model-based evidence review**, not executed sandbox practice or an
 empirical improvement benchmark. Recorded tool checks are evidence; an agent's
 claimed success is not proof. Research may add current information but reviewers
