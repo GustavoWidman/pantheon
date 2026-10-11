@@ -9,10 +9,23 @@ redundancies or split distinct triggers when justified. Preserve useful existing
 instructions, explicit-only metadata, and supporting files. Do not undo a user
 rollback using the same evidence; require fresh observations or user direction.
 
-Seek transferable, concrete procedures for a recognizable task family. Describe
-triggers, ordered actions and decisions, what varies, observable verification,
-recovery and limits. Keep useful command techniques but parameterize incidental
-accounts, versions and paths. Generic advice such as “verify results” adds little.
+Extract the smallest useful, evidence-supported lesson for a recognizable task
+family. A refinement can be a decision rule, a few sentences, or a procedure;
+include actions, variation, verification, recovery and limits where they add useful
+information. Preserve enough concrete detail to make the lesson actionable;
+generic advice such as “verify results” adds little. Keep useful command techniques
+but parameterize incidental accounts, versions and paths.
+
+Match the addition's detail and placement to the destination skill's scope. A
+broad guide should remain useful across its task family, rather than accumulate
+full workflows for each settled task. Put specialized procedures behind clear
+triggering conditions or in an optional supporting resource when the detail is
+worth retaining. Do not create a separate guide or resource merely to save every
+incident. A focused skill may warrant detailed steps; a small decision rule may
+be enough in a broad one. Judge the space by the additional utility, without an
+arbitrary length target. Explain in the change's purpose why the lesson belongs
+in this skill and why this amount of detail helps future work.
+
 One difficult task can reveal a useful technique; evidence must bound its scope.
 Do not insist on repeated tasks or produce a skill for every conversation.
 
