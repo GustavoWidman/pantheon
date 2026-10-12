@@ -66,7 +66,7 @@ impl Store {
         CREATE TABLE IF NOT EXISTS agent_runs(id TEXT PRIMARY KEY,owner TEXT NOT NULL,state TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS agent_inbox(id TEXT PRIMARY KEY,owner TEXT NOT NULL,channel TEXT NOT NULL,user TEXT NOT NULL,text TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'queued',created INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS agent_inbox_pending ON agent_inbox(owner,created) WHERE state='queued';
-        CREATE TABLE IF NOT EXISTS shell_runs(id TEXT PRIMARY KEY,owner TEXT NOT NULL,channel TEXT NOT NULL,user TEXT NOT NULL,command TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'running',background INTEGER NOT NULL DEFAULT 0,output TEXT);
+        CREATE TABLE IF NOT EXISTS shell_runs(id TEXT PRIMARY KEY,owner TEXT NOT NULL,channel TEXT NOT NULL,user TEXT NOT NULL,kind TEXT NOT NULL DEFAULT 'shell',command TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'running',background INTEGER NOT NULL DEFAULT 0,output TEXT);
         PRAGMA user_version=2;")?;
         crate::ui::initialize(&db)?;
         crate::cache::initialize(&db)?;
@@ -101,6 +101,16 @@ impl Store {
         if !columns.iter().any(|c| c == "attempted_at") {
             db.execute(
                 "ALTER TABLE outbox ADD COLUMN attempted_at INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        let shell_columns = db
+            .prepare("PRAGMA table_info(shell_runs)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if !shell_columns.iter().any(|c| c == "kind") {
+            db.execute(
+                "ALTER TABLE shell_runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'shell'",
                 [],
             )?;
         }
@@ -1034,12 +1044,62 @@ impl Store {
         user: u64,
         command: &str,
     ) -> Result<()> {
+        self.shell_start_kind(id, owner, channel, user, "shell", command)
+    }
+    /// Shell and Claude jobs share atomic detach/delivery, but retain a kind
+    /// so a Claude report is never mislabeled as arbitrary shell output.
+    pub fn shell_start_kind(
+        &self,
+        id: &str,
+        owner: &str,
+        channel: u64,
+        user: u64,
+        kind: &str,
+        command: &str,
+    ) -> Result<()> {
+        ensure!(
+            matches!(kind, "shell" | "claude"),
+            "unknown background run kind"
+        );
         self.db.lock().unwrap().execute(
-            "INSERT INTO shell_runs(id,owner,channel,user,command) VALUES(?1,?2,?3,?4,?5)",
-            params![id, owner, channel.to_string(), user.to_string(), command],
+            "INSERT INTO shell_runs(id,owner,channel,user,kind,command) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                id,
+                owner,
+                channel.to_string(),
+                user.to_string(),
+                kind,
+                command
+            ],
         )?;
         Ok(())
     }
+    /// Persist a Claude task as detached before any CLI process can start. Its
+    /// reply context and UI binding commit together: admission failure cannot
+    /// leave a phantom running job or permit a paid task without delivery state.
+    pub fn claude_start(
+        &self,
+        id: &str,
+        owner: &str,
+        channel_user: (u64, u64),
+        label: &str,
+        context: &crate::ui::ReplyContext,
+        tool_event: Option<&str>,
+    ) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        tx.execute("INSERT INTO shell_runs(id,owner,channel,user,kind,command,background) VALUES(?1,?2,?3,?4,'claude',?5,1)", params![id,owner,channel_user.0.to_string(),channel_user.1.to_string(),label])?;
+        tx.execute("INSERT INTO ui_contexts(source,reply_to,activity) VALUES(?1,?2,?3) ON CONFLICT(source) DO UPDATE SET reply_to=excluded.reply_to,activity=excluded.activity", params![id,context.reply_to.map(|id|id.to_string()),context.activity])?;
+        if let Some(event) = tool_event {
+            tx.execute(
+                "INSERT INTO shell_ui(job,event) SELECT ?1,event FROM ui_events WHERE event=?2",
+                params![id, event],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn shell_detach(&self, id: &str) -> Result<()> {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
@@ -1268,8 +1328,14 @@ pub(crate) fn touch_coordinator(db: &Connection, channel: u64) -> Result<()> {
     Ok(())
 }
 fn shell_delivery(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<()> {
-    let result:Option<(String,String,String,String)>=tx.query_row("SELECT owner,channel,user,output FROM shell_runs WHERE id=?1 AND state='done' AND background=1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
-    if let Some((owner, channel, user, output)) = result {
+    let result: Option<(String, String, String, String, String)> = tx
+        .query_row(
+            "SELECT owner,channel,user,kind,output FROM shell_runs WHERE id=?1 AND state='done' AND background=1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?;
+    if let Some((owner, channel, user, kind, output)) = result {
         crate::ui::copy_context(tx, id, &format!("shell:{id}"))?;
         deliver_event(
             tx,
@@ -1277,7 +1343,7 @@ fn shell_delivery(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<()> {
             &owner,
             channel.parse()?,
             user.parse()?,
-            &format!("[shell {id}] {output}"),
+            &format!("[{kind} {id}] {output}"),
         )?;
     }
     Ok(())
@@ -1849,6 +1915,83 @@ mod tests {
         assert!(events[1].text.contains("second result"));
         assert!(store.queued(1).unwrap().is_empty());
     }
+    #[test]
+    fn claude_admission_is_atomic_and_old_background_rows_migrate() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("db");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE shell_runs(id TEXT PRIMARY KEY,owner TEXT NOT NULL,channel TEXT NOT NULL,user TEXT NOT NULL,command TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'running',background INTEGER NOT NULL DEFAULT 0,output TEXT); INSERT INTO shell_runs(id,owner,channel,user,command) VALUES('legacy','child','1','2','test');").unwrap();
+        drop(db);
+        let store = Store::open(&path).unwrap();
+        let kind: String = store
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT kind FROM shell_runs WHERE id='legacy'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(kind, "shell");
+        let context = crate::ui::ReplyContext::request("123");
+        // A failure on the second admission write rolls back the first one.
+        store.db.lock().unwrap().execute_batch("CREATE TRIGGER reject_claude_context BEFORE INSERT ON ui_contexts BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
+        assert!(
+            store
+                .claude_start("job", "child", (1, 2), "redacted", &context, None)
+                .is_err()
+        );
+        let jobs: i64 = store
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM shell_runs WHERE id='job'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(jobs, 0);
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_claude_context")
+            .unwrap();
+        store
+            .claude_start("job", "child", (1, 2), "redacted", &context, None)
+            .unwrap();
+        store.shell_finish("job", "complete", false).unwrap();
+        assert_eq!(store.agent_events("child").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn interrupted_claude_is_reported_once_with_its_kind_and_never_replayed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("db");
+        let store = Store::open(&path).unwrap();
+        store
+            .shell_start_kind("claude-job", "child", 1, 2, "claude", "[redacted]")
+            .unwrap();
+        store.shell_detach("claude-job").unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        store.recover().unwrap();
+        store.recover().unwrap();
+        let events = store.agent_events("child").unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].text.contains("[claude claude-job]"));
+        assert!(events[0].text.contains("not replayed"));
+        let running: i64 = store
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM shell_runs WHERE state='running'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(running, 0);
+    }
+
     #[test]
     fn interrupted_shell_is_reported_after_restart_and_never_replayed() {
         let directory = tempfile::tempdir().unwrap();

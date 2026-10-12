@@ -123,6 +123,8 @@ async fn main() -> Result<()> {
             println!("Imported note {index}");
         }
         Action::Run => {
+            // Disabled is a true no-op: do not resolve or inspect Claude Code.
+            pantheon::claude::validate(&config.claude).await?;
             let token = std::env::var("DISCORD_TOKEN").context("missing DISCORD_TOKEN")?;
             let discord = Arc::new(
                 Discord::new(

@@ -20,6 +20,37 @@ pub struct Config {
     pub skills: crate::skills::SkillsConfig,
     pub curator: crate::curator::CuratorConfig,
     pub mcp: crate::mcp::McpConfig,
+    pub claude: ClaudeConfig,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClaudeConfig {
+    /// Opt-in because this invokes the separately installed, logged-in CLI.
+    pub enabled: bool,
+    /// Resolved only through the daemon's PATH; do not point at a credential wrapper.
+    pub executable: String,
+    pub model: String,
+    pub effort: String,
+    pub max_jobs: usize,
+    pub timeout_seconds: u64,
+    pub max_task_chars: usize,
+    pub max_output_chars: usize,
+    pub allowed_tools: Vec<String>,
+}
+impl Default for ClaudeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            executable: "claude".into(),
+            model: "opus".into(),
+            effort: "medium".into(),
+            max_jobs: 2,
+            timeout_seconds: 900,
+            max_task_chars: 12_000,
+            max_output_chars: 30_000,
+            allowed_tools: vec!["Read".into(), "Glob".into(), "Grep".into()],
+        }
+    }
 }
 #[derive(Clone, Deserialize, Serialize, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -63,6 +94,7 @@ impl Default for Config {
             skills: Default::default(),
             curator: Default::default(),
             mcp: Default::default(),
+            claude: Default::default(),
         }
     }
 }
@@ -136,6 +168,37 @@ impl Config {
         config.skills.validate()?;
         config.curator.validate()?;
         config.mcp.validate()?;
+        ensure!(
+            config.claude.max_jobs > 0
+                && config.claude.timeout_seconds > 0
+                && config.claude.max_task_chars > 0
+                && config.claude.max_output_chars > 0,
+            "claude limits must be positive"
+        );
+        ensure!(
+            config.claude.max_jobs <= 32
+                && config.claude.timeout_seconds <= 86400
+                && config.claude.max_task_chars <= 100_000
+                && config.claude.max_output_chars <= 1_000_000,
+            "claude limits exceed hard bounds (32 jobs, 86400 seconds, 100000 task chars, 1000000 output chars)"
+        );
+        ensure!(
+            config.claude.executable == "claude",
+            "claude.executable must be `claude` resolved on the service PATH, not a path or wrapper"
+        );
+        ensure!(
+            !config.claude.model.trim().is_empty(),
+            "claude.model must not be empty"
+        );
+        validate_claude_effort(&config.claude.effort)?;
+        ensure!(
+            !config
+                .claude
+                .allowed_tools
+                .iter()
+                .any(|tool| tool.trim().is_empty()),
+            "claude.allowed_tools must not contain empty names"
+        );
         Ok(config)
     }
     pub fn instructions(&self) -> Result<String> {
@@ -146,6 +209,17 @@ impl Config {
             .map(|x| x.unwrap_or_default())
     }
 }
+/// Claude Code's CLI accepts a narrower effort vocabulary than Pantheon's
+/// providers. Keep this separate so an otherwise valid agent value (such as
+/// `ultra`) cannot create a durable Claude job that fails only after launch.
+pub fn validate_claude_effort(s: &str) -> Result<()> {
+    ensure!(
+        ["low", "medium", "high", "xhigh", "max"].contains(&s),
+        "claude effort must be low, medium, high, xhigh or max"
+    );
+    Ok(())
+}
+
 pub fn validate_reasoning(s: &str) -> Result<()> {
     ensure!(
         [
@@ -161,6 +235,37 @@ pub fn validate_reasoning(s: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn claude_is_default_off_and_its_limits_are_validated_without_resolving_a_cli() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pantheon.toml");
+        std::fs::write(&path, "[discord]\napplication_id=1\nallowed_users=[2]\n").unwrap();
+        assert!(!Config::load(&path).unwrap().claude.enabled);
+        std::fs::write(
+            &path,
+            "[discord]\napplication_id=1\nallowed_users=[2]\n[claude]\nmax_jobs=0\n",
+        )
+        .unwrap();
+        assert!(Config::load(&path).is_err());
+        std::fs::write(
+            &path,
+            "[discord]\napplication_id=1\nallowed_users=[2]\n[claude]\neffort='ultra'\n",
+        )
+        .unwrap();
+        assert!(Config::load(&path).is_err());
+        assert!(validate_claude_effort("high").is_ok());
+        assert!(validate_claude_effort("none").is_err());
+        for value in ["/home/agent/.local/bin/claude", "other-wrapper"] {
+            std::fs::write(&path, format!("[discord]\napplication_id=1\nallowed_users=[2]\n[claude]\nexecutable='{value}'\n")).unwrap();
+            assert!(Config::load(&path).is_err());
+        }
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
+            assert!(validate_claude_effort(effort).is_ok());
+        }
+        for effort in ["none", "minimal", "ultra", ""] {
+            assert!(validate_claude_effort(effort).is_err());
+        }
+    }
     #[test]
     fn old_configs_inherit_bounded_retries_and_operator_values_are_validated() {
         let directory = tempfile::tempdir().unwrap();

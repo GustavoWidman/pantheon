@@ -3,6 +3,7 @@ pub mod attachments;
 pub mod auth;
 pub mod browser;
 pub mod cache;
+pub mod claude;
 pub mod config;
 pub mod curator;
 pub mod discord;

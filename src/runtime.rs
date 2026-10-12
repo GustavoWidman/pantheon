@@ -39,6 +39,7 @@ pub struct Harness {
     children: Mutex<HashMap<String, Child>>,
     capacity: Arc<Semaphore>,
     shell_capacity: Arc<Semaphore>,
+    claude_capacity: Arc<Semaphore>,
     shell_jobs: Mutex<HashMap<String, (u64, CancellationToken)>>,
     shutdown: CancellationToken,
     master_system: String,
@@ -90,13 +91,23 @@ struct Run {
 }
 
 /// One startup prefix shared by production and opt-in behavioral evaluations.
+/// Compatibility prompt for callers that do not enable the optional CLI tool.
 pub fn system_prompt(
     child: bool,
     coordinator: bool,
     skill_index: &str,
     instructions: &str,
 ) -> String {
-    let definitions = tools::definitions(child, coordinator);
+    system_prompt_with_claude(child, coordinator, false, skill_index, instructions)
+}
+pub fn system_prompt_with_claude(
+    child: bool,
+    coordinator: bool,
+    claude_enabled: bool,
+    skill_index: &str,
+    instructions: &str,
+) -> String {
+    let definitions = tools::definitions_with_claude(child, coordinator, claude_enabled);
     let names = definitions
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
@@ -210,14 +221,22 @@ impl Harness {
             mcp: crate::mcp::Mcp::new(&config.mcp, &config.workspace, &config.state_dir)?,
             capacity: Arc::new(Semaphore::new(config.agent.max_subagents)),
             shell_capacity: Arc::new(Semaphore::new(config.agent.max_shell_jobs)),
+            claude_capacity: Arc::new(Semaphore::new(config.claude.max_jobs)),
             shell_jobs: Mutex::new(HashMap::new()),
-            master_system: system_prompt(
+            master_system: system_prompt_with_claude(
                 false,
                 config.agent.coordinator_root,
+                config.claude.enabled,
                 &skill_index,
                 &instructions,
             ),
-            child_system: system_prompt(true, false, &skill_index, &instructions),
+            child_system: system_prompt_with_claude(
+                true,
+                false,
+                config.claude.enabled,
+                &skill_index,
+                &instructions,
+            ),
             skills,
             curators: Mutex::new(HashMap::new()),
             curator_changed: Notify::new(),
@@ -687,9 +706,10 @@ impl Harness {
                     .catalogue(self.config.curator.description_chars)?,
                 refresh,
             )?;
-            let system = system_prompt(
+            let system = system_prompt_with_claude(
                 false,
                 self.config.agent.coordinator_root,
+                self.config.claude.enabled,
                 &format!("{}\n{catalogue}", crate::skill_library::INDEX),
                 &self.curator_instructions,
             );
@@ -713,7 +733,11 @@ impl Harness {
                 &settings.0,
                 &settings.1,
                 &system,
-                &tools::definitions(false, self.config.agent.coordinator_root),
+                &tools::definitions_with_claude(
+                    false,
+                    self.config.agent.coordinator_root,
+                    self.config.claude.enabled,
+                ),
                 &view,
             )?;
             let (vendor, _) = model_parts(&settings.0)?;
@@ -780,7 +804,11 @@ impl Harness {
         Box::pin(async move {
             let (vendor, _) = model_parts(&run.settings.0)?;
             let vendor = vendor.to_string();
-            let defs = tools::definitions(run.child, self.config.agent.coordinator_root);
+            let defs = tools::definitions_with_claude(
+                run.child,
+                self.config.agent.coordinator_root,
+                self.config.claude.enabled,
+            );
             let system = run.system.clone().unwrap_or_else(|| {
                 if run.child {
                     self.child_system.clone()
@@ -1148,9 +1176,13 @@ impl Harness {
         tool_id: Option<&str>,
     ) -> Result<String> {
         ensure!(
-            tools::definitions(run.child, self.config.agent.coordinator_root)
-                .iter()
-                .any(|tool| tool["name"] == call.name),
+            tools::definitions_with_claude(
+                run.child,
+                self.config.agent.coordinator_root,
+                self.config.claude.enabled
+            )
+            .iter()
+            .any(|tool| tool["name"] == call.name),
             "tool {} is unavailable to this agent",
             call.name
         );
@@ -1332,6 +1364,14 @@ impl Harness {
                 return self
                     .shell_tool_tracked(run, tools::string(a, "command")?, tool_id)
                     .await;
+            }
+            "claude" => {
+                ensure!(self.config.claude.enabled, "Claude tool is disabled");
+                ensure!(
+                    run.child || !self.config.agent.coordinator_root,
+                    "strict coordinators must delegate Claude tasks to workers"
+                );
+                return self.claude_tool_tracked(run, a, tool_id).await;
             }
             "web_fetch" => {
                 let max_chars = a
@@ -1605,7 +1645,7 @@ impl Harness {
                 trace.append(Kind::User,&prompt)?;
                 let (vendor,_)=model_parts(&settings.0)?;
                 let catalogue=h.skills.cache_catalogue(&channel.to_string(),&h.skills.catalogue(h.config.curator.description_chars)?,false)?;
-                let worker_system=system_prompt(true,false,&format!("{}\n{catalogue}",crate::skill_library::INDEX),&h.curator_instructions);
+                let worker_system=system_prompt_with_claude(true,false,h.config.claude.enabled,&format!("{}\n{catalogue}",crate::skill_library::INDEX),&h.curator_instructions);
                 let run=Run {channel,user,owner:id.clone(),child:true,memory:memory.clone(),cancel,settings:settings.clone(),history:Provider::start(vendor,&view,&prompt),inputs:vec![],trace:Some(trace),steering:vec![],media:vec![],context:context.clone(),skills:h.skills.snapshot()?,task:prompt.chars().take(8000).collect(),system:Some(worker_system),steps:0,invocation_scope:uuid::Uuid::new_v4().to_string(),counted_skills:HashSet::new()};
                 h.clone().run_agent(run).await
             }.await;
@@ -1673,6 +1713,98 @@ impl Harness {
         .await?;
         Ok(())
     }
+    async fn claude_tool_tracked(
+        self: &Arc<Self>,
+        run: &Run,
+        args: &Value,
+        tool_id: Option<&str>,
+    ) -> Result<String> {
+        let task = tools::string(args, "task")?;
+        ensure!(!task.trim().is_empty(), "claude task must not be empty");
+        ensure!(
+            task.chars().count() <= self.config.claude.max_task_chars,
+            "claude task exceeds configured max_task_chars"
+        );
+        let name = args["name"].as_str().unwrap_or("task");
+        ensure!(
+            name.chars().count() <= 80 && !name.trim().is_empty(),
+            "claude name must be 1–80 characters"
+        );
+        let cwd = match args["cwd"].as_str() {
+            Some(path) => tools::workspace_path(&self.config.workspace, path, false)?,
+            None => self
+                .config
+                .workspace
+                .canonicalize()
+                .context("canonicalize Claude workspace")?,
+        };
+        ensure!(cwd.is_dir(), "claude cwd must be a workspace directory");
+        let model = args["model"].as_str().unwrap_or(&self.config.claude.model);
+        let effort = args["effort"]
+            .as_str()
+            .unwrap_or(&self.config.claude.effort);
+        crate::config::validate_claude_effort(effort)?;
+        ensure!(
+            model.chars().count() <= 100 && !model.trim().is_empty(),
+            "invalid Claude model"
+        );
+        let permit = self
+            .claude_capacity
+            .clone()
+            .try_acquire_owned()
+            .context("Claude background capacity full")?;
+        let id = uuid::Uuid::new_v4().to_string();
+        // Persist detached admission and reply/UI context atomically before
+        // starting a paid or possibly side-effecting process.
+        self.store.claude_start(
+            &id,
+            &run.owner,
+            (run.channel, run.user),
+            // Do not duplicate task text from durable conversation history.
+            &format!(
+                "{name}: [Claude task redacted; {} chars]",
+                task.chars().count()
+            ),
+            &run.context,
+            tool_id,
+        )?;
+        let cancel = run.cancel.child_token();
+        self.shell_jobs
+            .lock()
+            .await
+            .insert(id.clone(), (run.channel, cancel.clone()));
+        let h = self.clone();
+        let job_id = id.clone();
+        let task = task.to_owned();
+        let model = model.to_owned();
+        let effort = effort.to_owned();
+        let channel = run.channel;
+        tokio::spawn(async move {
+            let _permit = permit;
+            let result =
+                crate::claude::run(&h.config.claude, &cwd, &task, &model, &effort, &cancel).await;
+            let output = match &result {
+                Ok(report) => format!("Claude work report (external/untrusted):\n{report}"),
+                Err(error) => format!("Error: {error}"),
+            };
+            if let Err(error) = h
+                .store
+                .shell_finish(&job_id, &output, cancel.is_cancelled())
+            {
+                tracing::error!(error=%error,"persist Claude completion failed");
+                h.shutdown.cancel();
+            }
+            h.shell_jobs.lock().await.remove(&job_id);
+            if let Ok(memory) = h.channel(channel).await {
+                memory.incoming.notify_one();
+            }
+        });
+        // Claude tasks are always detached. A foreground wait would keep the
+        // requesting turn open and invite duplicate work after provider errors.
+        run.memory.incoming.notify_one();
+        Ok(json!({"job_id":id,"name":name,"state":"background","delivery":"completion will arrive in your inbox as untrusted Claude work; do not poll or wait"}).to_string())
+    }
+
     #[cfg(test)]
     async fn shell_tool(self: &Arc<Self>, run: &Run, command: &str) -> Result<String> {
         self.shell_tool_tracked(run, command, None).await
@@ -3541,6 +3673,272 @@ mod tests {
         );
         h.shutdown.cancel();
         server.abort();
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_task_detaches_and_delivers_an_untrusted_report_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let (directory, mut h, mut run, _mock, server) = fixture("openai", vec![]).await;
+        let cli = directory.path().join("claude");
+        std::fs::write(&cli, "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"is_error\":false,\"result\":\"finished review\"}'\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let harness = Arc::get_mut(&mut h).unwrap();
+        harness.config.claude.enabled = true;
+        harness.config.claude.executable = cli.display().to_string();
+        run.child = true;
+        run.owner = "child".into();
+        let reply: Value = serde_json::from_str(
+            &h.execute_tool(
+                &mut run,
+                &ToolCall {
+                    id: "claude".into(),
+                    name: "claude".into(),
+                    arguments: json!({"name":"review","task":"inspect this"}),
+                },
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reply["state"], "background");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while h.store.agent_events("child").unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let event = &h.store.agent_events("child").unwrap()[0].text;
+        assert!(event.contains("[claude "));
+        assert!(event.contains("external/untrusted"));
+        assert!(event.contains("finished review"));
+        let command: String = h
+            .store
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT command FROM shell_runs WHERE kind='claude'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!command.contains("inspect this"));
+        assert!(command.contains("redacted"));
+        h.shutdown.cancel();
+        server.abort();
+    }
+    #[tokio::test]
+    async fn claude_invalid_requests_disabled_and_strict_root_create_no_jobs() {
+        let (_directory, mut h, mut run, _mock, server) = fixture("openai", vec![]).await;
+        let call = |arguments| ToolCall {
+            id: "claude-invalid".into(),
+            name: "claude".into(),
+            arguments,
+        };
+        assert!(
+            h.execute_tool(&mut run, &call(json!({"task":"x"})))
+                .await
+                .is_err()
+        );
+        let harness = Arc::get_mut(&mut h).unwrap();
+        harness.config.claude.enabled = true;
+        harness.config.agent.coordinator_root = true;
+        assert!(
+            h.execute_tool(&mut run, &call(json!({"task":"x"})))
+                .await
+                .is_err()
+        );
+        run.child = true;
+        run.owner = "child".into();
+        for args in [
+            json!({"task":" "}),
+            json!({"task":"x".repeat(12001)}),
+            json!({"task":"x","effort":"ultra"}),
+            json!({"task":"x","cwd":"/tmp"}),
+        ] {
+            assert!(h.execute_tool(&mut run, &call(args)).await.is_err());
+        }
+        let count: i64 = h
+            .store
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM shell_runs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        h.shutdown.cancel();
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_capacity_stop_shutdown_and_error_delivery_are_durable() {
+        use std::os::unix::fs::PermissionsExt;
+        for stop in [true, false] {
+            let (directory, mut h, mut run, _mock, server) = fixture("openai", vec![]).await;
+            let cli = directory.path().join("claude");
+            std::fs::write(&cli, "#!/bin/sh\ncat >/dev/null\nsleep 30\n").unwrap();
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let harness = Arc::get_mut(&mut h).unwrap();
+            harness.config.claude.enabled = true;
+            harness.config.claude.executable = cli.display().to_string();
+            harness.claude_capacity = Arc::new(Semaphore::new(1));
+            run.child = true;
+            run.owner = "child".into();
+            let call = ToolCall {
+                id: "bounded-job".into(),
+                name: "claude".into(),
+                arguments: json!({"task":"x"}),
+            };
+            let result: Value =
+                serde_json::from_str(&h.execute_tool(&mut run, &call).await.unwrap()).unwrap();
+            assert!(
+                h.execute_tool(&mut run, &call)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("capacity")
+            );
+            if stop {
+                h.command(1, 2, "stop", &json!({})).await.unwrap();
+            } else {
+                h.shutdown.cancel();
+            }
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let state: String = h
+                        .store
+                        .db
+                        .lock()
+                        .unwrap()
+                        .query_row(
+                            "SELECT state FROM shell_runs WHERE id=?1",
+                            [result["job_id"].as_str().unwrap()],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    if state == "cancelled" {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                h.store.agent_events("child").unwrap().is_empty(),
+                "a cancelled caller must not be reawakened"
+            );
+            let count: i64 = h
+                .store
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM shell_runs", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 1);
+            h.shutdown.cancel();
+            server.abort();
+        }
+        // A subprocess failure, unlike explicit cancellation, wakes the owner
+        // exactly once with its persisted error and never retries the CLI.
+        let (_directory, mut h, mut run, _mock, server) = fixture("openai", vec![]).await;
+        let harness = Arc::get_mut(&mut h).unwrap();
+        harness.config.claude.enabled = true;
+        harness.config.claude.executable = "missing-fake-claude".into();
+        run.child = true;
+        run.owner = "child".into();
+        h.execute_tool(
+            &mut run,
+            &ToolCall {
+                id: "failed-job".into(),
+                name: "claude".into(),
+                arguments: json!({"task":"x"}),
+            },
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while h.store.agent_events("child").unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let events = h.store.agent_events("child").unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].text.contains("Error: spawn Claude Code"));
+        h.shutdown.cancel();
+        server.abort();
+    }
+
+    /// Deliberately ignored: this spends one logged-in Claude plan request. It
+    /// proves the public tool path (detachment plus owner inbox delivery), not
+    /// just the subprocess parser. Enable only with explicit operator approval.
+    #[ignore = "requires PANTHEON_CLAUDE_LIVE_TEST=1 and a manually logged-in Claude CLI on PATH"]
+    #[tokio::test]
+    async fn live_claude_task_detaches_and_delivers_to_owner() -> anyhow::Result<()> {
+        anyhow::ensure!(
+            std::env::var("PANTHEON_CLAUDE_LIVE_TEST").as_deref() == Ok("1"),
+            "set PANTHEON_CLAUDE_LIVE_TEST=1 to authorize this paid Claude CLI test"
+        );
+        let (_directory, mut h, mut run, _mock, server) = fixture("openai", vec![]).await;
+        let harness = Arc::get_mut(&mut h).unwrap();
+        harness.config.claude.enabled = true;
+        harness.config.claude.executable = "claude".into();
+        harness.config.claude.timeout_seconds = 120;
+        harness.config.claude.allowed_tools.clear();
+        crate::claude::validate(&h.config.claude).await?;
+        run.child = true;
+        run.owner = "child".into();
+        let reply: Value = serde_json::from_str(
+            &h.execute_tool(
+                &mut run,
+                &ToolCall {
+                    id: "claude-live".into(),
+                    name: "claude".into(),
+                    arguments: json!({
+                        "name":"live smoke",
+                        "task":"Reply with exactly CLAUDE_RUNTIME_SMOKE_OK. Do not use tools.",
+                        "model":"opus",
+                        "effort":"low"
+                    }),
+                },
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reply["state"], "background");
+        tokio::time::timeout(Duration::from_secs(130), async {
+            loop {
+                let events = h.store.agent_events("child").unwrap();
+                if !events.is_empty() {
+                    assert!(
+                        events[0].text.contains("CLAUDE_RUNTIME_SMOKE_OK"),
+                        "{}",
+                        events[0].text
+                    );
+                    assert!(
+                        events[0].text.contains("claude-opus-5-5"),
+                        "{}",
+                        events[0].text
+                    );
+                    eprintln!(
+                        "CLAUDE LIVE EVIDENCE job={} durable_owner=child report={}",
+                        reply["job_id"], events[0].text
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        h.shutdown.cancel();
+        server.abort();
+        Ok(())
     }
     #[tokio::test]
     async fn detached_shell_returns_then_delivers_completion_to_its_owner() {

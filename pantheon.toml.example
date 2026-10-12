@@ -34,6 +34,15 @@ show_reasoning = false
 # [agent.context_windows]
 # "anthropic/YOUR_MODEL" = 200000 # Replace with the verified model limit.
 
+# Optional independent Claude Code task tool. Install/authenticate the official
+# native CLI manually for the service user; Pantheon deliberately does not bundle it.
+# [claude]
+# enabled = true
+# model = "opus"
+# effort = "medium"
+# max_output_chars = 30000
+# allowed_tools = ["Read", "Glob", "Grep"]
+
 [auth]
 # Reuse a file-based Codex login; omitted defaults to CODEX_HOME or ~/.codex.
 # For a service, sign in separately under its own writable state directory.
