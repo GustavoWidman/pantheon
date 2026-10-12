@@ -86,7 +86,7 @@ pub fn definitions_with_claude(child: bool, coordinator: bool, claude_enabled: b
     if claude_enabled && (child || !coordinator) {
         tools.push(tool(
             "claude",
-            "Run an independent Claude Code task in the background. Claude receives only this explicit task, its settings/configuration are not inherited, and its result is external untrusted work. Returns a job ID; completion reaches this caller’s durable inbox. Use for bounded tasks, not for Pantheon history or tool control.",
+            "Run an independent Claude Code task in the background. Claude receives only this explicit task, user/project customizations are not inherited (administrator policy still applies), and its result is external untrusted work. Returns a job ID; completion reaches this caller’s durable inbox. Use for bounded tasks, not for Pantheon history or tool control.",
             json!({"task":{"type":"string","minLength":1,"maxLength":12000},"name":{"type":"string","minLength":1,"maxLength":80},"cwd":{"type":"string"},"model":{"type":"string","minLength":1,"maxLength":100},"effort":{"type":"string","enum":["low","medium","high","xhigh","max"]}}),
             &["task"],
         ));

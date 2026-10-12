@@ -176,14 +176,21 @@ impl Config {
             "claude limits must be positive"
         );
         ensure!(
-            !config.claude.executable.trim().is_empty(),
-            "claude.executable must not be empty"
+            config.claude.max_jobs <= 32
+                && config.claude.timeout_seconds <= 86400
+                && config.claude.max_task_chars <= 100_000
+                && config.claude.max_output_chars <= 1_000_000,
+            "claude limits exceed hard bounds (32 jobs, 86400 seconds, 100000 task chars, 1000000 output chars)"
+        );
+        ensure!(
+            config.claude.executable == "claude",
+            "claude.executable must be `claude` resolved on the service PATH, not a path or wrapper"
         );
         ensure!(
             !config.claude.model.trim().is_empty(),
             "claude.model must not be empty"
         );
-        validate_reasoning(&config.claude.effort)?;
+        validate_claude_effort(&config.claude.effort)?;
         ensure!(
             !config
                 .claude
@@ -202,6 +209,17 @@ impl Config {
             .map(|x| x.unwrap_or_default())
     }
 }
+/// Claude Code's CLI accepts a narrower effort vocabulary than Pantheon's
+/// providers. Keep this separate so an otherwise valid agent value (such as
+/// `ultra`) cannot create a durable Claude job that fails only after launch.
+pub fn validate_claude_effort(s: &str) -> Result<()> {
+    ensure!(
+        ["low", "medium", "high", "xhigh", "max"].contains(&s),
+        "claude effort must be low, medium, high, xhigh or max"
+    );
+    Ok(())
+}
+
 pub fn validate_reasoning(s: &str) -> Result<()> {
     ensure!(
         [
@@ -229,6 +247,24 @@ mod tests {
         )
         .unwrap();
         assert!(Config::load(&path).is_err());
+        std::fs::write(
+            &path,
+            "[discord]\napplication_id=1\nallowed_users=[2]\n[claude]\neffort='ultra'\n",
+        )
+        .unwrap();
+        assert!(Config::load(&path).is_err());
+        assert!(validate_claude_effort("high").is_ok());
+        assert!(validate_claude_effort("none").is_err());
+        for value in ["/home/agent/.local/bin/claude", "other-wrapper"] {
+            std::fs::write(&path, format!("[discord]\napplication_id=1\nallowed_users=[2]\n[claude]\nexecutable='{value}'\n")).unwrap();
+            assert!(Config::load(&path).is_err());
+        }
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
+            assert!(validate_claude_effort(effort).is_ok());
+        }
+        for effort in ["none", "minimal", "ultra", ""] {
+            assert!(validate_claude_effort(effort).is_err());
+        }
     }
     #[test]
     fn old_configs_inherit_bounded_retries_and_operator_values_are_validated() {

@@ -23,7 +23,7 @@ Pantheon deliberately does **not** bundle Claude Code or install it through
 Nix. Native Claude Code updates independently. For NixOS, arrange for the
 manually installed executable (commonly `~/.local/bin/claude`) to be on the
 service's actual `PATH`—for example by extending the systemd service PATH or a
-small wrapper. `services.pantheon.extraPackages` may help construct PATHs for
+small Pantheon launch wrapper. `services.pantheon.extraPackages` may help construct PATHs for
 other commands, but it must not supply a Claude package.
 
 ## Configuration
@@ -38,7 +38,6 @@ key cannot silently bill Claude API usage.
 ```toml
 [claude]
 enabled = true
-# executable = "claude"       # resolved through the daemon's PATH
 model = "opus"                # official CLI alias
 # effort = "medium"           # low, medium, high, xhigh, max
 max_jobs = 2
@@ -53,11 +52,22 @@ A call accepts a required `task`, plus optional `name`, workspace-relative
 `cwd`, `model`, and `effort`. Prompt text goes over stdin, never through a
 shell. The subprocess uses print/JSON mode, safe/restricted mode, no session
 persistence, no settings/skills/hooks/plugins/MCP, `dontAsk` permissions, and
-the configured allow-list. It runs with a process group: `/stop`, shutdown and
-timeout kill descendants. A restart records an interrupted report and never
+the configured allow-list. CLI administrator-managed policy still applies, even
+with blank user/project configuration. It runs with a process group: `/stop`,
+shutdown and timeout kill descendants. A restart records an interrupted report and never
 replays a task.
 
 Claude's `--tools` allow-list is an operational permission boundary, not an OS
 sandbox. Keep the default read-only set unless the user has authorized a
 specific broader capability and the service's filesystem/network isolation is
 appropriate.
+
+The executable name is fixed to `claude` on PATH; paths and credential wrappers
+are not accepted. The output limit counts report characters; JSON metadata and
+escaping have a separate bounded envelope. Oversized reports are explicitly
+truncated; an oversized envelope is an output-limit failure, not malformed JSON.
+Cancelled jobs retain their durable result/state without reawakening a caller
+that has just been stopped. Task text is not copied into the background-job command field (the ordinary tool/conversation history
+remains durable). Routine tests use fake CLIs; the ignored
+`live_claude_task_detaches_and_delivers_to_owner` test requires explicit
+`PANTHEON_CLAUDE_LIVE_TEST=1` and spends one plan request.
