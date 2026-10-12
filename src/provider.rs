@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use std::time::Duration;
 
 #[path = "provider_retry.rs"]
-mod retry;
+pub(crate) mod retry;
 pub(crate) use retry::validate as validate_request_retries;
 use retry::{HttpFailure, RequestRetries, StreamFailure};
 
@@ -606,7 +606,14 @@ impl Provider {
                     request = request.header("x-openai-internal-codex-residency", residency);
                 }
                 let result = self
-                    .receive_model_response(request.json(&body), model, attempt, true, submitted)
+                    .receive_model_response(
+                        request.json(&body),
+                        model,
+                        attempt,
+                        true,
+                        submitted,
+                        &body,
+                    )
                     .await;
                 match result {
                     Ok(value) => return Ok(value),
@@ -673,6 +680,7 @@ impl Provider {
                     attempt,
                     false,
                     submitted,
+                    body,
                 )
                 .await;
             match result {
@@ -711,8 +719,10 @@ impl Provider {
         attempt: usize,
         streaming: bool,
         submitted: Option<&(dyn Fn() -> Result<()> + Sync)>,
+        body: &Value,
     ) -> Result<Value> {
         let mut diagnostic = crate::transport::Exchange::new(model, attempt, self.timeout_seconds);
+        diagnostic.request_shape(body);
         let result = async {
             let pending = request.send();
             if let Some(submitted) = submitted {
@@ -1242,12 +1252,13 @@ impl SseDecoder {
                         self.completed_items.insert(index, item);
                     }
                     Some("error" | "response.failed" | "response.incomplete") => {
-                        if retry::transient_event(&event) {
-                            return Err(StreamFailure::Transient.into());
+                        let details = retry::event_details(&event);
+                        return Err(if details.retryable {
+                            StreamFailure::Transient(details)
+                        } else {
+                            StreamFailure::Terminal(details)
                         }
-                        bail!(
-                            "provider stream failed or was incomplete; no tools from this response executed"
-                        )
+                        .into());
                     }
                     _ => {}
                 }

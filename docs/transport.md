@@ -103,3 +103,27 @@ of incomplete tool-bearing responses.
 This reproduces the transport failure mechanism, not proof of the packet-level
 cause of a particular production incident. Retain correlation IDs and capture
 TCP telemetry if a production connection continues to fail.
+
+## Structured provider-stream error diagnostics
+
+For terminal HTTP-200 SSE `error`, `response.failed` and `response.incomplete`
+events, the warning now includes `stream_error`: the recognized event name,
+allowlisted error `code` and `type`, numeric error `status` (100–599), known
+incomplete reason (`max_output_tokens` or `content_filter`), a diagnostic
+category (`validation`, `context`, `auth`, `rate_limit`, `upstream`, `incomplete`
+or `unknown`) and `retryable` under the **existing** retry policy. Unknown
+codes/types/reasons are `null`, not copied from the provider. The `retryable`
+flag means *eligible*; a request at its attempt limit still stops. HTTP status
+is recorded separately; HTTP 200 plus `stream_error.status=503` is a provider
+stream error, not an HTTP 503 response. Header request IDs and Cloudflare ray
+IDs remain bounded as before; event-supplied IDs and messages are not logged.
+
+`request_shape` contains only the JSON request's serialized byte count, number
+of input/messages items, recognized function-call/output and reasoning item
+counts, and tool definition count. These are structural clues, not the response
+size, a valid-context guarantee or proof of malformed requests. Prompt/system
+text, tool schemas/arguments, unknown item types, account identifiers and raw
+provider error values are never included. This applies to failures on any
+attempt; successful requests are not logged. Match a later diagnostic ID to its
+exchange before diagnosing a recurring failure. Earlier incident records lack
+these new fields and cannot be retroactively classified.

@@ -25,6 +25,7 @@ pub(crate) struct Exchange {
     events: usize,
     last_event: Option<&'static str>,
     completed_items: usize,
+    request_shape: Option<Value>,
 }
 
 fn milliseconds(duration: std::time::Duration) -> u64 {
@@ -67,7 +68,29 @@ impl Exchange {
             events: 0,
             last_event: None,
             completed_items: 0,
+            request_shape: None,
         }
+    }
+
+    pub fn request_shape(&mut self, body: &Value) {
+        let items = body["input"]
+            .as_array()
+            .or_else(|| body["messages"].as_array());
+        let count = |kind: &str| {
+            items
+                .into_iter()
+                .flatten()
+                .filter(|item| item["type"] == kind)
+                .count()
+        };
+        self.request_shape = Some(json!({
+            "serialized_bytes": serde_json::to_vec(body).map(|bytes| bytes.len()).ok(),
+            "input_items": items.map(Vec::len),
+            "function_calls": count("function_call"),
+            "function_outputs": count("function_call_output"),
+            "reasoning_items": count("reasoning"),
+            "tool_definitions": body["tools"].as_array().map(Vec::len),
+        }));
     }
 
     pub fn headers(&mut self, response: &reqwest::Response) {
@@ -146,7 +169,20 @@ impl Exchange {
                 .map(|e| safe_cause(&e.to_string()))
                 .collect::<Vec<_>>()
         });
+        let stream_event = error
+            .downcast_ref::<crate::provider::retry::StreamFailure>()
+            .and_then(|failure| match failure {
+                crate::provider::retry::StreamFailure::Transient(details)
+                | crate::provider::retry::StreamFailure::Terminal(details) => Some(details),
+                crate::provider::retry::StreamFailure::PrematureEof => None,
+            });
         json!({
+            "request_shape":self.request_shape,
+            "stream_error":stream_event.map(|details| json!({
+                "event":details.event, "code":details.code, "type":details.error_type,
+                "status":details.status, "incomplete_reason":details.incomplete_reason,
+                "kind":details.kind, "retryable":details.retryable,
+            })),
             "id":self.id,"model":self.model,"attempt":self.attempt,
             "stage":self.stage,"elapsed_ms":milliseconds(self.started.elapsed()),
             "timeout_seconds":self.timeout_seconds,"headers_ms":self.headers_ms,
@@ -194,6 +230,38 @@ fn safe_cause(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn request_shape_contains_counts_not_content_or_unknown_item_names() {
+        let body = json!({"instructions":"private-system", "input":[
+            {"type":"function_call", "arguments":"private-arguments", "call_id":"private-id"},
+            {"type":"function_call_output", "output":"private-output"},
+            {"type":"reasoning", "encrypted_content":"private-reasoning"},
+            {"type":"private-type", "content":"private-content"}],
+            "tools":[{"name":"private-tool","parameters":{"description":"private-schema"}}]});
+        let mut exchange = Exchange::new("codex/test", 1, Some(300));
+        exchange.request_shape(&body);
+        let record = exchange.report(&anyhow::anyhow!("private-error"));
+        assert_eq!(record["request_shape"]["input_items"], 4);
+        assert_eq!(record["request_shape"]["function_calls"], 1);
+        assert_eq!(record["request_shape"]["function_outputs"], 1);
+        assert_eq!(record["request_shape"]["reasoning_items"], 1);
+        assert_eq!(record["request_shape"]["tool_definitions"], 1);
+        assert_eq!(record["stream_error"], Value::Null);
+        for secret in [
+            "private-system",
+            "private-arguments",
+            "private-id",
+            "private-output",
+            "private-reasoning",
+            "private-type",
+            "private-content",
+            "private-tool",
+            "private-schema",
+            "private-error",
+        ] {
+            assert!(!record.to_string().contains(secret), "leaked {secret}");
+        }
+    }
     #[test]
     fn transport_causes_are_bounded_and_urls_and_controls_are_removed() {
         let text = safe_cause(
