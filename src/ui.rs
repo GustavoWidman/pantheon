@@ -648,10 +648,10 @@ pub(crate) fn shell_finished(
     output: &str,
     cancelled: bool,
 ) -> Result<()> {
-    let event:Option<(String,String,bool,i64)>=db.query_row("SELECT e.event,e.presentation,r.background,e.started FROM shell_ui s JOIN ui_events e ON e.event=s.event JOIN shell_runs r ON r.id=s.job WHERE s.job=?1",[job],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
-    if let Some((id, p, background, started)) = event {
+    let event:Option<(String,String,bool,i64,String)>=db.query_row("SELECT e.event,e.presentation,r.background,e.started,r.kind FROM shell_ui s JOIN ui_events e ON e.event=s.event JOIN shell_runs r ON r.id=s.job WHERE s.job=?1",[job],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+    if let Some((id, p, background, started, kind)) = event {
         let mut p: crate::activity::Presentation = serde_json::from_str(&p)?;
-        p.finish("shell", output);
+        p.finish(&kind, output);
         let status =
             if cancelled || output.starts_with("Error:") || output.starts_with("Interrupted") {
                 "error"

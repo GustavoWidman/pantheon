@@ -20,6 +20,37 @@ pub struct Config {
     pub skills: crate::skills::SkillsConfig,
     pub curator: crate::curator::CuratorConfig,
     pub mcp: crate::mcp::McpConfig,
+    pub claude: ClaudeConfig,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClaudeConfig {
+    /// Opt-in because this invokes the separately installed, logged-in CLI.
+    pub enabled: bool,
+    /// Resolved only through the daemon's PATH; do not point at a credential wrapper.
+    pub executable: String,
+    pub model: String,
+    pub effort: String,
+    pub max_jobs: usize,
+    pub timeout_seconds: u64,
+    pub max_task_chars: usize,
+    pub max_output_chars: usize,
+    pub allowed_tools: Vec<String>,
+}
+impl Default for ClaudeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            executable: "claude".into(),
+            model: "opus".into(),
+            effort: "medium".into(),
+            max_jobs: 2,
+            timeout_seconds: 900,
+            max_task_chars: 12_000,
+            max_output_chars: 30_000,
+            allowed_tools: vec!["Read".into(), "Glob".into(), "Grep".into()],
+        }
+    }
 }
 #[derive(Clone, Deserialize, Serialize, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -63,6 +94,7 @@ impl Default for Config {
             skills: Default::default(),
             curator: Default::default(),
             mcp: Default::default(),
+            claude: Default::default(),
         }
     }
 }
@@ -136,6 +168,30 @@ impl Config {
         config.skills.validate()?;
         config.curator.validate()?;
         config.mcp.validate()?;
+        ensure!(
+            config.claude.max_jobs > 0
+                && config.claude.timeout_seconds > 0
+                && config.claude.max_task_chars > 0
+                && config.claude.max_output_chars > 0,
+            "claude limits must be positive"
+        );
+        ensure!(
+            !config.claude.executable.trim().is_empty(),
+            "claude.executable must not be empty"
+        );
+        ensure!(
+            !config.claude.model.trim().is_empty(),
+            "claude.model must not be empty"
+        );
+        validate_reasoning(&config.claude.effort)?;
+        ensure!(
+            !config
+                .claude
+                .allowed_tools
+                .iter()
+                .any(|tool| tool.trim().is_empty()),
+            "claude.allowed_tools must not contain empty names"
+        );
         Ok(config)
     }
     pub fn instructions(&self) -> Result<String> {
@@ -161,6 +217,19 @@ pub fn validate_reasoning(s: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn claude_is_default_off_and_its_limits_are_validated_without_resolving_a_cli() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pantheon.toml");
+        std::fs::write(&path, "[discord]\napplication_id=1\nallowed_users=[2]\n").unwrap();
+        assert!(!Config::load(&path).unwrap().claude.enabled);
+        std::fs::write(
+            &path,
+            "[discord]\napplication_id=1\nallowed_users=[2]\n[claude]\nmax_jobs=0\n",
+        )
+        .unwrap();
+        assert!(Config::load(&path).is_err());
+    }
     #[test]
     fn old_configs_inherit_bounded_retries_and_operator_values_are_validated() {
         let directory = tempfile::tempdir().unwrap();

@@ -66,7 +66,7 @@ impl Store {
         CREATE TABLE IF NOT EXISTS agent_runs(id TEXT PRIMARY KEY,owner TEXT NOT NULL,state TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS agent_inbox(id TEXT PRIMARY KEY,owner TEXT NOT NULL,channel TEXT NOT NULL,user TEXT NOT NULL,text TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'queued',created INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS agent_inbox_pending ON agent_inbox(owner,created) WHERE state='queued';
-        CREATE TABLE IF NOT EXISTS shell_runs(id TEXT PRIMARY KEY,owner TEXT NOT NULL,channel TEXT NOT NULL,user TEXT NOT NULL,command TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'running',background INTEGER NOT NULL DEFAULT 0,output TEXT);
+        CREATE TABLE IF NOT EXISTS shell_runs(id TEXT PRIMARY KEY,owner TEXT NOT NULL,channel TEXT NOT NULL,user TEXT NOT NULL,kind TEXT NOT NULL DEFAULT 'shell',command TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'running',background INTEGER NOT NULL DEFAULT 0,output TEXT);
         PRAGMA user_version=2;")?;
         crate::ui::initialize(&db)?;
         crate::cache::initialize(&db)?;
@@ -101,6 +101,16 @@ impl Store {
         if !columns.iter().any(|c| c == "attempted_at") {
             db.execute(
                 "ALTER TABLE outbox ADD COLUMN attempted_at INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        let shell_columns = db
+            .prepare("PRAGMA table_info(shell_runs)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if !shell_columns.iter().any(|c| c == "kind") {
+            db.execute(
+                "ALTER TABLE shell_runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'shell'",
                 [],
             )?;
         }
@@ -1034,9 +1044,33 @@ impl Store {
         user: u64,
         command: &str,
     ) -> Result<()> {
+        self.shell_start_kind(id, owner, channel, user, "shell", command)
+    }
+    /// Shell and Claude jobs share atomic detach/delivery, but retain a kind
+    /// so a Claude report is never mislabeled as arbitrary shell output.
+    pub fn shell_start_kind(
+        &self,
+        id: &str,
+        owner: &str,
+        channel: u64,
+        user: u64,
+        kind: &str,
+        command: &str,
+    ) -> Result<()> {
+        ensure!(
+            matches!(kind, "shell" | "claude"),
+            "unknown background run kind"
+        );
         self.db.lock().unwrap().execute(
-            "INSERT INTO shell_runs(id,owner,channel,user,command) VALUES(?1,?2,?3,?4,?5)",
-            params![id, owner, channel.to_string(), user.to_string(), command],
+            "INSERT INTO shell_runs(id,owner,channel,user,kind,command) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                id,
+                owner,
+                channel.to_string(),
+                user.to_string(),
+                kind,
+                command
+            ],
         )?;
         Ok(())
     }
@@ -1268,8 +1302,14 @@ pub(crate) fn touch_coordinator(db: &Connection, channel: u64) -> Result<()> {
     Ok(())
 }
 fn shell_delivery(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<()> {
-    let result:Option<(String,String,String,String)>=tx.query_row("SELECT owner,channel,user,output FROM shell_runs WHERE id=?1 AND state='done' AND background=1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
-    if let Some((owner, channel, user, output)) = result {
+    let result: Option<(String, String, String, String, String)> = tx
+        .query_row(
+            "SELECT owner,channel,user,kind,output FROM shell_runs WHERE id=?1 AND state='done' AND background=1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?;
+    if let Some((owner, channel, user, kind, output)) = result {
         crate::ui::copy_context(tx, id, &format!("shell:{id}"))?;
         deliver_event(
             tx,
@@ -1277,7 +1317,7 @@ fn shell_delivery(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<()> {
             &owner,
             channel.parse()?,
             user.parse()?,
-            &format!("[shell {id}] {output}"),
+            &format!("[{kind} {id}] {output}"),
         )?;
     }
     Ok(())

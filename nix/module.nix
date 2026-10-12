@@ -80,7 +80,7 @@ in
     extraPackages = lib.mkOption {
       type = lib.types.listOf lib.types.package;
       default = [ ];
-      description = "Additional commands exposed to agents through the service PATH.";
+      description = "Additional commands exposed to agents through the service PATH. Do not add Claude Code here: install Anthropic's native CLI manually and expose its user-owned executable on PATH.";
     };
     skillDirectories = lib.mkOption {
       type = lib.types.listOf lib.types.path;
