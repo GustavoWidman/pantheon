@@ -374,6 +374,82 @@ mod request_retries {
         task.abort();
     }
 
+    #[tokio::test]
+    async fn terminal_sse_errors_are_classified_without_exposing_provider_text() {
+        use tracing::instrument::WithSubscriber;
+        let cases = [
+            (json!({"type":"error","error":{"code":"invalid_request_error","type":"invalid_request_error","status":400,"message":"private-api-token"}}), "validation", false, Some("invalid_request_error")),
+            (json!({"type":"response.failed","response":{"error":{"code":"context_length_exceeded","message":"private-api-token"}}}), "context", false, Some("context_length_exceeded")),
+            (json!({"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens","message":"private-api-token"},"error":{"code":"server_error"}}}), "incomplete", false, Some("server_error")),
+            (json!({"type":"error","error":{"code":"private-api-token","type":"private-api-token","status":"503 private-api-token","message":"private-api-token","request_id":"private-api-token"}}), "unknown", false, None),
+            (json!({"type":"error","error":{"code":{"value":"private-api-token"},"type":["private-api-token"],"status":9999,"message":"private-api-token"}}), "unknown", false, None),
+        ];
+        for (event, kind, retryable, code) in cases {
+            let (provider, state, task) = server(vec![Reply::Sse(format!("data: {event}\n\n"))], 3).await;
+            let log = DiagnosticLog::default();
+            let error = provider.step("openai/test", "none", "private-system-text", &[json!({"role":"user","content":"private-api-token"})], &[])
+                .with_subscriber(capture(&log)).await.unwrap_err();
+            let (text, records) = log.records();
+            assert_eq!(state.requests.lock().unwrap().len(), 1);
+            assert_eq!(records.len(), 1, "{text}");
+            let record = &records[0];
+            assert_eq!(record["status"], 200);
+            assert_eq!(record["last_sse_event"], event["type"]);
+            assert_eq!(record["stream_error"]["event"], event["type"]);
+            assert_eq!(record["stream_error"]["kind"], kind);
+            assert_eq!(record["stream_error"]["retryable"], retryable);
+            assert_eq!(record["stream_error"]["code"].as_str(), code);
+            assert_eq!(record["request_shape"]["input_items"], 2);
+            assert_eq!(record["request_shape"]["tool_definitions"], 0);
+            assert!(record["request_shape"]["serialized_bytes"].as_u64().unwrap() > 0);
+            assert!(error.to_string().contains("stream failed or was incomplete"));
+            assert!(!text.contains("private-api-token"));
+            assert!(!text.contains("private-system-text"));
+            assert!(!error.to_string().contains("private-api-token"));
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn known_transient_sse_error_preserves_retry_policy_and_discards_partial_tool() {
+        use tracing::instrument::WithSubscriber;
+        let partial = json!({"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","name":"shell","call_id":"never-dispatch","arguments":"private-arguments"}});
+        let event = json!({"type":"response.failed","response":{"error":{"code":"server_error","type":"server_error","status":503,"message":"private-api-token"}}});
+        let sse = format!("data: {partial}\n\ndata: {event}\n\n");
+        let (provider, state, task) = server(vec![Reply::Sse(sse), Reply::Sse(completed_sse())], 2).await;
+        let log = DiagnosticLog::default();
+        let response = provider.step("openai/test", "none", "secret-system", &[], &[])
+            .with_subscriber(capture(&log)).await.unwrap();
+        assert!(response.calls.is_empty());
+        assert_eq!(state.requests.lock().unwrap().len(), 2);
+        let (text, records) = log.records();
+        assert_eq!(records.len(), 1, "{text}");
+        assert_eq!(records[0]["completed_output_items"], 1);
+        assert_eq!(records[0]["stream_error"]["kind"], "upstream");
+        assert_eq!(records[0]["stream_error"]["code"], "server_error");
+        assert_eq!(records[0]["stream_error"]["type"], "server_error");
+        assert_eq!(records[0]["stream_error"]["status"], 503);
+        assert_eq!(records[0]["stream_error"]["retryable"], true);
+        for secret in ["private-arguments", "private-api-token", "secret-system", "never-dispatch"] {
+            assert!(!text.contains(secret));
+        }
+        task.abort();
+    }
+
+    #[test]
+    fn event_details_reject_unknown_names_values_and_free_text() {
+        let unknown = retry::event_details(&json!({"type":"private-api-token","error":{"code":"server_error"}}));
+        assert_eq!(unknown.event, "unknown");
+        assert!(!unknown.retryable);
+        let event = json!({"type":"response.incomplete","response":{"incomplete_details":{"reason":"private-api-token"}},"error":{"status":-5}});
+        let details = retry::event_details(&event);
+        assert_eq!(details.incomplete_reason, None);
+        assert_eq!(details.status, None);
+        assert_eq!(details.kind, "incomplete");
+        let event = json!({"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"}}});
+        assert_eq!(retry::event_details(&event).incomplete_reason, Some("content_filter"));
+    }
+
     #[test]
     fn retry_after_and_transient_classification_preserve_bounded_policy() {
         let policy = retry::RequestRetries {
