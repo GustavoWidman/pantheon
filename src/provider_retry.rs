@@ -57,11 +57,38 @@ pub(crate) enum StreamFailure {
 pub(crate) struct StreamEventDetails {
     pub event: &'static str,
     pub code: Option<&'static str>,
+    pub code_state: &'static str,
     pub error_type: Option<&'static str>,
+    pub type_state: &'static str,
+    pub error_source: &'static str,
     pub status: Option<u16>,
     pub incomplete_reason: Option<&'static str>,
     pub kind: &'static str,
     pub retryable: bool,
+}
+
+/// Null placeholders are not error objects. Preserve the precedence of actual
+/// objects (including empty ones); never combine fields from conflicting errors.
+fn event_error(event: &serde_json::Value) -> (Option<&serde_json::Value>, &'static str) {
+    if let Some(error) = event.get("error").filter(|e| e.is_object()) {
+        (Some(error), "error")
+    } else if let Some(error) = event["response"].get("error").filter(|e| e.is_object()) {
+        (Some(error), "response.error")
+    } else if event["type"] == "error" {
+        (Some(event), "event")
+    } else {
+        (None, "none")
+    }
+}
+
+fn code_state(value: Option<&serde_json::Value>) -> &'static str {
+    match value {
+        None => "missing",
+        Some(serde_json::Value::Null) => "null",
+        Some(value) if safe_code(value).is_some() => "recognized",
+        Some(serde_json::Value::String(_)) => "unrecognized",
+        Some(_) => "invalid_type",
+    }
 }
 
 fn safe_code(value: &serde_json::Value) -> Option<&'static str> {
@@ -91,14 +118,14 @@ pub(crate) fn event_details(event: &serde_json::Value) -> StreamEventDetails {
         Some("response.incomplete") => "response.incomplete",
         _ => "unknown",
     };
-    // Follow precisely the same field precedence as transient_event; do not
-    // change which provider errors Pantheon retries.
-    let error = event
-        .get("error")
-        .or_else(|| event["response"].get("error"))
-        .or_else(|| (name == "error").then_some(event));
+    // Diagnostics and retry decisions must inspect the same error object.
+    let (error, error_source) = event_error(event);
     let code = error.and_then(|e| safe_code(&e["code"]));
-    let error_type = error.and_then(|e| safe_code(&e["type"]));
+    // A flat event's `type: error` identifies the event, not the error category.
+    let type_value = error
+        .filter(|_| error_source != "event")
+        .and_then(|e| e.get("type"));
+    let error_type = type_value.and_then(safe_code);
     let status = error
         .and_then(|e| e["status"].as_u64())
         .and_then(|s| u16::try_from(s).ok())
@@ -157,7 +184,14 @@ pub(crate) fn event_details(event: &serde_json::Value) -> StreamEventDetails {
     StreamEventDetails {
         event: name,
         code,
+        code_state: code_state(error.and_then(|e| e.get("code"))),
         error_type,
+        type_state: if error_source == "event" {
+            "not_applicable"
+        } else {
+            code_state(type_value)
+        },
+        error_source,
         status,
         incomplete_reason,
         kind,
@@ -166,11 +200,30 @@ pub(crate) fn event_details(event: &serde_json::Value) -> StreamEventDetails {
 }
 impl fmt::Display for StreamFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::PrematureEof => "provider stream ended without a completed response; no tools from this response executed",
-            Self::Transient(_) => "provider stream reported a transient failure; no tools from this response executed",
-            Self::Terminal(_) => "provider stream failed or was incomplete; no tools from this response executed",
-        })
+        let details = match self {
+            Self::PrematureEof => return f.write_str("provider stream ended without a completed response; no tools from this response executed"),
+            Self::Transient(details) => {
+                f.write_str("provider stream reported a transient failure")?;
+                details
+            }
+            Self::Terminal(details) => {
+                f.write_str("provider stream failed or was incomplete")?;
+                details
+            }
+        };
+        write!(f, " ({}; category={}", details.event, details.kind)?;
+        if let Some(code) = details.code.or(details.error_type) {
+            write!(f, "; code={code}")?;
+        } else {
+            write!(f, "; code={}", details.code_state)?;
+        }
+        if let Some(status) = details.status {
+            write!(f, "; status={status}")?;
+        }
+        if let Some(reason) = details.incomplete_reason {
+            write!(f, "; reason={reason}")?;
+        }
+        f.write_str("); no tools from this response executed")
     }
 }
 impl std::error::Error for StreamFailure {}
@@ -245,10 +298,7 @@ pub(super) fn transient_event(event: &serde_json::Value) -> bool {
     if !matches!(event["type"].as_str(), Some("error" | "response.failed")) {
         return false;
     }
-    let error = event
-        .get("error")
-        .or_else(|| event["response"].get("error"))
-        .or_else(|| (event["type"] == "error").then_some(event));
+    let (error, _) = event_error(event);
     let Some(error) = error else { return false };
     error["status"]
         .as_u64()

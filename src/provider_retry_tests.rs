@@ -450,6 +450,77 @@ mod request_retries {
         assert_eq!(retry::event_details(&event).incomplete_reason, Some("content_filter"));
     }
 
+    #[tokio::test]
+    async fn error_placeholders_do_not_hide_transient_failures_or_release_partial_tools() {
+        use tracing::instrument::WithSubscriber;
+        let partial = json!({"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","name":"shell","call_id":"never-dispatch","arguments":"private-arguments"}});
+        for (event, source) in [
+            (json!({"type":"error","code":"server_error","error":null,"message":"private-provider-text"}), "event"),
+            (json!({"type":"response.failed","error":null,"response":{"error":{"code":"server_error"}}}), "response.error"),
+            (json!({"type":"error","code":"server_error","error":"private-provider-text"}), "event"),
+        ] {
+            let (provider, state, task) = server(vec![
+                Reply::Sse(format!("data: {partial}\n\ndata: {event}\n\n")),
+                Reply::Sse(completed_sse()),
+            ], 2).await;
+            let log = DiagnosticLog::default();
+            let response = provider.step("openai/test", "none", "", &[], &[])
+                .with_subscriber(capture(&log)).await.unwrap();
+            assert!(response.calls.is_empty());
+            assert!(response.native.is_empty());
+            let requests = state.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].1, requests[1].1);
+            let (text, records) = log.records();
+            assert_eq!(records.len(), 1, "{text}");
+            assert_eq!(records[0]["stream_error"]["code"], "server_error");
+            assert_eq!(records[0]["stream_error"]["code_state"], "recognized");
+            assert_eq!(records[0]["stream_error"]["error_source"], source);
+            assert_eq!(records[0]["stream_error"]["retryable"], true);
+            assert!(!text.contains("private-provider-text"));
+            assert!(!text.contains("private-arguments"));
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_error_field_states_remain_distinct_private_and_non_retryable() {
+        use tracing::instrument::WithSubscriber;
+        for (event, source, code_state, type_state) in [
+            (json!({"type":"error","message":"private-provider-text"}), "event", "missing", "not_applicable"),
+            (json!({"type":"error","code":null}), "event", "null", "not_applicable"),
+            (json!({"type":"error","error":{"code":"private-provider-text","type":"private-provider-text"}}), "error", "unrecognized", "unrecognized"),
+            (json!({"type":"error","error":{"code":{},"type":17}}), "error", "invalid_type", "invalid_type"),
+            // Do not fall through or combine a real primary error with a
+            // conflicting transient code/status in another location.
+            (json!({"type":"error","code":"server_error","status":503,"error":{"code":"invalid_request_error","type":null},"response":{"error":{"code":"server_error"}}}), "error", "recognized", "null"),
+            (json!({"type":"error","code":"server_error","error":{}}), "error", "missing", "missing"),
+            (json!({"type":"response.failed","error":null,"response":{"error":null}}), "none", "missing", "missing"),
+        ] {
+            let (provider, state, task) = server(vec![Reply::Sse(format!("data: {event}\n\n"))], 3).await;
+            let log = DiagnosticLog::default();
+            let error = provider.step("openai/test", "none", "", &[], &[])
+                .with_subscriber(capture(&log)).await.unwrap_err();
+            assert_eq!(state.requests.lock().unwrap().len(), 1);
+            let (text, records) = log.records();
+            assert_eq!(records.len(), 1, "{text}");
+            let details = &records[0]["stream_error"];
+            assert_eq!(details["error_source"], source);
+            assert_eq!(details["code_state"], code_state);
+            assert_eq!(details["type_state"], type_state);
+            assert_eq!(details["retryable"], false);
+            assert!(error.to_string().contains("category="));
+            assert!(error.to_string().contains(if code_state == "recognized" {
+                "code=invalid_request_error"
+            } else {
+                code_state
+            }));
+            assert!(!text.contains("private-provider-text"));
+            assert!(!error.to_string().contains("private-provider-text"));
+            task.abort();
+        }
+    }
+
     #[test]
     fn retry_after_and_transient_classification_preserve_bounded_policy() {
         let policy = retry::RequestRetries {
