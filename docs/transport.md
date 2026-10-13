@@ -111,9 +111,18 @@ events, the warning now includes `stream_error`: the recognized event name,
 allowlisted error `code` and `type`, numeric error `status` (100–599), known
 incomplete reason (`max_output_tokens` or `content_filter`), a diagnostic
 category (`validation`, `context`, `auth`, `rate_limit`, `upstream`, `incomplete`
-or `unknown`) and `retryable` under the **existing** retry policy. Unknown
-codes/types/reasons are `null`, not copied from the provider. The `retryable`
-flag means *eligible*; a request at its attempt limit still stops. HTTP status
+or `unknown`) and `retryable`. Unknown codes/types/reasons are `null`, not copied
+from the provider. `code_state` and `type_state` distinguish `missing`, explicit
+`null`, `recognized`, `unrecognized` strings, and `invalid_type` values. For
+flat `error` events, `type_state=not_applicable`: `type: error` is the event name,
+not an error category. `error_source` is `error`, `response.error`, `event`, or
+`none`. Error selection uses the first actual object in that order; null and
+non-object placeholders cannot hide a flat or nested error. Fields from
+conflicting objects are never merged. The same selection drives bounded retries
+of recognized transient errors; unknown errors still stop immediately.
+Returned errors include these safe categories/codes and known incomplete reasons,
+so Discord and worker notices identify recognized failures without raw messages.
+The `retryable` flag means *eligible*; a request at its attempt limit still stops. HTTP status
 is recorded separately; HTTP 200 plus `stream_error.status=503` is a provider
 stream error, not an HTTP 503 response. Header request IDs and Cloudflare ray
 IDs remain bounded as before; event-supplied IDs and messages are not logged.

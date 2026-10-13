@@ -180,6 +180,8 @@ impl Exchange {
             "request_shape":self.request_shape,
             "stream_error":stream_event.map(|details| json!({
                 "event":details.event, "code":details.code, "type":details.error_type,
+                "code_state":details.code_state, "type_state":details.type_state,
+                "error_source":details.error_source,
                 "status":details.status, "incomplete_reason":details.incomplete_reason,
                 "kind":details.kind, "retryable":details.retryable,
             })),
