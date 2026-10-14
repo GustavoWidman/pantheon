@@ -351,7 +351,8 @@ mod tests {
             ("exit 2", false),
         ] {
             let (_dir, path) = fake(script);
-            assert_eq!(validate_cli(&test_config(&path)).await.is_ok(), expected);
+            let result = validate_cli(&test_config(&path)).await;
+            assert_eq!(result.is_ok(), expected, "fixture {script:?}: {result:#?}");
         }
         let config = test_config(std::path::Path::new("definitely-missing-claude"));
         assert!(validate(&config).await.is_err());
@@ -379,18 +380,24 @@ mod tests {
     #[tokio::test]
     async fn malformed_nonzero_and_timeout_are_failures() {
         let cwd = std::env::current_dir().unwrap();
+        // Exceed the pipe buffer so an early-exit fixture cannot accidentally
+        // pass just because the task was buffered before the child ran.
+        let task = "x".repeat(100_000);
         for (script, needle) in [
-            ("printf nope", "malformed JSON"),
-            ("printf err >&2; exit 7", "exited 7"),
+            // Read through EOF before responding so fixture exit cannot race
+            // the parent's task writer and obscure the intended error path.
+            ("cat >/dev/null; printf nope", "malformed JSON"),
+            ("cat >/dev/null; printf err >&2; exit 7", "exited 7"),
             ("sleep 10", "timed out"),
         ] {
             let (_dir, path) = fake(script);
             let mut config = test_config(&path);
             config.timeout_seconds = 1;
+            config.max_task_chars = task.len();
             let error = run(
                 &config,
                 &cwd,
-                "x",
+                &task,
                 "opus",
                 "medium",
                 &CancellationToken::new(),
@@ -401,6 +408,34 @@ mod tests {
             assert!(error.contains(needle), "{error}");
         }
     }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn closed_task_stdin_is_still_a_write_failure() {
+        // Deliberately close stdin without consuming a task larger than the
+        // pipe buffer. Unlike the result fixtures, this tests a real CLI error.
+        let (_dir, path) = fake("exec 0<&-; exit 7");
+        let task = "x".repeat(100_000);
+        let mut config = test_config(&path);
+        config.max_task_chars = task.len();
+        let error = run(
+            &config,
+            Path::new("."),
+            &task,
+            "opus",
+            "low",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("write Claude task"), "{error:#}");
+        assert!(
+            error.chain().any(|cause| cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe)),
+            "{error:#}"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn permission_arguments_are_read_only_by_default_and_broader_tools_are_explicit() {
@@ -472,9 +507,11 @@ mod tests {
             &CancellationToken::new(),
         )
         .await
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("exceeded JSON envelope limit"), "{error}");
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("exceeded JSON envelope limit"),
+            "{error:#}"
+        );
     }
 
     #[cfg(unix)]
