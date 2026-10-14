@@ -314,12 +314,71 @@ mod tests {
 
     #[cfg(unix)]
     fn fake(script: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
+        fake_with_writer_hook(script, || {})
+    }
+    #[cfg(unix)]
+    fn fake_with_writer_hook(
+        script: &str,
+        while_writer_open: impl FnOnce(),
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::io::{Read, Write};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("claude");
-        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Never open the executable for writing in this multithreaded test
+        // process: a concurrent fork can inherit that writable descriptor
+        // until exec, even with CLOEXEC, and make a fixture exec fail ETXTBSY.
+        // A separate writer process cannot leak its descriptor to our other
+        // children. Wait for it to exit before returning the executable.
+        let mut writer = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "exec 3> \"$1\" || exit; printf r; cat >&3 || exit; exec 3>&-; chmod 755 \"$1\"",
+                "claude-fixture-writer",
+            ])
+            .arg(&path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = [0];
+        writer
+            .stdout
+            .take()
+            .unwrap()
+            .read_exact(&mut ready)
+            .unwrap();
+        assert_eq!(ready, *b"r");
+        while_writer_open();
+        let mut input = writer.stdin.take().unwrap();
+        write!(input, "#!/bin/sh\n{script}\n").unwrap();
+        drop(input);
+        assert!(writer.wait().unwrap().success());
         (dir, path)
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fixture_writer_cannot_leak_to_an_unrelated_child() {
+        // The writer has its executable open here. Keep a concurrently
+        // launched child alive past the writer's exit: it must not inherit a
+        // writable reference that makes the completed fixture unexecutable.
+        let mut keeper = None;
+        let (_dir, path) = fake_with_writer_hook("printf ready", || {
+            keeper = Some(
+                std::process::Command::new("/bin/sh")
+                    .args(["-c", "read line"])
+                    .stdin(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+        });
+        let result = std::process::Command::new(path).output();
+        let mut keeper = keeper.unwrap();
+        drop(keeper.stdin.take());
+        keeper.wait().unwrap();
+        let output =
+            result.expect("completed fixture remains executable with unrelated child alive");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"ready");
     }
     #[cfg(unix)]
     fn test_config(executable: &std::path::Path) -> ClaudeConfig {
