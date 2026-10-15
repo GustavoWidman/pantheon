@@ -7,28 +7,56 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 
 pub const ENDPOINT: &str = "https://api.z.ai/api/coding/paas/v4/chat/completions";
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 131072;
 pub const MODELS: [&str; 2] = ["glm-5.3", "glm-5.3-flash"];
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub enabled: bool,
-    pub max_in_flight: usize,
+    /// None means no harness concurrency cap; finite caps are shared by clones.
+    #[serde(
+        deserialize_with = "deserialize_max_in_flight",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_in_flight: Option<usize>,
     pub max_output_tokens: u64,
 }
 impl Default for Config {
     fn default() -> Self {
         Self {
             enabled: false,
-            max_in_flight: 2,
-            max_output_tokens: 16384,
+            max_in_flight: None,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
         }
+    }
+}
+fn deserialize_max_in_flight<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Limit {
+        Count(usize),
+        Name(String),
+    }
+    match Option::<Limit>::deserialize(deserializer)? {
+        None | Some(Limit::Count(0)) => Ok(None),
+        Some(Limit::Count(count)) => Ok(Some(count)),
+        Some(Limit::Name(name)) if name == "none" => Ok(None),
+        Some(Limit::Name(_)) => Err(serde::de::Error::custom(
+            "zai.max_in_flight string must be \"none\"; otherwise use 0 or an integer 1–32",
+        )),
     }
 }
 impl Config {
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            (1..=32).contains(&self.max_in_flight),
-            "zai.max_in_flight must be 1–32"
+            self.max_in_flight
+                .is_none_or(|limit| (1..=32).contains(&limit)),
+            "zai.max_in_flight must be omitted, \"none\", 0, or 1–32"
         );
         ensure!(
             (1..=131072).contains(&self.max_output_tokens),
@@ -221,7 +249,7 @@ pub(super) fn request_body(
     }).collect::<Result<Vec<_>>>()?;
     let mut messages = vec![json!({"role":"system","content":system})];
     messages.extend_from_slice(history);
-    let mut body = json!({"model":id,"messages":messages,"stream":true,"tool_stream":true,"stream_options":{"include_usage":true},"thinking":{"type":"enabled","clear_thinking":false},"reasoning_effort":effort,"max_tokens":16384});
+    let mut body = json!({"model":id,"messages":messages,"stream":true,"tool_stream":true,"stream_options":{"include_usage":true},"thinking":{"type":"enabled","clear_thinking":false},"reasoning_effort":effort,"max_tokens":DEFAULT_MAX_OUTPUT_TOKENS});
     if !tools.is_empty() {
         body["tools"] = json!(tools);
         body["tool_choice"] = json!("auto");

@@ -11,8 +11,28 @@ agents or establish account quota/entitlement.
 ```toml
 [zai]
 enabled = true                 # default false; key presence alone is insufficient
-max_in_flight = 2              # shared across clones: main, workers, maintenance
-max_output_tokens = 16384      # 1–131072; lower this for bounded tests/short tasks
+```
+
+That minimal opt-in plus `ZAI_API_KEY` in the protected environment is enough to
+make GLM available; it does not change the main agent model. Defaults are
+unlimited harness concurrency and 131072 output tokens per response for either
+model. Unlimited admission does not bypass upstream rate limits or plan quota.
+
+Optional overrides (omit these to keep the defaults):
+
+```toml
+# Within [zai]:
+# max_in_flight = "none"        # unlimited, same as omission or 0
+# max_in_flight = 0             # unlimited
+# max_in_flight = 2             # explicit finite shared cap; 1–32
+# max_output_tokens = 131072    # 1–131072; lower for bounded tests/short tasks
+```
+
+TOML has no bare `none` value: use `"none"`, `0`, or omit the field. The Rust
+configuration represents unlimited as `None`, with no semaphore allocated.
+Serialization omits an unlimited `max_in_flight` field.
+
+```toml
 
 # Optional main-agent selection. Otherwise select zai/model only when spawning
 # a worker or via /model; keep existing main and compactor settings unchanged.
@@ -66,9 +86,10 @@ only to fresh turns. Request validation rejects foreign Responses items,
 encrypted reasoning, Anthropic blocks and mismatched tool-result history rather
 than guessing a translation. It does not transcode an active native transcript.
 
-`max_in_flight` (1–32) is a harness limit, **not** a claimed plan concurrency
-limit. Clones share one cancellation-safe semaphore, including the bounded retry
-sequence. Existing `agent.request_max_attempts` / `request_backoff_seconds` and
+`max_in_flight` defaults to unlimited (no harness semaphore). An explicit finite
+value (1–32) is a harness limit, **not** a claimed plan concurrency limit. With a
+finite cap, clones share one cancellation-safe semaphore across main, workers and
+maintenance, including the bounded retry sequence. Existing `agent.request_max_attempts` / `request_backoff_seconds` and
 Retry-After handling apply to HTTP 429/5xx and classified transient failures.
 Cancellation drops request/wait/backoff futures and releases admission. Terminal
 validation errors do not dispatch tools. HTTP/provider errors expose only safe

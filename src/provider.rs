@@ -24,7 +24,7 @@ pub struct Provider {
     retries: RequestRetries,
     error_capture: Option<std::path::PathBuf>,
     zai: zai::Config,
-    zai_slots: std::sync::Arc<tokio::sync::Semaphore>,
+    zai_slots: Option<std::sync::Arc<tokio::sync::Semaphore>>,
     #[cfg(test)]
     endpoint: Option<String>,
 }
@@ -86,7 +86,7 @@ impl Provider {
             retries: RequestRetries::default(),
             error_capture: None,
             zai: zai::Config::default(),
-            zai_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
+            zai_slots: None,
             #[cfg(test)]
             endpoint: None,
         })
@@ -109,14 +109,16 @@ impl Provider {
                 enabled: true,
                 ..Default::default()
             },
-            zai_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
+            zai_slots: None,
             endpoint: Some(endpoint),
         }
     }
     /// Explicit opt-in; clones share one admission limit across workers and main.
     pub fn with_zai(mut self, config: zai::Config) -> Result<Self> {
         config.validate()?;
-        self.zai_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(config.max_in_flight));
+        self.zai_slots = config
+            .max_in_flight
+            .map(|limit| std::sync::Arc::new(tokio::sync::Semaphore::new(limit)));
         self.zai = config;
         Ok(self)
     }
@@ -703,12 +705,10 @@ impl Provider {
                 self.zai.enabled,
                 "Z.ai provider disabled; set zai.enabled explicitly"
             );
-            Some(
-                self.zai_slots
-                    .acquire()
-                    .await
-                    .context("Z.ai admission closed")?,
-            )
+            match &self.zai_slots {
+                Some(slots) => Some(slots.acquire().await.context("Z.ai admission closed")?),
+                None => None,
+            }
         } else {
             None
         };
