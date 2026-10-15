@@ -47,3 +47,7 @@ Anthropic's current [authentication and credential-use guidance](https://code.cl
 ## Research references
 
 The implementation was informed by Hermes at commit `7157422022ff06f3e632d1dd394ee1253b17ad37`: its [Codex auth/refresh lifecycle](https://github.com/NousResearch/hermes-agent/blob/7157422022ff06f3e632d1dd394ee1253b17ad37/hermes_cli/auth_codex.py), [Codex request headers](https://github.com/NousResearch/hermes-agent/blob/7157422022ff06f3e632d1dd394ee1253b17ad37/agent/codex_headers.py), [native web search provider](https://github.com/NousResearch/hermes-agent/blob/7157422022ff06f3e632d1dd394ee1253b17ad37/plugins/web/openai_native/provider.py), and [Anthropic adapter](https://github.com/NousResearch/hermes-agent/blob/7157422022ff06f3e632d1dd394ee1253b17ad37/agent/anthropic_adapter.py). Pantheon implements its own Rust transport; no Hermes Python runtime is required.
+
+## Z.ai / GLM
+
+The opt-in `zai/` provider uses `ZAI_API_KEY` and the exact Coding Chat Completions endpoint, never OpenAI credentials or a general paid-endpoint fallback. See [configuration, protocol, reasoning lifetime and capability limits](zai.md). It is absent from authenticated suggestions until both `zai.enabled=true` and a nonempty key are present.

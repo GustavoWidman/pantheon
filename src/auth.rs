@@ -26,6 +26,9 @@ impl AuthConfig {
     }
     pub fn reasoning_for_model(&self, model: &str, requested: &str) -> Result<String> {
         crate::config::validate_reasoning(requested)?;
+        if model.starts_with("zai/") {
+            crate::provider::zai::validate_effort(requested)?;
+        }
         let Some(slug) = model.strip_prefix("codex/") else {
             return Ok(requested.into());
         };

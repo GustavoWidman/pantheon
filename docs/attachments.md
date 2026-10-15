@@ -119,3 +119,7 @@ Partial downloads and PDF page renders are temporary. Cancellation cleans them,
 and startup cleans crash leftovers and tracked incomplete workspace copies.
 Metadata remains available after byte cleanup. Cleanup is disk housekeeping,
 not a model task, and does not alter conversation memory or cached prompts.
+
+## Model-specific GLM inputs
+
+GLM-5.3 is text-only: incoming images remain preserved originals with explicit unavailable-vision notices; PDF reads provide one page of extracted text with visual limitations. GLM-5.3-Flash supports labeled image_url inputs and rendered PDF pages, but native file/video/audio inputs are intentionally not claimed. Browser screenshots share the same capability gate. No hidden vision-provider or MCP analysis call is made. See [the complete input matrix](zai.md#attachments-and-web-tools).

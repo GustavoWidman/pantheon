@@ -414,6 +414,32 @@ async fn bundled_pdf_fallback_renders_only_requested_page_and_leaves_no_scratch(
         .as_bytes(),
     );
     tokio::fs::write(&path, pdf).await.unwrap();
+    for model in ["zai/glm-5.3", "zai/glm-5.3-flash"] {
+        let (text, parts) = files
+            .inspect(
+                &path,
+                model,
+                Some(2),
+                remaining_budget(model, &[]),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(text.contains("SECOND PAGE"));
+        assert!(!text.contains("FIRST PAGE"));
+        if model == "zai/glm-5.3" {
+            assert!(parts.is_empty());
+            assert!(text.contains("extracted text only"));
+            assert!(text.contains("NOT available"));
+        } else {
+            assert_eq!(parts[0]["type"], "text");
+            assert_eq!(parts[1]["type"], "image_url");
+        }
+        assert_eq!(
+            std::fs::read_dir(files.root.join("tmp")).unwrap().count(),
+            0
+        );
+    }
     let (text, parts) = files
         .inspect(
             &path,
@@ -488,4 +514,113 @@ async fn static_gif_is_native_but_animated_gif_stays_available_without_invalid_p
         .is_none()
     );
     assert!(path.exists());
+}
+
+#[tokio::test]
+async fn zai_images_open_read_and_ingress_are_capability_aware() {
+    let (dir, _store, files) = fixture();
+    let png = dir.path().join("image.png");
+    tokio::fs::write(&png, b"synthetic fixture bytes")
+        .await
+        .unwrap();
+    let saved = files.snapshot(10, "image", &png).await.unwrap();
+    let message = saved.message.clone();
+    for model in ["zai/glm-5.3", "zai/glm-5.3-flash"] {
+        let (notice, parts) = files
+            .inspect(
+                &png,
+                model,
+                None,
+                remaining_budget(model, &[]),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ingress = files
+            .input_parts(
+                10,
+                std::slice::from_ref(&message),
+                model,
+                remaining_budget(model, &[]),
+            )
+            .await
+            .unwrap();
+        let mut user = crate::provider::Provider::user("zai", &notice);
+        crate::provider::Provider::attach_user_parts(&mut user, parts.clone()).unwrap();
+        crate::provider::Provider::request_body(model, "low", "s", &[user], &[]).unwrap();
+        if model == "zai/glm-5.3" {
+            assert!(parts.is_empty());
+            assert!(notice.contains("have NOT been viewed"));
+            assert_eq!(ingress.len(), 1);
+            assert!(
+                ingress[0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not supplied as native")
+            );
+            assert_eq!(remaining_budget(model, &[]).images, 0);
+        } else {
+            assert_eq!(parts[0]["type"], "text");
+            assert_eq!(parts[1]["type"], "image_url");
+            assert!(
+                parts[1]["image_url"]["url"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("data:image/png;base64,")
+            );
+            assert_eq!(ingress[1]["type"], "image_url");
+            let before = remaining_budget(model, &[]);
+            let after = remaining_budget(model, &parts);
+            assert_eq!(before.images - after.images, 1);
+            assert!(after.payload < before.payload);
+        }
+    }
+    assert_eq!(
+        tokio::fs::read(&png).await.unwrap(),
+        b"synthetic fixture bytes"
+    );
+    let (notice, parts) = files
+        .inspect(
+            &png,
+            "zai/glm-5.3-flash",
+            None,
+            InputBudget {
+                files: 0,
+                payload: 0,
+                images: 0,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(parts.is_empty());
+    assert!(notice.contains("have NOT been viewed"));
+    let binary = dir.path().join("opaque.bin");
+    tokio::fs::write(&binary, b"binary").await.unwrap();
+    let (notice, parts) = files
+        .inspect(
+            &binary,
+            "zai/glm-5.3",
+            None,
+            remaining_budget("zai/glm-5.3", &[]),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(parts.is_empty());
+    assert!(notice.contains("unavailable"));
+    let text = dir.path().join("notes.txt");
+    tokio::fs::write(&text, b"actual text").await.unwrap();
+    let (notice, parts) = files
+        .inspect(
+            &text,
+            "zai/glm-5.3",
+            None,
+            remaining_budget("zai/glm-5.3", &[]),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(parts.is_empty());
+    assert!(notice.contains("actual text"));
 }

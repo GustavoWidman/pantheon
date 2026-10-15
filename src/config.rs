@@ -21,6 +21,7 @@ pub struct Config {
     pub curator: crate::curator::CuratorConfig,
     pub mcp: crate::mcp::McpConfig,
     pub claude: ClaudeConfig,
+    pub zai: crate::provider::zai::Config,
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -95,6 +96,7 @@ impl Default for Config {
             curator: Default::default(),
             mcp: Default::default(),
             claude: Default::default(),
+            zai: Default::default(),
         }
     }
 }
@@ -163,10 +165,19 @@ impl Config {
             ensure!(*tokens > 0, "context window limits must be positive");
         }
         config.auth.validate()?;
+        config.zai.validate()?;
         config.attachments.validate()?;
         config.web.validate()?;
         config.skills.validate()?;
         config.curator.validate()?;
+        if config.curator.enabled {
+            crate::curator::effective_model(
+                &config.agent.model,
+                &config.agent.model,
+                config.curator.model.as_deref(),
+                None,
+            )?;
+        }
         config.mcp.validate()?;
         ensure!(
             config.claude.max_jobs > 0
@@ -264,6 +275,28 @@ mod tests {
         }
         for effort in ["none", "minimal", "ultra", ""] {
             assert!(validate_claude_effort(effort).is_err());
+        }
+    }
+    #[test]
+    fn startup_glm_requires_explicit_maintenance_route_or_disabled_curator() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        let base = "[discord]\napplication_id=1\nallowed_users=[2]\n[agent]\nmodel='zai/glm-5.3'\n[zai]\nenabled=true\n";
+        std::fs::write(&path, base).unwrap();
+        assert!(
+            Config::load(&path)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("implicit GLM")
+        );
+        for extra in [
+            "[curator]\nenabled=false\n",
+            "[curator]\nmodel='openai/explicit'\n",
+            "[curator]\nmodel='zai/glm-5.3'\n",
+        ] {
+            std::fs::write(&path, format!("{base}{extra}")).unwrap();
+            assert!(Config::load(&path).is_ok());
         }
     }
     #[test]

@@ -439,3 +439,53 @@ async fn curator_context_bridge_recovers_a_journal_commit_before_ack_without_rep
     assert!(h.store.queued(1).unwrap().is_empty());
     server.abort();
 }
+
+#[tokio::test]
+async fn glm_main_override_keeps_curator_route_and_picker_explicit_inheritance_agrees() {
+    let (_dir, h, _run, mock, server) = fixture("openai", vec![]).await;
+    h.store.set_settings(1, "zai/glm-5.3", "high").unwrap();
+    h.discord.models.set_chat_model(1, "zai/glm-5.3");
+    let settings = h.curator_settings(1).await.unwrap();
+    assert_eq!(settings.0, "openai/test");
+    assert_eq!(h.discord.models.kind_model(1, "curator").as_deref(), Some("openai/test"));
+    h.store.set_curator_model(1, Some("none")).unwrap();
+    h.discord.models.set_kind_model(1, "curator", Some("none")).unwrap();
+    let settings = h.curator_settings(1).await.unwrap();
+    assert_eq!(settings.0, "zai/glm-5.3");
+    assert_eq!(h.discord.models.kind_model(1, "curator").as_deref(), Some("zai/glm-5.3"));
+    h.store.set_curator_model(1, None).unwrap();
+    h.discord.models.set_kind_model(1, "curator", None).unwrap();
+    assert_eq!(h.curator_settings(1).await.unwrap().0, "openai/test");
+    assert!(mock.requests.lock().await.is_empty());
+    server.abort();
+}
+
+#[tokio::test]
+async fn glm_startup_implicit_curator_has_no_picker_model_and_no_network() {
+    let (_dir, h, _run, mock, server) = fixture("zai", vec![]).await;
+    assert!(h.curator_settings(1).await.unwrap_err().to_string().contains("implicit GLM"));
+    assert!(h.discord.models.kind_model(1, "curator").is_none());
+    h.store.set_curator_model(1, Some("openai/explicit-curator")).unwrap();
+    h.discord.models.set_kind_model(1, "curator", Some("openai/explicit-curator")).unwrap();
+    assert_eq!(h.curator_settings(1).await.unwrap().0, "openai/explicit-curator");
+    assert_eq!(h.discord.models.kind_model(1, "curator").as_deref(), Some("openai/explicit-curator"));
+    assert!(mock.requests.lock().await.is_empty());
+    server.abort();
+}
+
+#[tokio::test]
+async fn glm_model_and_reasoning_commands_share_effective_curator_picker_route() {
+    let (_dir, h, _run, mock, server) = fixture("openai", vec![]).await;
+    h.discord.models.replace("zai", crate::provider::zai::catalog());
+    h.command(1, 2, "model", &json!([{"name":"model","value":"zai/glm-5.3"}])).await.unwrap();
+    assert_eq!(h.store.settings(1, "ignored", "ignored").unwrap().0, "zai/glm-5.3");
+    assert_eq!(h.curator_settings(1).await.unwrap().0, "openai/test");
+    h.command(1, 2, "model", &json!([{"name":"kind","value":"curator"},{"name":"model","value":"none"}])).await.unwrap();
+    assert_eq!(h.curator_settings(1).await.unwrap().0, "zai/glm-5.3");
+    h.command(1, 2, "model", &json!([{"name":"kind","value":"curator"},{"name":"model","value":"default"}])).await.unwrap();
+    h.command(1, 2, "reasoning", &json!([{"name":"kind","value":"curator"},{"name":"level","value":"medium"}])).await.unwrap();
+    assert_eq!(h.curator_settings(1).await.unwrap(), ("openai/test".into(), "medium".into()));
+    assert_eq!(h.discord.models.kind_model(1, "curator").as_deref(), Some("openai/test"));
+    assert!(mock.requests.lock().await.is_empty());
+    server.abort();
+}

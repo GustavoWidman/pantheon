@@ -211,6 +211,7 @@ impl Harness {
                     config.agent.request_backoff_seconds,
                 )?
                 .with_auth(config.auth.clone())
+                .with_zai(config.zai.clone())?
                 .with_catalog(discord.models.clone()),
             web: crate::web::Web::new(config.state_dir.join("web/cache"), config.web.clone())?,
             browser: BrowserManager::new(
@@ -439,11 +440,12 @@ impl Harness {
             &self.config.agent.reasoning,
         )?;
         let selected = self.store.curator_model(channel)?;
-        let model = match selected.as_deref() {
-            Some("none") => main.0.clone(),
-            Some(m) => m.to_owned(),
-            None => self.config.curator.model.clone().unwrap_or(main.0.clone()),
-        };
+        let model = crate::curator::effective_model(
+            &main.0,
+            &self.config.agent.model,
+            self.config.curator.model.as_deref(),
+            selected.as_deref(),
+        )?;
         let selected = self.store.reasoning_override(channel, "curator")?;
         let inherited = self.discord.models.reasoning(&model, &main.1);
         let requested = match selected.as_deref() {
@@ -1046,13 +1048,34 @@ impl Harness {
                     {
                         let meta: Value = serde_json::from_str(&output)?;
                         let path = tools::string(&meta, "path")?;
-                        let bytes = tokio::fs::read(path).await?;
-                        ensure!(
-                            bytes.len() <= 12_000_000,
-                            "screenshot too large for provider input"
-                        );
-                        use base64::Engine;
-                        Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+                        if vendor == "zai" {
+                            let (notice, parts) = self
+                                .attachments
+                                .inspect(
+                                    std::path::Path::new(path),
+                                    &run.settings.0,
+                                    None,
+                                    crate::attachments::budget_with_media(
+                                        &run.settings.0,
+                                        &run.history,
+                                        &run.media,
+                                    ),
+                                    &run.cancel,
+                                )
+                                .await?;
+                            run.media.extend(parts);
+                            run.media
+                                .push(Provider::user(vendor, &notice)["content"][0].clone());
+                            None
+                        } else {
+                            let bytes = tokio::fs::read(path).await?;
+                            ensure!(
+                                bytes.len() <= 12_000_000,
+                                "screenshot too large for provider input"
+                            );
+                            use base64::Engine;
+                            Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+                        }
                     } else {
                         None
                     };
@@ -1213,7 +1236,8 @@ impl Harness {
                 value
             }
             "mcp" => {
-                self.mcp
+                let mut value = self
+                    .mcp
                     .execute(
                         run.channel,
                         run.child,
@@ -1221,7 +1245,11 @@ impl Harness {
                         a,
                         &run.cancel,
                     )
-                    .await?
+                    .await?;
+                if run.settings.0.starts_with("zai/") {
+                    crate::provider::zai::annotate_mcp(&mut value);
+                }
+                value
             }
             "zoom" => {
                 return run
@@ -1390,12 +1418,7 @@ impl Harness {
                 }
             }
             "web_search" => {
-                let model = self
-                    .config
-                    .web
-                    .search_model
-                    .as_deref()
-                    .unwrap_or(&run.settings.0);
+                let model = self.web.search_model(&run.settings.0);
                 let limit = a
                     .get("max_results")
                     .map(|_| tools::number(a, "max_results"))
@@ -2190,11 +2213,12 @@ impl Harness {
                             "default" => None,
                             _ => Some(self.discord.models.resolve(provider, id)?),
                         };
-                        let effective = match target.as_deref() {
-                            Some("none") => model.clone(),
-                            Some(m) => m.to_owned(),
-                            None => self.config.curator.model.clone().unwrap_or(model.clone()),
-                        };
+                        let effective = crate::curator::effective_model(
+                            &model,
+                            &self.config.agent.model,
+                            self.config.curator.model.as_deref(),
+                            target.as_deref(),
+                        )?;
                         let preferred = self.discord.models.reasoning(&effective, &reasoning);
                         self.reasoning_for_model(&effective, &preferred)?;
                         self.store.set_curator_model(channel, target.as_deref())?;
@@ -2277,11 +2301,12 @@ impl Harness {
                     "compact" => self
                         .store
                         .compactor_model(channel, &self.config.agent.compactor_model)?,
-                    "curator" => match self.store.curator_model(channel)?.as_deref() {
-                        Some("none") => model.clone(),
-                        Some(m) => m.to_owned(),
-                        None => self.config.curator.model.clone().unwrap_or(model.clone()),
-                    },
+                    "curator" => crate::curator::effective_model(
+                        &model,
+                        &self.config.agent.model,
+                        self.config.curator.model.as_deref(),
+                        self.store.curator_model(channel)?.as_deref(),
+                    )?,
                     _ => model.clone(),
                 };
                 if let Some(level) = args["level"].as_str() {
@@ -3049,6 +3074,9 @@ mod tests {
     ) -> axum::response::Response {
         use axum::response::IntoResponse;
         let streaming = body["stream"] == true;
+        let zai = body["model"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("glm-"));
         let first = {
             let mut requests = state.requests.lock().await;
             let first = requests.is_empty();
@@ -3065,7 +3093,16 @@ mod tests {
             .await
             .pop_front()
             .expect("unexpected provider request");
-        if streaming {
+        if streaming && zai {
+            let choice = &response["choices"][0];
+            let mut delta = choice["message"].clone();
+            if let Some(calls) = delta["tool_calls"].as_array_mut() {
+                for (index, call) in calls.iter_mut().enumerate() {
+                    call["index"] = json!(index);
+                }
+            }
+            ([(axum::http::header::CONTENT_TYPE,"text/event-stream")],format!("data: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"index":0,"delta":delta,"finish_reason":choice["finish_reason"]}],"usage":response["usage"]}))).into_response()
+        } else if streaming {
             axum::response::Response::new(axum::body::Body::from(format!(
                 "data: {}\n\n",
                 json!({"type":"response.completed","response":response})
@@ -3107,7 +3144,12 @@ mod tests {
             workspace: directory.path().into(),
             ..Default::default()
         };
-        config.agent.model = format!("{vendor}/test");
+        let model = if vendor == "zai" {
+            "zai/glm-5.3".to_owned()
+        } else {
+            format!("{vendor}/test")
+        };
+        config.agent.model = model.clone();
         let discord = Arc::new(Discord::new("mock-token".into(), 1, vec![2]).unwrap());
         let mut h = Harness::new(config, discord, CancellationToken::new()).unwrap();
         Arc::get_mut(&mut h).unwrap().provider = Provider::mock(format!("http://{address}/"));
@@ -3137,7 +3179,14 @@ mod tests {
             child: false,
             memory: c,
             cancel: h.shutdown.child_token(),
-            settings: (format!("{vendor}/test"), "medium".into()),
+            settings: (
+                model,
+                if vendor == "zai" {
+                    "low".into()
+                } else {
+                    "medium".into()
+                },
+            ),
             history: Provider::start(vendor, &view, &input.text),
             context: crate::ui::ReplyContext::request(&input.id),
             inputs: vec![input.id],
@@ -3154,6 +3203,9 @@ mod tests {
         (directory, h, run, mock, server)
     }
     fn final_response(vendor: &str, text: &str) -> Value {
+        if vendor == "zai" {
+            return json!({"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":text}}],"usage":{}});
+        }
         if vendor == "openai" {
             json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}],"usage":{"input_tokens_details":{"cached_tokens":123}}})
         } else {
@@ -4758,4 +4810,84 @@ for line in sys.stdin:
     include!("runtime_attachment_tests.rs");
     include!("runtime_curator_tests.rs");
     include!("runtime_request_retry_tests.rs");
+    #[tokio::test]
+    async fn zai_tool_loop_preserves_native_reasoning_but_never_publishes_or_logs_it() {
+        let calls = json!({"choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","content":"Working","reasoning_content":"private-glm-native-reasoning","tool_calls":[{"id":"a","type":"function","function":{"name":"read","arguments":"{\"path\":\"picture.png\"}"}},{"id":"b","type":"function","function":{"name":"write","arguments":"{\"path\":\"result.txt\",\"text\":\"verified\"}"}}]}}],"usage":{"prompt_tokens":20,"completion_tokens":10}});
+        for model in ["zai/glm-5.3", "zai/glm-5.3-flash"] {
+            let (dir, mut h, mut run, mock, server) =
+                fixture("zai", vec![calls.clone(), final_response("zai", "Done")]).await;
+            std::fs::write(dir.path().join("picture.png"), b"image-fixture").unwrap();
+            Arc::get_mut(&mut h).unwrap().config.agent.show_reasoning = true;
+            run.settings.0 = model.into();
+            let memory = run.memory.clone();
+            let task = tokio::spawn(h.clone().run_agent(run));
+            mock.started.notified().await;
+            mock.release.notify_one();
+            task.await.unwrap().unwrap();
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("result.txt")).unwrap(),
+                "verified"
+            );
+            let requests = mock.requests.lock().await;
+            assert_eq!(requests.len(), 2);
+            let messages = requests[1]["messages"].as_array().unwrap();
+            assert_eq!(
+                messages[2]["reasoning_content"],
+                "private-glm-native-reasoning"
+            );
+            assert_eq!(messages[3]["tool_call_id"], "a");
+            assert_eq!(messages[4]["tool_call_id"], "b");
+            if model.ends_with("flash") {
+                assert!(
+                    messages.last().unwrap()["content"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|v| v["type"] == "image_url")
+                );
+            } else {
+                assert!(
+                    messages[3]["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("have NOT been viewed")
+                );
+                assert!(!requests[1].to_string().contains("data:image"));
+            }
+            assert!(
+                !memory
+                    .memory
+                    .lock()
+                    .await
+                    .export_html()
+                    .contains("private-glm-native-reasoning")
+            );
+            assert!(
+                drain(&h)
+                    .iter()
+                    .all(|out| !out.text.contains("private-glm-native-reasoning"))
+            );
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn zai_malformed_tool_batch_executes_nothing_and_does_not_checkpoint_native_state() {
+        let response = json!({"choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"reasoning_content":"private-malformed-state","tool_calls":[{"id":"a","type":"function","function":{"name":"write","arguments":"{\"path\":\"must-not-exist\",\"text\":\"bad\"}"}},{"id":"b","type":"function","function":{"name":"write","arguments":"{"}}]}}]});
+        let (dir, h, run, mock, server) = fixture("zai", vec![response]).await;
+        let memory = run.memory.clone();
+        let task = tokio::spawn(h.clone().run_agent(run));
+        mock.started.notified().await;
+        mock.release.notify_one();
+        assert!(task.await.unwrap().is_err());
+        assert!(!dir.path().join("must-not-exist").exists());
+        assert!(
+            !memory
+                .memory
+                .lock()
+                .await
+                .export_html()
+                .contains("private-malformed-state")
+        );
+        server.abort();
+    }
 }
