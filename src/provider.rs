@@ -5,6 +5,8 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::time::Duration;
 
+#[path = "provider_codex.rs"]
+pub(crate) mod codex;
 #[path = "provider_retry.rs"]
 pub(crate) mod retry;
 #[path = "provider_zai.rs"]
@@ -277,6 +279,7 @@ impl Provider {
                                 .as_str()
                                 .map(str::to_owned),
                             adaptive_thinking: false,
+                            codex: Some(codex::Capabilities::from_metadata(m)),
                             source: "Codex /models".into(),
                             observed_at: Some(crate::store::now()),
                         })
@@ -372,6 +375,7 @@ impl Provider {
                         efforts,
                         default_effort: None,
                         adaptive_thinking,
+                        codex: None,
                         source: format!("{vendor} /v1/models"),
                         observed_at: Some(crate::store::now()),
                     });
@@ -512,6 +516,9 @@ impl Provider {
         if vendor == "zai" {
             return zai::request_body(id, reasoning, system, history, tools);
         }
+        if model.starts_with("codex/") {
+            return codex::Request::standard(id, reasoning, system, history, tools)?.value();
+        }
         if vendor == "openai" {
             let mut input = vec![json!({"role":"system","content":system})];
             input.extend_from_slice(history);
@@ -527,31 +534,11 @@ impl Provider {
                     }
                 }
             }
-            let codex = model.starts_with("codex/");
-            let converted:Vec<Value>=tools.iter().map(|t|json!({"type":"function","name":if codex && t["name"] == "web_search" {json!("pantheon_web_search")} else {t["name"].clone()},"description":t["description"],"parameters":t["input_schema"],"strict":false})).collect();
+            let converted:Vec<Value>=tools.iter().map(|t|json!({"type":"function","name":t["name"],"description":t["description"],"parameters":t["input_schema"],"strict":false})).collect();
             let mut body = json!({"model":id,"store":false,"include":["reasoning.encrypted_content"],"input":input,"tools":converted,"max_output_tokens":16384});
-            // None is usable for models without reasoning; all_turns preserves the prefix after steering.
             if reasoning != "none" {
                 body["reasoning"] =
                     json!({"effort":reasoning,"context":"all_turns","summary":"auto"});
-            }
-            if codex {
-                body["instructions"] = json!(system);
-                body["input"] = json!(history);
-                // The subscription backend is SSE-only and owns output limits.
-                body["stream"] = json!(true);
-                body.as_object_mut().unwrap().remove("max_output_tokens");
-                // Native Codex follows its own cache contract. Keep view content
-                // exact, stripping only unsupported API-specific block metadata.
-                for item in body["input"].as_array_mut().unwrap() {
-                    if let Some(blocks) = item.get_mut("content").and_then(Value::as_array_mut) {
-                        for block in blocks {
-                            if let Some(map) = block.as_object_mut() {
-                                map.remove("prompt_cache_breakpoint");
-                            }
-                        }
-                    }
-                }
             }
             Ok(body)
         } else {
@@ -619,15 +606,23 @@ impl Provider {
             body["max_tokens"] = json!(self.zai.max_output_tokens);
         }
         let value = self.send_body_observed(model, &body, submitted).await?;
-        let mut response = Self::parse(vendor, value)?;
         if model.starts_with("codex/") {
-            for call in &mut response.calls {
-                if call.name == "pantheon_web_search" {
-                    call.name = "web_search".into();
-                }
-            }
+            codex::parse(value)
+        } else {
+            Self::parse(vendor, value)
         }
-        Ok(response)
+    }
+    fn codex_capabilities(&self, model: &str) -> codex::Capabilities {
+        self.catalog
+            .metadata(model)
+            .and_then(|m| m.codex)
+            .unwrap_or_else(|| {
+                model
+                    .strip_prefix("codex/")
+                    .and_then(|slug| self.codex.model_metadata(slug))
+                    .map(|m| codex::Capabilities::from_metadata(&m))
+                    .unwrap_or_default()
+            })
     }
     async fn send_body(&self, model: &str, body: &Value) -> Result<Value> {
         self.send_body_observed(model, body, None).await
@@ -642,8 +637,10 @@ impl Provider {
         let is_codex = model.starts_with("codex/");
         if is_codex {
             let affinity = self.cache_affinity.to_string();
-            let mut body = body.clone();
-            body["prompt_cache_key"] = json!(affinity);
+            let capabilities = self.codex_capabilities(model);
+            let wire = codex::Request::prepare(body, capabilities, self.cache_affinity)?;
+            // Keep diagnostic shape structural; serialization uses the typed request, not Value.
+            let body = wire.value()?;
             let mut credentials = self.codex.credentials(None).await?;
             let mut refreshed = false;
             for attempt in 1..=self.retries.max_attempts {
@@ -672,7 +669,7 @@ impl Provider {
                 }
                 let result = self
                     .receive_model_response(
-                        request.json(&body),
+                        wire.apply_mode_header(request).json(&wire),
                         model,
                         attempt,
                         true,
@@ -1522,9 +1519,28 @@ mod tests {
             assert_eq!(sent["store"], false);
             assert!(sent.get("previous_response_id").is_none());
         }
-        assert_eq!(requests[0].1["input"], json!(fresh));
-        assert_eq!(requests[1].1["input"], json!(history));
-        assert_eq!(requests[2].1["input"], json!(fresh));
+        let projected = |history: &[Value]| {
+            history
+                .iter()
+                .map(|item| {
+                    let mut item = item.clone();
+                    if item.get("type").is_none() {
+                        item["type"] = json!("message");
+                    }
+                    item
+                })
+                .collect::<Vec<_>>()
+        };
+        for (index, original) in [(0, &fresh), (1, &history), (2, &fresh)] {
+            let input = requests[index].1["input"].as_array().unwrap();
+            assert_eq!(input[0]["role"], "developer");
+            assert_eq!(input[0]["content"][0]["text"], "fixed");
+            assert_eq!(&input[1..], projected(original));
+        }
+        assert_eq!(
+            requests[0].1, requests[2].1,
+            "durable scope reconstructs the same request"
+        );
         assert_ne!(requests[3].0["session-id"], requests[0].0["session-id"]);
         assert_eq!(
             requests[3].1["prompt_cache_key"],
@@ -1961,7 +1977,7 @@ mod tests {
         std::fs::write(d.path().join("models_cache.json"), &cache).unwrap();
         let app=Router::new().route("/models",get(|headers:HeaderMap,Query(query):Query<std::collections::HashMap<String,String>>|async move {
             assert_eq!(headers["authorization"],"Bearer private-test-token");assert_eq!(headers["chatgpt-account-id"],"test-account");assert_eq!(query["client_version"],"0.160.0");
-            Json(json!({"models":[{"slug":"visible","visibility":"list","supported_reasoning_levels":[{"effort":"low"},{"effort":"max"}],"default_reasoning_level":"low"},{"slug":"hidden","visibility":"hide"}]}))
+            Json(json!({"models":[{"slug":"visible","visibility":"list","supported_reasoning_levels":[{"effort":"low"},{"effort":"max"}],"default_reasoning_level":"low","use_responses_lite":true,"supports_reasoning_summary_parameter":false},{"slug":"hidden","visibility":"hide"}]}))
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1977,6 +1993,18 @@ mod tests {
             .unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].efforts, vec!["low", "max"]);
+        assert_eq!(
+            models[0].codex.as_ref().unwrap().use_responses_lite,
+            Some(true)
+        );
+        assert_eq!(
+            models[0]
+                .codex
+                .as_ref()
+                .unwrap()
+                .supports_reasoning_summary_parameter,
+            Some(false)
+        );
         let catalog = crate::models::Catalog::default();
         catalog.replace("codex", models);
         assert_eq!(
@@ -2052,8 +2080,11 @@ mod tests {
         let body =
             Provider::request_body("codex/gpt-5.6", "high", "fixed", &history, &tools).unwrap();
         assert_eq!(model_parts("codex/gpt-5.6").unwrap(), ("openai", "gpt-5.6"));
-        assert_eq!(body["instructions"], "fixed");
-        assert_eq!(body["input"], json!(history));
+        assert!(body.get("instructions").is_none());
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][1], history[0]);
+        assert_eq!(body["input"][2]["content"], history[1]["content"]);
+        assert_eq!(body["input"][2]["type"], "message");
         assert_eq!(body["tools"][0]["name"], "pantheon_web_search");
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);

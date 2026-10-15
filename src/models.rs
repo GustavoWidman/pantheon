@@ -16,6 +16,9 @@ pub struct Model {
     pub default_effort: Option<String>,
     #[serde(default)]
     pub adaptive_thinking: bool,
+    /// Subscription-only request capabilities, not inferred from model names.
+    #[serde(default)]
+    pub(crate) codex: Option<crate::provider::codex::Capabilities>,
     #[serde(default)]
     pub source: String,
     #[serde(default)]
@@ -29,6 +32,7 @@ impl Model {
             efforts: vec![],
             default_effort: None,
             adaptive_thinking: false,
+            codex: None,
             source: "configured fallback".into(),
             observed_at: None,
         }
@@ -509,6 +513,7 @@ fn codex_cache(auth: &AuthConfig) -> Vec<Model> {
                     .collect(),
                 default_effort: m["default_reasoning_level"].as_str().map(str::to_owned),
                 adaptive_thinking: false,
+                codex: Some(crate::provider::codex::Capabilities::from_metadata(m)),
                 source: "Codex CLI cache".into(),
                 observed_at: value["fetched_at"]
                     .as_str()

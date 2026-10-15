@@ -158,7 +158,10 @@ mod request_retries {
         for (headers, body, _) in requests.iter() {
             assert_eq!(headers["session-id"], identity.to_string());
             assert_eq!(body["prompt_cache_key"], identity.to_string());
-            assert_eq!(body["input"], json!(history));
+            assert_eq!(body["input"][0]["role"], "developer");
+            assert_eq!(body["input"][0]["content"][0]["text"], "stable system");
+            assert_eq!(body["input"].as_array().unwrap()[1..], history);
+            assert!(!headers.contains_key(crate::provider::codex::LITE_HEADER));
         }
         assert!(requests[1].2.duration_since(requests[0].2) >= Duration::from_millis(30));
         assert!(requests[2].2.duration_since(requests[1].2) >= Duration::from_millis(60));

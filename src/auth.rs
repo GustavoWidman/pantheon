@@ -32,20 +32,7 @@ impl AuthConfig {
         let Some(slug) = model.strip_prefix("codex/") else {
             return Ok(requested.into());
         };
-        let metadata = (|| -> Option<Value> {
-            let file = std::fs::File::open(self.home().ok()?.join("models_cache.json")).ok()?;
-            let mut bytes = Vec::new();
-            file.take(4_194_305).read_to_end(&mut bytes).ok()?;
-            if bytes.len() > 4_194_304 {
-                return None;
-            }
-            let value: Value = serde_json::from_slice(&bytes).ok()?;
-            value["models"]
-                .as_array()?
-                .iter()
-                .find(|m| m["slug"] == slug)
-                .cloned()
-        })();
+        let metadata = self.codex_model_metadata(slug);
         let levels = metadata
             .as_ref()
             .and_then(|m| m["supported_reasoning_levels"].as_array())
@@ -79,6 +66,21 @@ impl AuthConfig {
             "unsupported reasoning effort for {model}; supported: {}",
             levels.join(", ")
         )
+    }
+    /// Read only bounded non-secret model metadata; never opens auth.json.
+    pub(crate) fn codex_model_metadata(&self, slug: &str) -> Option<Value> {
+        let file = std::fs::File::open(self.home().ok()?.join("models_cache.json")).ok()?;
+        let mut bytes = Vec::new();
+        file.take(4_194_305).read_to_end(&mut bytes).ok()?;
+        if bytes.len() > 4_194_304 {
+            return None;
+        }
+        let value: Value = serde_json::from_slice(&bytes).ok()?;
+        value["models"]
+            .as_array()?
+            .iter()
+            .find(|m| m["slug"] == slug)
+            .cloned()
     }
     pub fn cli(&self) -> PathBuf {
         self.codex_cli
@@ -196,6 +198,9 @@ pub(crate) struct CodexAuth {
 impl CodexAuth {
     pub fn reasoning_for_model(&self, model: &str, requested: &str) -> Result<String> {
         self.config.reasoning_for_model(model, requested)
+    }
+    pub(crate) fn model_metadata(&self, slug: &str) -> Option<Value> {
+        self.config.codex_model_metadata(slug)
     }
     pub fn new(config: AuthConfig) -> Self {
         Self {
