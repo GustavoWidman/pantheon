@@ -868,10 +868,18 @@ impl Harness {
             .provider
             .clone()
             .with_cache_affinity(self.store.cache_affinity(&run.owner)?);
-        for step in 0..self.config.agent.max_steps {
+        let mut next_step = 0;
+        loop {
             if run.cancel.is_cancelled() {
                 bail!("cancelled");
             }
+            // Zero means no cycle cap, not a usize::MAX-sized iteration range.
+            // Keep cancellation and all steering/settlement on the normal path.
+            if self.config.agent.max_steps != 0 && next_step >= self.config.agent.max_steps {
+                bail!("maximum tool steps reached");
+            }
+            let step = next_step;
+            next_step = next_step.saturating_add(1);
             // Complete the preceding tool batch before accepting newer steering.
             if !run.media.is_empty() {
                 let mut item = Provider::user(
@@ -1088,7 +1096,6 @@ impl Harness {
                 }
             }
         }
-        bail!("maximum tool steps reached")
     }
     async fn log_run(&self, run: &mut Run, kind: Kind, text: &str) -> Result<()> {
         if let Some(trace) = run.trace.as_mut() {
@@ -3160,6 +3167,91 @@ mod tests {
             json!({"stop_reason":"end_turn","content":[{"type":"text","text":text}],"usage":{"cache_read_input_tokens":123}})
         }
     }
+    fn step_response(index: usize) -> Value {
+        // A deliberately invalid, side-effect-free tool still produces a real
+        // tool result and forces the actual runtime/provider loop to continue.
+        json!({"status":"completed","output":[{"type":"function_call","call_id":format!("step-{index}"),"name":"unknown_test_tool","arguments":"{}"}]})
+    }
+
+    #[tokio::test]
+    async fn unlimited_agent_steps_pass_128_cycles_and_settle_normally() {
+        let mut responses: Vec<_> = (0..129).map(step_response).collect();
+        responses.push(final_response("openai", "finished after 129 tool batches"));
+        let (_dir, h, mut run, mock, server) = fixture("openai", responses).await;
+        assert_eq!(h.config.agent.max_steps, 0);
+        mock.release.notify_one();
+        let result = tokio::time::timeout(
+            Duration::from_secs(120),
+            h.run_steps(&mut run, "openai", &[], "test", "unlimited"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(result.contains("finished after 129 tool batches"));
+        assert_eq!(run.steps, 130);
+        assert_eq!(mock.requests.lock().await.len(), 130);
+        let messages = drain(&h);
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.text.contains("finished after 129 tool batches"))
+        );
+        assert!(h.store.queued(1).unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn explicit_agent_step_cap_stops_at_exact_model_cycle_count() {
+        for cap in [1, 128] {
+            let responses: Vec<_> = (0..=cap).map(step_response).collect();
+            let (_dir, mut h, mut run, mock, server) = fixture("openai", responses).await;
+            Arc::get_mut(&mut h).unwrap().config.agent.max_steps = cap;
+            mock.release.notify_one();
+            let error = tokio::time::timeout(
+                Duration::from_secs(120),
+                h.run_steps(&mut run, "openai", &[], "test", "capped"),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert_eq!(error.to_string(), "maximum tool steps reached");
+            assert_eq!(run.steps, cap);
+            assert_eq!(mock.requests.lock().await.len(), cap);
+            assert_eq!(mock.responses.lock().await.len(), 1);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn unlimited_agent_steps_cancel_in_flight_on_stop_or_shutdown() {
+        for shutdown in [false, true] {
+            let (_dir, h, mut run, mock, server) =
+                fixture("openai", vec![final_response("openai", "must not finish")]).await;
+            let cancel = run.cancel.clone();
+            let runner = h.clone();
+            let task = tokio::spawn(async move {
+                runner
+                    .run_steps(&mut run, "openai", &[], "test", "cancel")
+                    .await
+            });
+            mock.started.notified().await;
+            if shutdown {
+                h.shutdown.cancel();
+            } else {
+                cancel.cancel();
+            }
+            let error = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.to_string(), "cancelled");
+            assert_eq!(mock.requests.lock().await.len(), 1);
+            assert_eq!(mock.responses.lock().await.len(), 1);
+            server.abort();
+        }
+    }
+
     #[tokio::test]
     async fn codex_runtime_routes_root_worker_and_compactor_to_durable_scopes() {
         let (dir, mut h, mut run, mock, server) =

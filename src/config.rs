@@ -66,6 +66,7 @@ pub struct AgentConfig {
     pub reasoning: String,
     pub view_bytes: usize,
     pub context_windows: BTreeMap<String, u64>,
+    /// Maximum model-response cycles per run; zero disables this cap.
     pub max_steps: usize,
     pub max_subagents: usize,
     pub agent_idle_seconds: u64,
@@ -106,7 +107,7 @@ impl Default for AgentConfig {
             reasoning: "medium".into(),
             view_bytes: 128_000,
             context_windows: BTreeMap::new(),
-            max_steps: 128,
+            max_steps: 0,
             max_subagents: 8,
             agent_idle_seconds: 3600,
             request_timeout_seconds: 300,
@@ -138,9 +139,7 @@ impl Config {
             "view_bytes must be >= 1024"
         );
         ensure!(
-            config.agent.max_steps > 0
-                && config.agent.max_subagents > 0
-                && config.agent.max_shell_jobs > 0,
+            config.agent.max_subagents > 0 && config.agent.max_shell_jobs > 0,
             "agent limits must be positive"
         );
         ensure!(
@@ -234,6 +233,41 @@ pub fn validate_reasoning(s: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_step_cap_defaults_to_unlimited_and_preserves_positive_configs() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pantheon.toml");
+        let base = "[discord]\napplication_id=1\nallowed_users=[2]\n";
+        assert_eq!(AgentConfig::default().max_steps, 0);
+        for (setting, expected) in [
+            ("", 0),
+            ("max_steps=0", 0),
+            ("max_steps=1", 1),
+            ("max_steps=128", 128),
+        ] {
+            std::fs::write(&path, format!("{base}[agent]\n{setting}\n")).unwrap();
+            let config = Config::load(&path).unwrap();
+            assert_eq!(config.agent.max_steps, expected);
+            assert_eq!(config.curator.max_steps, 8);
+            let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(roundtrip.agent.max_steps, expected);
+        }
+        for setting in [
+            "max_steps=-1",
+            "max_steps='none'",
+            "max_subagents=0",
+            "max_shell_jobs=0",
+        ] {
+            std::fs::write(&path, format!("{base}[agent]\n{setting}\n")).unwrap();
+            assert!(Config::load(&path).is_err(), "{setting}");
+        }
+        // The curator deliberately retains its independent finite bounds.
+        for cap in [0, 17] {
+            std::fs::write(&path, format!("{base}[curator]\nmax_steps={cap}\n")).unwrap();
+            assert!(Config::load(&path).is_err());
+        }
+    }
 
     #[test]
     fn claude_is_default_off_and_its_limits_are_validated_without_resolving_a_cli() {
