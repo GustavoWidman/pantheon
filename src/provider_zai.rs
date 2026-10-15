@@ -57,7 +57,7 @@ pub fn supports_images(model: &str) -> bool {
 pub fn catalog() -> Vec<crate::models::Model> {
     MODELS.into_iter().map(|id| crate::models::Model {
         id: id.into(), name: id.into(), efforts: vec!["low".into(), "high".into(), "max".into()],
-        default_effort: Some("max".into()), adaptive_thinking: false,
+        default_effort: Some("max".into()), adaptive_thinking: false, codex: None,
         source: "Z.ai current model documentation: https://docs.z.ai/devpack/latest-model (static allowlist, not account access)".into(),
         observed_at: None,
     }).collect()
