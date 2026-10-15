@@ -12,7 +12,9 @@ model = "openai/gpt-5.6"
 compactor_model = "openai/gpt-5-mini"
 reasoning = "medium"
 view_bytes = 128000
-max_steps = 128
+# Model-response cycles per run (root and workers), not individual tool calls.
+# 0 disables the cap (default); positive values retain a finite per-run cap.
+max_steps = 0
 max_subagents = 8
 agent_idle_seconds = 3600
 request_timeout_seconds = 300
