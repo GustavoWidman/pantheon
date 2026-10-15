@@ -4,7 +4,7 @@ fn config_and_models_are_explicit() {
     assert!(!Config::default().enabled);
     assert!(
         Config {
-            max_in_flight: 0,
+            max_in_flight: Some(0),
             ..Default::default()
         }
         .validate()
@@ -263,13 +263,16 @@ async fn shared_admission_and_cancel_release_permit() {
     let provider = super::super::Provider::mock(url)
         .with_zai(Config {
             enabled: true,
-            max_in_flight: 1,
+            max_in_flight: Some(1),
             max_output_tokens: 100,
         })
         .unwrap();
     let first = provider.clone();
     let second = provider.clone();
-    assert!(Arc::ptr_eq(&first.zai_slots, &second.zai_slots));
+    assert!(Arc::ptr_eq(
+        first.zai_slots.as_ref().unwrap(),
+        second.zai_slots.as_ref().unwrap()
+    ));
     let call = |provider: super::super::Provider| {
         tokio::spawn(async move {
             provider
@@ -295,12 +298,12 @@ async fn shared_admission_and_cancel_release_permit() {
     let _ = waiting.await;
     active.abort();
     let _ = active.await;
-    assert_eq!(provider.zai_slots.available_permits(), 1);
+    assert_eq!(provider.zai_slots.as_ref().unwrap().available_permits(), 1);
     let resumed = call(provider.clone());
     received.recv().await.unwrap();
     release.notify_waiters();
     assert!(resumed.await.unwrap().is_ok());
-    assert_eq!(provider.zai_slots.available_permits(), 1);
+    assert_eq!(provider.zai_slots.as_ref().unwrap().available_permits(), 1);
     task.abort();
 }
 #[tokio::test]
@@ -355,6 +358,12 @@ async fn http_errors_are_redacted_and_retry_is_bounded() {
         );
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let provider = super::super::Provider::mock(url)
+            .with_zai(Config {
+                enabled: true,
+                max_in_flight: Some(2),
+                ..Default::default()
+            })
+            .unwrap()
             .with_request_retries(2, 1)
             .unwrap();
         let error = provider
@@ -371,7 +380,180 @@ async fn http_errors_are_redacted_and_retry_is_bounded() {
                 2
             }
         );
-        assert_eq!(provider.zai_slots.available_permits(), 2);
+        assert_eq!(provider.zai_slots.as_ref().unwrap().available_permits(), 2);
         task.abort();
     }
+}
+
+#[test]
+fn concurrency_config_normalizes_unlimited_and_roundtrips() {
+    for (setting, expected) in [
+        ("", None),
+        ("max_in_flight = \"none\"", None),
+        ("max_in_flight = 0", None),
+        ("max_in_flight = 1", Some(1)),
+        ("max_in_flight = 32", Some(32)),
+    ] {
+        let config: Config = toml::from_str(&format!("enabled = true\n{setting}")).unwrap();
+        config.validate().unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.max_in_flight, expected);
+        assert_eq!(config.max_output_tokens, 131072);
+        let serialized = toml::to_string(&config).unwrap();
+        let roundtrip: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(roundtrip.max_in_flight, expected);
+        assert_eq!(roundtrip.max_output_tokens, 131072);
+        assert!(roundtrip.enabled);
+        assert_eq!(serialized.contains("max_in_flight"), expected.is_some());
+    }
+    // Serde callers can also express an actual None/null, without a string sentinel.
+    assert!(
+        serde_json::from_value::<Config>(json!({"max_in_flight":null}))
+            .unwrap()
+            .max_in_flight
+            .is_none()
+    );
+    for value in [
+        "-1",
+        "33",
+        "true",
+        "1.5",
+        "[]",
+        "{}",
+        "\"unlimited\"",
+        "\"2\"",
+        "\"None\"",
+        "none",
+    ] {
+        let parsed = toml::from_str::<Config>(&format!("max_in_flight = {value}"));
+        assert!(
+            parsed.is_err() || parsed.unwrap().validate().is_err(),
+            "{value}"
+        );
+    }
+    for value in [0, 131073] {
+        assert!(
+            Config {
+                max_output_tokens: value,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+    for value in [1, 131072] {
+        Config {
+            max_output_tokens: value,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn unlimited_default_has_no_semaphore_and_admits_more_than_old_cap() {
+    use axum::{Router, http::header, routing::post};
+    use std::sync::Arc;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let handler_release = release.clone();
+    let app = Router::new().route("/", post(move || {
+        let sender = sender.clone();
+        let release = handler_release.clone();
+        async move {
+            sender.send(()).unwrap();
+            release.acquire().await.unwrap().forget();
+            ([(header::CONTENT_TYPE, "text/event-stream")], "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+        }
+    }));
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    assert!(super::super::Provider::new(1).unwrap().zai_slots.is_none());
+    for setting in ["", "max_in_flight = \"none\"", "max_in_flight = 0"] {
+        let config: Config = toml::from_str(&format!("enabled = true\n{setting}")).unwrap();
+        let provider = super::super::Provider::mock(url.clone())
+            .with_zai(config)
+            .unwrap();
+        assert!(provider.zai_slots.is_none());
+        let mut calls = Vec::new();
+        for _ in 0..40 {
+            let provider = provider.clone();
+            calls.push(tokio::spawn(async move {
+                provider.step("zai/glm-5.3", "low", "sys", &[], &[]).await
+            }));
+        }
+        // Every request must reach the fixture while no response has been released.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for _ in 0..40 {
+                received.recv().await.unwrap();
+            }
+        })
+        .await
+        .expect("unlimited calls were incorrectly queued by the harness");
+        release.add_permits(40);
+        for call in calls {
+            assert!(call.await.unwrap().is_ok());
+        }
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn minimal_opt_in_lists_models_and_sends_default_or_custom_output_limit() {
+    use axum::{Json, Router, http::header, routing::post};
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("pantheon.toml");
+    let main_before = crate::config::Config::default().agent.model;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let app = Router::new().route("/", post(move |Json(body): Json<Value>| {
+        let sender = sender.clone();
+        async move {
+            sender.send(body).unwrap();
+            ([(header::CONTENT_TYPE, "text/event-stream")], "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+        }
+    }));
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    for (setting, expected) in [("", 131072), ("max_output_tokens = 777", 777)] {
+        // Existing Discord authorization remains required; the only new opt-in is enabled.
+        std::fs::write(
+            &path,
+            format!(
+                "[discord]\napplication_id=1\nallowed_users=[2]\n[zai]\nenabled=true\n{setting}\n"
+            ),
+        )
+        .unwrap();
+        let config = crate::config::Config::load(&path).unwrap();
+        assert_eq!(config.agent.model, main_before);
+        assert!(config.zai.max_in_flight.is_none());
+        let provider = super::super::Provider::mock(url.clone())
+            .with_zai(config.zai.clone())
+            .unwrap();
+        let models = provider.list_models("zai").await.unwrap();
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            MODELS
+        );
+        for model in ["zai/glm-5.3", "zai/glm-5.3-flash"] {
+            assert!(provider.step(model, "low", "sys", &[], &[]).await.is_ok());
+            let wire = received.recv().await.unwrap();
+            assert_eq!(wire["max_tokens"], expected);
+            assert_eq!(wire["model"], model.strip_prefix("zai/").unwrap());
+        }
+        let serialized = toml::to_string(&config.zai).unwrap();
+        assert_eq!(
+            toml::from_str::<Config>(&serialized)
+                .unwrap()
+                .max_output_tokens,
+            expected
+        );
+    }
+    assert_eq!(
+        request_body("glm-5.3", "low", "sys", &[], &[]).unwrap()["max_tokens"],
+        131072
+    );
+    server.abort();
 }

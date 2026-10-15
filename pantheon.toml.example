@@ -116,5 +116,7 @@ max_research_calls = 4
 # Keep web.search_model on an existing supported hosted-search provider.
 [zai]
 enabled = false
-max_in_flight = 2
-max_output_tokens = 16384
+# Set only enabled=true plus ZAI_API_KEY to opt in; defaults below need no override.
+# max_in_flight = "none" # unlimited (default); omission or 0 also unlimited
+# max_in_flight = 2      # optional finite shared cap, 1–32; bare none is invalid TOML
+# max_output_tokens = 131072 # default for both models; accepted range 1–131072
