@@ -20,6 +20,7 @@ pub struct Provider {
     catalog: std::sync::Arc<crate::models::Catalog>,
     cache_affinity: uuid::Uuid,
     retries: RequestRetries,
+    error_capture: Option<std::path::PathBuf>,
     zai: zai::Config,
     zai_slots: std::sync::Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
@@ -81,6 +82,7 @@ impl Provider {
             catalog: std::sync::Arc::default(),
             cache_affinity: uuid::Uuid::new_v4(),
             retries: RequestRetries::default(),
+            error_capture: None,
             zai: zai::Config::default(),
             zai_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
             #[cfg(test)]
@@ -96,6 +98,7 @@ impl Provider {
             catalog: std::sync::Arc::default(),
             cache_affinity: uuid::Uuid::new_v4(),
             // Existing mocks test one exchange; retry fixtures enable their policy explicitly.
+            error_capture: None,
             retries: RequestRetries {
                 max_attempts: 1,
                 ..Default::default()
@@ -114,6 +117,11 @@ impl Provider {
         self.zai_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(config.max_in_flight));
         self.zai = config;
         Ok(self)
+    }
+    /// Explicitly sensitive selected-error capture; no filesystem I/O while disabled.
+    pub fn with_error_capture(mut self, enabled: bool, state_dir: &std::path::Path) -> Self {
+        self.error_capture = enabled.then(|| state_dir.join("provider-error-events"));
+        self
     }
     pub fn with_auth(mut self, config: AuthConfig) -> Self {
         self.codex = CodexAuth::new(config);
@@ -800,6 +808,7 @@ impl Provider {
     ) -> Result<Value> {
         let mut diagnostic = crate::transport::Exchange::new(model, attempt, self.timeout_seconds);
         diagnostic.request_shape(body);
+        diagnostic.error_capture(self.error_capture.clone());
         let result = async {
             let pending = request.send();
             if let Some(submitted) = submitted {
@@ -1190,7 +1199,10 @@ async fn read_response_observed(
             .is_some_and(|v| v.starts_with("text/event-stream"));
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
-    let mut decoder = SseDecoder::default();
+    let mut decoder = SseDecoder {
+        capture_errors: diagnostic.as_ref().is_some_and(|d| d.capture_enabled()),
+        ..Default::default()
+    };
     let mut received = 0;
     if let Some(d) = diagnostic.as_deref_mut() {
         d.streaming(sse);
@@ -1211,7 +1223,7 @@ async fn read_response_observed(
         if sse {
             let decoded = decoder.feed(&chunk);
             if let Some(d) = diagnostic.as_deref_mut() {
-                d.stage = "sse_decode";
+                d.decoded(&decoded);
                 d.events(
                     decoder.events,
                     decoder.last_event,
@@ -1243,6 +1255,7 @@ async fn read_response_observed(
 struct SseDecoder {
     pending: Vec<u8>,
     data: Vec<String>,
+    capture_errors: bool,
     server_tools: Vec<Value>,
     completed_items: std::collections::BTreeMap<u64, Value>,
     events: usize,
@@ -1342,7 +1355,7 @@ impl SseDecoder {
                         self.completed_items.insert(index, item);
                     }
                     Some("error" | "response.failed" | "response.incomplete") => {
-                        let details = retry::event_details(&event);
+                        let details = retry::event_details_captured(&event, self.capture_errors);
                         return Err(if details.retryable {
                             StreamFailure::Transient(details)
                         } else {
@@ -2293,5 +2306,152 @@ mod tests {
             Provider::request_body("openai/gpt-5.6", "medium", "fixed", &history, &[]).unwrap(),
             supported
         );
+    }
+    #[tokio::test]
+    async fn error_capture_is_opt_in_and_provider_error_stages_cover_both_adapters() {
+        use tracing::instrument::WithSubscriber;
+        let cases = [
+            (
+                false,
+                json!({"type":"error","error":{"code":"novel_rejection","type":"new_class","message":"unknown item reference: sk-secretkey123; api_key=secretvalue"},"response":{"output":[{"text":"private-output"}]}}),
+                "provider_error",
+            ),
+            (
+                false,
+                json!({"type":"response.failed","error":null,"response":{"error":{"code":"novel_rejection","message":"nested explanation"},"output":"private-output"}}),
+                "provider_error",
+            ),
+            (
+                false,
+                json!({"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"},"output":"private-output"}}),
+                "provider_error",
+            ),
+            (
+                true,
+                json!({"error":{"code":1211,"type":"new_class","message":"new GLM explanation"},"private-key":"private-output"}),
+                "provider_error",
+            ),
+        ];
+        for (zai, event, stage) in cases {
+            for enabled in [false, true] {
+                let temporary = tempfile::tempdir().unwrap();
+                let path = temporary.path().join("provider-error-events");
+                let wire = format!("data: {}\n\n", event);
+                let app = axum::Router::new().route(
+                    "/",
+                    axum::routing::get(move || {
+                        let wire = wire.clone();
+                        async move { ([("content-type", "text/event-stream")], wire) }
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let response = reqwest::get(format!("http://{address}/")).await.unwrap();
+                let mut diagnostic = crate::transport::Exchange::new(
+                    if zai { "zai/test" } else { "codex/test" },
+                    1,
+                    None,
+                );
+                diagnostic.error_capture(enabled.then(|| path.clone()));
+                diagnostic.headers(&response);
+                let result = if zai {
+                    super::zai::read_response(response, &mut diagnostic).await
+                } else {
+                    read_response_observed(response, true, Some(&mut diagnostic)).await
+                };
+                let log = DiagnosticLog::default();
+                let error = async { diagnostic.finish(result) }
+                    .with_subscriber(capture(&log))
+                    .await
+                    .unwrap_err();
+                assert!(error.downcast_ref::<StreamFailure>().is_some());
+                let (text, records) = log.records();
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0]["stage"], stage);
+                assert_eq!(
+                    records[0]["private_error_capture"],
+                    if enabled { "saved" } else { "disabled" }
+                );
+                for private in [
+                    "novel_rejection",
+                    "new_class",
+                    "unknown item reference",
+                    "nested explanation",
+                    "new GLM explanation",
+                    "private-output",
+                    "private-key",
+                    "secretvalue",
+                    "secretkey123",
+                ] {
+                    assert!(!text.contains(private), "routine log leaked {private}");
+                    assert!(
+                        !format!("{error:?}").contains(private),
+                        "returned Debug leaked {private}"
+                    );
+                }
+                if enabled {
+                    let snapshots = std::fs::read_dir(&path)
+                        .unwrap()
+                        .filter_map(|e| {
+                            let path = e.unwrap().path();
+                            (path.extension().is_some_and(|ext| ext == "json"))
+                                .then(|| std::fs::read_to_string(path).unwrap())
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(snapshots.len(), 1);
+                    let snapshot = &snapshots[0];
+                    for private in [
+                        "secretvalue",
+                        "secretkey123",
+                        "private-output",
+                        "private-key",
+                    ] {
+                        assert!(!snapshot.contains(private));
+                    }
+                    assert!(snapshot.contains(records[0]["id"].as_str().unwrap()));
+                    if zai {
+                        assert!(snapshot.contains("new GLM explanation"));
+                        assert!(snapshot.contains("1211"));
+                    }
+                } else {
+                    assert!(!path.exists());
+                }
+                task.abort();
+            }
+        }
+    }
+    #[tokio::test]
+    async fn malformed_sse_never_captures_as_a_provider_error() {
+        for wire in [
+            "data: {not-json}\n\n",
+            "data: {\"type\":\"response.completed\"}\n\n",
+        ] {
+            for zai in [false, true] {
+                let mut diagnostic = crate::transport::Exchange::new("test/model", 1, None);
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("capture");
+                diagnostic.error_capture(Some(path.clone()));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let app = axum::Router::new().route(
+                    "/",
+                    axum::routing::get(move || async move {
+                        ([("content-type", "text/event-stream")], wire)
+                    }),
+                );
+                let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let response = reqwest::get(format!("http://{address}/")).await.unwrap();
+                let result = if zai {
+                    super::zai::read_response(response, &mut diagnostic).await
+                } else {
+                    read_response_observed(response, true, Some(&mut diagnostic)).await
+                };
+                assert_eq!(diagnostic.stage, "sse_decode");
+                assert!(diagnostic.finish(result).is_err());
+                assert!(!path.exists());
+                task.abort();
+            }
+        }
     }
 }

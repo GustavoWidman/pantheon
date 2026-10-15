@@ -51,8 +51,9 @@ pub(crate) enum StreamFailure {
     Terminal(StreamEventDetails),
 }
 
-/// Never preserve provider free-text or arbitrary identifiers: providers may echo
-/// prompt text or credentials in even ostensibly structured error fields.
+/// Ordinary metadata never preserves provider free-text or arbitrary identifiers.
+/// Explicitly opted-in selected private fields have a redacted Debug wrapper and
+/// may only be written by the bounded capture path, never logs/retry decisions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StreamEventDetails {
     pub event: &'static str,
@@ -65,6 +66,8 @@ pub(crate) struct StreamEventDetails {
     pub incomplete_reason: Option<&'static str>,
     pub kind: &'static str,
     pub retryable: bool,
+    pub structure: serde_json::Value,
+    pub private_fields: Option<crate::provider_capture::SelectedFields>,
 }
 
 /// Null placeholders are not error objects. Preserve the precedence of actual
@@ -196,7 +199,21 @@ pub(crate) fn event_details(event: &serde_json::Value) -> StreamEventDetails {
         incomplete_reason,
         kind,
         retryable,
+        structure: crate::provider_capture::structure(event, error),
+        private_fields: None,
     }
+}
+pub(crate) fn event_details_captured(
+    event: &serde_json::Value,
+    capture: bool,
+) -> StreamEventDetails {
+    let mut details = event_details(event);
+    if capture {
+        details.private_fields = Some(crate::provider_capture::SelectedFields::new(
+            event_error(event).0,
+        ));
+    }
+    details
 }
 impl fmt::Display for StreamFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

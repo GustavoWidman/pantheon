@@ -12,6 +12,7 @@ pub mod memory;
 pub mod models;
 mod pricing;
 pub mod provider;
+mod provider_capture;
 pub mod runtime;
 pub mod skill_dashboard;
 pub mod skill_library;

@@ -26,6 +26,7 @@ pub(crate) struct Exchange {
     last_event: Option<&'static str>,
     completed_items: usize,
     request_shape: Option<Value>,
+    error_capture: Option<std::path::PathBuf>,
 }
 
 fn milliseconds(duration: std::time::Duration) -> u64 {
@@ -69,9 +70,28 @@ impl Exchange {
             last_event: None,
             completed_items: 0,
             request_shape: None,
+            error_capture: None,
         }
     }
 
+    pub fn error_capture(&mut self, directory: Option<std::path::PathBuf>) {
+        self.error_capture = directory;
+    }
+    pub fn capture_enabled(&self) -> bool {
+        self.error_capture.is_some()
+    }
+    pub fn decoded<T>(&mut self, result: &Result<T>) {
+        self.stage = if result
+            .as_ref()
+            .err()
+            .and_then(|e| e.downcast_ref::<crate::provider::retry::StreamFailure>())
+            .is_some_and(|e| !matches!(e, crate::provider::retry::StreamFailure::PrematureEof))
+        {
+            "provider_error"
+        } else {
+            "sse_decode"
+        };
+    }
     pub fn request_shape(&mut self, body: &Value) {
         let items = body["input"]
             .as_array()
@@ -184,6 +204,7 @@ impl Exchange {
                 "error_source":details.error_source,
                 "status":details.status, "incomplete_reason":details.incomplete_reason,
                 "kind":details.kind, "retryable":details.retryable,
+                "structure":details.structure,
             })),
             "id":self.id,"model":self.model,"attempt":self.attempt,
             "stage":self.stage,"elapsed_ms":milliseconds(self.started.elapsed()),
@@ -209,7 +230,34 @@ impl Exchange {
 
     pub fn finish<T>(&self, result: Result<T>) -> Result<T> {
         result.map_err(|error| {
-            tracing::warn!(diagnostic_id=%self.id, diagnostic=%self.report(&error), "provider request failed");
+            let mut report = self.report(&error);
+            let capture = match (
+                &self.error_capture,
+                error.downcast_ref::<crate::provider::retry::StreamFailure>(),
+            ) {
+                (
+                    Some(directory),
+                    Some(
+                        crate::provider::retry::StreamFailure::Transient(details)
+                        | crate::provider::retry::StreamFailure::Terminal(details),
+                    ),
+                ) => details
+                    .private_fields
+                    .as_ref()
+                    .map(|fields| {
+                        crate::provider_capture::save(
+                            directory,
+                            &self.id,
+                            report["stream_error"].clone(),
+                            fields,
+                        )
+                    })
+                    .unwrap_or("not_applicable"),
+                (Some(_), _) => "not_applicable",
+                (None, _) => "disabled",
+            };
+            report["private_error_capture"] = json!(capture);
+            tracing::warn!(diagnostic_id=%self.id, diagnostic=%report, "provider request failed");
             let message = format!("{error} [diagnostic {}]", self.id);
             error.context(message)
         })
