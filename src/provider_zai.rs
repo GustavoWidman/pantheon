@@ -313,6 +313,8 @@ pub(super) struct Decoder {
     pending: Vec<u8>,
     data: Vec<String>,
     pub events: usize,
+    capture_errors: bool,
+    last_error_event: Option<&'static str>,
     text: String,
     reasoning: String,
     has_reasoning: bool,
@@ -357,7 +359,8 @@ impl Decoder {
     }
     fn event(&mut self, event: Value) -> Result<()> {
         if event.get("error").is_some_and(|e| !e.is_null()) || event["type"] == "error" {
-            let details = retry::event_details(&event);
+            let details = retry::event_details_captured(&event, self.capture_errors);
+            self.last_error_event = Some(details.event);
             return Err(if details.retryable {
                 retry::StreamFailure::Transient(details)
             } else {
@@ -484,7 +487,10 @@ pub(super) async fn read_response(
         .is_some_and(|s| s.starts_with("text/event-stream"));
     diagnostic.streaming(sse);
     let mut stream = response.bytes_stream();
-    let mut decoder = Decoder::default();
+    let mut decoder = Decoder {
+        capture_errors: diagnostic.capture_enabled(),
+        ..Default::default()
+    };
     let mut bytes = Vec::new();
     let mut received = 0usize;
     while let Some(chunk) = stream.next().await {
@@ -499,9 +505,13 @@ pub(super) async fn read_response(
             "Z.ai response exceeded size limit; no tools from this response executed"
         );
         if sse {
-            diagnostic.stage = "sse_decode";
             let result = decoder.feed(&chunk);
-            diagnostic.events(decoder.events, Some("chat.completion.chunk"), 0);
+            diagnostic.decoded(&result);
+            diagnostic.events(
+                decoder.events,
+                decoder.last_error_event.or(Some("chat.completion.chunk")),
+                0,
+            );
             if let Some(value) = result? {
                 return Ok(value);
             }

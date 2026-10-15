@@ -206,6 +206,7 @@ impl Harness {
             attachments,
             attachment_jobs: Mutex::new(HashMap::new()),
             provider: Provider::new(config.agent.request_timeout_seconds)?
+                .with_error_capture(config.agent.provider_error_capture, &config.state_dir)
                 .with_request_retries(
                     config.agent.request_max_attempts,
                     config.agent.request_backoff_seconds,

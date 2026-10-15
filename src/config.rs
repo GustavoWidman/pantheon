@@ -72,6 +72,8 @@ pub struct AgentConfig {
     pub max_subagents: usize,
     pub agent_idle_seconds: u64,
     pub request_timeout_seconds: u64,
+    /// Sensitive selected provider-error diagnostics; disabled unless explicitly opted in.
+    pub provider_error_capture: bool,
     pub request_max_attempts: usize,
     pub request_backoff_seconds: u64,
     pub tool_timeout_seconds: u64,
@@ -113,6 +115,7 @@ impl Default for AgentConfig {
             max_subagents: 8,
             agent_idle_seconds: 3600,
             request_timeout_seconds: 300,
+            provider_error_capture: false,
             request_max_attempts: 4,
             request_backoff_seconds: 2,
             tool_timeout_seconds: 120,
@@ -340,6 +343,7 @@ mod tests {
         let old = "[discord]\napplication_id = 1\nallowed_users = [2]\n";
         std::fs::write(&path, old).unwrap();
         let config = Config::load(&path).unwrap();
+        assert!(!config.agent.provider_error_capture);
         assert_eq!(config.agent.request_max_attempts, 4);
         assert_eq!(config.agent.request_backoff_seconds, 2);
         for (attempts, backoff, valid) in [

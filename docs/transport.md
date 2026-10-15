@@ -12,9 +12,9 @@ For a systemd user service, use `journalctl --user -u SERVICE_NAME`. Services co
 
 The record contains the model, attempt, configured request timeout, time to headers, total elapsed time, HTTP status/version, provider request ID and Cloudflare ray ID when supplied. Body diagnostics include bytes/chunks received, time to first byte, time since the last chunk, parsed SSE event count, the last recognized event type and completed output-item count.
 
-Failure stages distinguish `headers`, `http_status`, `body`, `premature_eof`, `sse_decode`, `json_decode` and `size_limit`. A transport error additionally records reqwest's timeout/connect/body/decode/request flags, bounded underlying error causes, and OS error information when available. Unknown values remain `null`; for example, a clean SSE EOF without a completed response has no reqwest error flags. A body failure after HTTP 200 does not imply successful model completion. Compare elapsed time with the configured timeout and retain the provider request ID when investigating upstream failures.
+Failure stages distinguish `headers`, `http_status`, `body`, `premature_eof`, `provider_error`, `sse_decode`, `json_decode` and `size_limit`. A transport error additionally records reqwest's timeout/connect/body/decode/request flags, bounded underlying error causes, and OS error information when available. Unknown values remain `null`; for example, a clean SSE EOF without a completed response has no reqwest error flags. A body failure after HTTP 200 does not imply successful model completion. Compare elapsed time with the configured timeout and retain the provider request ID when investigating upstream failures.
 
-Request bodies, response bodies, tool arguments, reasoning, credentials, account IDs, cookies and arbitrary headers are excluded. Only selected opaque response identifiers and recognized event names are recorded. URLs are removed from reqwest errors and redacted in transport causes. Payload-decoding errors never render their underlying error strings into the diagnostic record. Cause chains and fields are bounded to keep failures from generating unbounded logs.
+Normal diagnostics exclude request bodies, response bodies, tool arguments, reasoning, credentials, account IDs, cookies and arbitrary headers. The separately gated, sensitive selected-error capture below is not an ordinary log. Only selected opaque response identifiers and recognized event names are recorded. URLs are removed from reqwest errors and redacted in transport causes. Payload-decoding errors never render their underlying error strings into the diagnostic record. Cause chains and fields are bounded to keep failures from generating unbounded logs.
 
 Tools are still dispatched only after a complete provider response. “No tools from this response executed” refers to that failed response; earlier steps can already have completed tool effects.
 
@@ -136,3 +136,68 @@ provider error values are never included. This applies to failures on any
 attempt; successful requests are not logged. Match a later diagnostic ID to its
 exchange before diagnosing a recurring failure. Earlier incident records lack
 these new fields and cannot be retroactively classified.
+
+## Provider errors versus decoding failures
+
+`stage=provider_error` now means that a JSON SSE provider-error event was parsed
+(`error`, `response.failed`, or `response.incomplete` on Responses; an error
+object or `type:error` on Z.ai). It is **not** a JSON decoding failure and does
+not establish a refusal, outage or malformed request. `sse_decode` is reserved
+for malformed stream framing/UTF-8/JSON or an invalid event schema. Existing
+retry classification is unchanged: unfamiliar errors still stop immediately.
+`stream_error.structure` records only fixed field names, presence/JSON kinds,
+lengths/counts and process-local salted fingerprints of short code/type strings.
+It never includes arbitrary keys, messages or values. Fingerprints correlate
+identical code/type strings within one service process, not across restarts,
+and cannot explain an unfamiliar error by themselves.
+
+## Explicitly sensitive private error capture (off by default)
+
+To recover a provider's unfamiliar explanation on a future recurrence, an
+operator may explicitly enable this startup setting:
+
+```toml
+[agent]
+provider_error_capture = true # default false; do not enable casually
+```
+
+This implementation does not enable it for you. It affects inference requests
+sharing the runtime Provider (chat, workers, compactor, hosted search); it is not
+a network trace or capture of HTTP error bodies. Only parsed SSE error events
+are eligible. JSON syntax errors, EOFs and body/header failures have no selected
+provider error to capture. The first selected error object has the same
+precedence as classification (`error`, `response.error`, flat `error` event).
+A flat event's `type:error` is an event marker, not a provider error category.
+
+Each private file contains the diagnostic UUID, timestamp, safe structural
+metadata and **only the selected string `code`, `type`, and `message` fields** (also numeric `code` for provider variants such as Z.ai).
+No whole event, request, response, output/reasoning, tool data, arbitrary property
+names or request/response headers is saved. Common bearer/basic authorization,
+cookie lines, credential assignments, key/JWT patterns, URLs and long opaque
+tokens are conservatively redacted. Fields over 16 KiB are omitted before
+redaction; retained code/type are at most 256 bytes and message at most 4096
+bytes, otherwise omitted. **This is sensitive diagnostic text, not guaranteed
+anonymized data. Providers can echo prompt text, personal information or an
+unrecognized credential format; redaction cannot guarantee their removal.**
+Review files locally before sharing, and do not upload them with ordinary logs.
+
+Storage is `state_dir/provider-error-events/`, created 0700; snapshot and lock
+files are 0600. Existing directories/files with foreign ownership, group/other
+permissions, unexpected entries, hard links or symlinks are rejected. Files are
+created exclusively via the opened directory descriptor, with no symlink
+following or overwriting. A nonblocking lock bounds concurrent writers; capture
+is skipped if busy. Storage admits at most **16 snapshots, 8 KiB per snapshot,
+128 KiB total**, plus one empty lock file. It **stops when full**, never silently
+replaces old evidence. Retention is deliberately operator-owned: inspect and
+remove snapshots promptly after diagnosis; disabling capture stops new writes
+but does not delete existing evidence. Backups inherit this sensitivity. The
+parent state path must be operator-controlled (same-UID attackers are outside
+this filesystem isolation boundary).
+
+Normal logs and user-facing errors still exclude selected text; they record
+only `private_error_capture=disabled|not_applicable|saved|full|busy|size_limit|unavailable`
+(or `unsupported_platform` on non-Unix). No file paths or capture I/O error text
+are logged. Capture failure never replaces the provider failure, changes retry
+eligibility or dispatches partial tools. A saved diagnostic file does not by
+itself prove the provider's explanation is accurate. Unknown historical errors
+cannot be recovered retroactively.

@@ -578,3 +578,28 @@ mod request_retries {
         );
     }
 }
+
+#[test]
+fn private_capture_selection_matches_classification_without_changing_retries() {
+    use super::retry::*;
+    for (event, source, code) in [
+        (json!({"type":"error","error":{"code":"novel","message":"top reason"},"response":{"error":{"code":"ignored"}}}),"error","novel"),
+        (json!({"type":"response.failed","error":null,"response":{"error":{"code":"novel","message":"nested reason"}}}),"response.error","novel"),
+        (json!({"type":"error","error":false,"code":"novel","message":"flat reason"}),"event","novel"),
+        (json!({"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}),"none","")
+    ] {
+        let plain=event_details(&event); let captured=event_details_captured(&event,true);
+        assert_eq!(plain.error_source,source);
+        assert_eq!(captured.retryable,plain.retryable);
+        assert_eq!(captured.code,plain.code);
+        assert_eq!(captured.kind,plain.kind);
+        assert!(plain.private_fields.is_none());
+        assert!(captured.private_fields.is_some());
+        if !code.is_empty() { assert_eq!(plain.code_state,"unrecognized"); }
+        assert!(!format!("{captured:?}").contains("top reason"));
+        assert!(!format!("{captured:?}").contains("nested reason"));
+        assert!(!format!("{captured:?}").contains("flat reason"));
+        let error:anyhow::Error=StreamFailure::Terminal(captured).into();
+        assert!(RequestRetries::default().delay(&error,1).is_none());
+    }
+}
