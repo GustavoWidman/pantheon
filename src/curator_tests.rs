@@ -1005,3 +1005,110 @@ async fn native_research_finishes_the_tool_batch_without_changing_memory_or_cach
     assert!(results[1].0 < second.len() - 1);
     assert_eq!(evidence["content"][1]["type"], "input_file");
 }
+
+#[test]
+fn implicit_glm_maintenance_keeps_baseline_or_requires_explicit_opt_in() {
+    assert_eq!(
+        effective_model("openai/current", "codex/baseline", None, None).unwrap(),
+        "openai/current"
+    );
+    assert_eq!(
+        effective_model("zai/glm-5.3", "codex/baseline", None, None).unwrap(),
+        "codex/baseline"
+    );
+    assert!(
+        effective_model("zai/glm-5.3", "zai/glm-5.3", None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("implicit GLM")
+    );
+    assert_eq!(
+        effective_model("zai/glm-5.3", "zai/glm-5.3", Some("openai/curator"), None).unwrap(),
+        "openai/curator"
+    );
+    assert_eq!(
+        effective_model(
+            "zai/glm-5.3",
+            "codex/baseline",
+            Some("openai/curator"),
+            Some("none")
+        )
+        .unwrap(),
+        "zai/glm-5.3"
+    );
+    assert_eq!(
+        effective_model(
+            "zai/glm-5.3",
+            "codex/baseline",
+            None,
+            Some("zai/glm-5.3-flash")
+        )
+        .unwrap(),
+        "zai/glm-5.3-flash"
+    );
+}
+
+#[tokio::test]
+async fn curator_search_uses_pinned_route_and_unpinned_glm_fails_before_network() {
+    let mut f = Fixture::new();
+    let mut answer = response(vec![], 10);
+    answer["output"].as_array_mut().unwrap().push(json!({"type":"web_search_call","status":"completed","action":{"type":"search","query":"safe synthetic query","sources":[]}}));
+    let server = Mock::new(vec![answer], vec![], usize::MAX).await;
+    let config = CuratorConfig::default();
+    let cancel = CancellationToken::new();
+    let skills = crate::skills::Skills::load(&SkillsConfig::default()).unwrap();
+    let call = ToolCall {
+        id: "research".into(),
+        name: "web_search".into(),
+        arguments: json!({"query":"safe synthetic query"}),
+    };
+    {
+        let mut env = f.environment(&server, &config, &cancel);
+        env.model = "zai/glm-5.3";
+        let session = Session {
+            provider: env.provider.clone(),
+            env: &env,
+            memory: f.frozen.clone(),
+            budget: Arc::new(Mutex::new(Budget::default())),
+        };
+        let error = session
+            .read(
+                &call,
+                &skills,
+                crate::attachments::remaining_budget(env.model, &[]),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("web.search_model"));
+        assert!(server.state.requests.lock().unwrap().is_empty());
+    }
+    f.web = Web::new(
+        f._root.path().join("pinned-web"),
+        WebConfig {
+            search_model: Some("openai/search-pinned".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut env = f.environment(&server, &config, &cancel);
+    env.model = "zai/glm-5.3";
+    let session = Session {
+        provider: env.provider.clone(),
+        env: &env,
+        memory: f.frozen.clone(),
+        budget: Arc::new(Mutex::new(Budget::default())),
+    };
+    let result = session
+        .read(
+            &call,
+            &skills,
+            crate::attachments::remaining_budget(env.model, &[]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["model"], "openai/search-pinned");
+    let requests = server.state.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["model"], "search-pinned");
+    assert_eq!(requests[0]["tools"][0]["type"], "web_search");
+}

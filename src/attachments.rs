@@ -679,6 +679,9 @@ impl Attachments {
         for id in ids {
             for f in self.files(channel, Some(id))? {
                 if f.hash.is_none() || !self.blob(&f).is_file() {
+                    if model.starts_with("zai/") {
+                        parts.push(crate::provider::text_part(model, &format!("Attachment {} · {} is not locally available and was not viewed. Use attachment open to restore it if possible.", f.id, f.filename)));
+                    }
                     continue;
                 }
                 self.touch(&f.id)?;
@@ -697,6 +700,9 @@ impl Attachments {
                         &format!("{} · {}", f.id, f.filename),
                         model,
                     ));
+                } else if model.starts_with("zai/") {
+                    parts.push(crate::provider::text_part(model, &format!(
+                        "Attachment {} · {} ({}) preserved, but not supplied as native input to {model}. Use attachment open/read for text or PDF page extraction. Images/diagrams/scans are NOT visible through a text extract; select an explicitly vision-capable model for visual tasks. No automatic vision-provider call was made.", f.id, f.filename, f.mime)));
                 }
             }
         }
@@ -758,6 +764,15 @@ impl Attachments {
                 cancel,
             )
             .await?;
+            if !crate::provider::supports_images(model) {
+                return Ok((
+                    format!(
+                        "PDF page {page} (only this page): extracted text only; {model} cannot view page images. Diagrams, layout, handwriting and scanned/image-only content are NOT available. Empty text is not evidence of an empty page. No automatic vision-provider call was made. Original: {}\n{text}",
+                        path.display()
+                    ),
+                    vec![],
+                ));
+            }
             let temp = Temporary(
                 self.root
                     .join("tmp")
@@ -791,9 +806,14 @@ impl Attachments {
                 &mut remaining,
             )
             .await?;
+            let visual_note = if image.is_some() {
+                "text plus page image"
+            } else {
+                "text only: page image unavailable/over allowance; visual contents are NOT available"
+            };
             return Ok((
                 format!(
-                    "PDF page {page} (only this page, request further pages explicitly):\n{text}"
+                    "PDF page {page} (only this page, request further pages explicitly; {visual_note}):\n{text}"
                 ),
                 image
                     .into_iter()
@@ -805,7 +825,7 @@ impl Attachments {
         }
         Ok((
             format!(
-                "File available at {} ({} bytes, {mime}). Native input is unavailable for this backend/type or exceeds its request allowance. Inspect with workspace tools; use read(path, page) for PDF pages.",
+                "File available at {} ({} bytes, {mime}). Native input is unavailable for this backend/type or exceeds its request allowance. Visual contents have NOT been viewed: text-only models cannot evaluate images/diagrams/scans. Inspect with workspace tools; use read(path, page) for PDF text/page inputs or select an explicitly vision-capable model. No automatic vision-provider call was made.",
                 path.display(),
                 tokio::fs::metadata(path).await?.len()
             ),
@@ -936,10 +956,10 @@ fn hash_file_sync_cancel(path: &Path, cancel: &CancellationToken) -> Result<Stri
 }
 
 fn labelled_native(part: Value, label: &str, model: &str) -> Vec<Value> {
-    if part["type"] == "input_image" || part["type"] == "image" {
+    if part["type"] == "input_image" || part["type"] == "image" || part["type"] == "image_url" {
         // Image schemas carry no filename; keep the association explicit in multi-file batches.
         vec![
-            json!({"type":if model.starts_with("anthropic/") { "text" } else { "input_text" },"text":format!("Image evidence (external data): {label}")}),
+            crate::provider::text_part(model, &format!("Image evidence (external data): {label}")),
             part,
         ]
     } else {
@@ -1005,6 +1025,9 @@ async fn native_part(
         mime,
         "image/png" | "image/jpeg" | "image/webp" | "image/gif"
     );
+    if image && !crate::provider::supports_images(model) {
+        return Ok(None);
+    }
     let file = mime == "application/pdf"
         || mime.starts_with("text/")
         || matches!(
@@ -1061,6 +1084,8 @@ async fn native_part(
     let mut part = if image {
         if anthropic_image {
             json!({"type":"image","source":{"type":"base64","media_type":mime}})
+        } else if model.starts_with("zai/") {
+            json!({"type":"image_url","image_url":{}})
         } else {
             json!({"type":"input_image","detail":"auto"})
         }
@@ -1069,6 +1094,8 @@ async fn native_part(
     };
     if anthropic_image {
         part["source"]["data"] = Value::String(data);
+    } else if image && model.starts_with("zai/") {
+        part["image_url"]["url"] = Value::String(data);
     } else {
         part[if image { "image_url" } else { "file_data" }] = Value::String(data);
     }
@@ -1109,7 +1136,9 @@ pub fn remaining_budget(model: &str, history: &[Value]) -> InputBudget {
         } else {
             0
         };
-        let own_image = usize::from(v["type"] == "input_image" || v["type"] == "image");
+        let own_image = usize::from(
+            v["type"] == "input_image" || v["type"] == "image" || v["type"] == "image_url",
+        );
         let children = match v {
             Value::Object(map) => map.values().map(count).collect::<Vec<_>>(),
             Value::Array(values) => values.iter().map(count).collect(),
@@ -1157,18 +1186,29 @@ pub fn remaining_budget(model: &str, history: &[Value]) -> InputBudget {
         .iter()
         .map(count)
         .fold((0, 0), |(f, i), (ff, ii)| (f + ff, i + ii));
-    let allowance = if model.starts_with("anthropic/") {
+    let allowance = if model.starts_with("anthropic/") || model.starts_with("zai/") {
         32_000_000u64
     } else {
         512_000_000
     };
     InputBudget {
-        files: 50_000_000u64.saturating_sub(files),
+        files: if model.starts_with("zai/") {
+            0
+        } else {
+            50_000_000u64.saturating_sub(files)
+        },
         payload: allowance
             .saturating_sub(history.iter().map(size).sum::<u64>())
             .saturating_mul(3)
             / 4,
-        images: (if model.starts_with("anthropic/") {
+        images: (if model.starts_with("zai/") {
+            // Harness-conservative allowance, not a vendor/account quota claim.
+            if crate::provider::supports_images(model) {
+                20usize
+            } else {
+                0
+            }
+        } else if model.starts_with("anthropic/") {
             100usize
         } else {
             1500
@@ -1196,7 +1236,7 @@ pub fn text_chars(value: &Value) -> usize {
         Value::Object(map) => map
             .iter()
             .map(|(key, value)| {
-                if matches!(key.as_str(), "file_data" | "image_url" | "data")
+                if matches!(key.as_str(), "file_data" | "image_url" | "url" | "data")
                     && value.as_str().is_some_and(|s| {
                         s.starts_with("data:")
                             || key == "data" && map.get("type").is_some_and(|v| v == "base64")

@@ -31,3 +31,5 @@ PANTHEON_TEST_CODEX_MODEL=codex/gpt-5.6-sol cargo test --locked --test web_live 
 ```
 
 These checks require the operator's existing file-based Codex login and use subscription quota. They search an official source, fetch it, verify cache reuse after restarting the fetch manager, and exercise native client-tool replay with post-tool steering. Automated CI uses local HTTP/RPC fixtures and never receives subscription credentials.
+
+GLM inference is not a hosted-search transport. When using a GLM worker/main model, set `web.search_model` to an existing authorized search-capable OpenAI/Codex/Anthropic model. An inherited GLM search fails explicitly before network access. `web_fetch` remains independent and unchanged.

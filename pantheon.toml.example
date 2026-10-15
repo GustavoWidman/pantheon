@@ -73,8 +73,10 @@ directories = []
 
 [curator]
 enabled = true
-# Omit model/reasoning to inherit this channel's main model and effort.
-# /model kind:curator model:none forces main-model inheritance.
+# Omit model/reasoning to inherit this channel's non-GLM main model and effort.
+# A GLM chat override keeps the configured non-GLM main model for maintenance.
+# If agent.model is GLM, explicitly set curator.model or disable this curator.
+# /model kind:curator model:none explicitly opts into main-model inheritance.
 # model = "codex/YOUR_MODEL"
 # reasoning = "low"
 idle_seconds = 300
@@ -105,3 +107,12 @@ max_research_calls = 4
 # description = "Remote integration"
 # url = "https://your-mcp-service.example/mcp"
 # bearer_env = "REMOTE_MCP_TOKEN"
+
+# Optional exact Z.ai Coding Chat Completions endpoint (never general paid fallback).
+# Set ZAI_API_KEY in the protected service environment, not here.
+# Workers may use zai/glm-5.3 (text) or zai/glm-5.3-flash (images); low/high/max.
+# Keep web.search_model on an existing supported hosted-search provider.
+[zai]
+enabled = false
+max_in_flight = 2
+max_output_tokens = 16384

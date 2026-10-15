@@ -29,7 +29,12 @@ thinking use adaptive thinking and `output_config.effort` during inference.
 
 Curator overrides apply to newly started jobs; all parallel reviewers inherit
 that job’s pinned model and effort. `model:none` explicitly inherits the current
-main model even when configuration supplies a curator model. `model:default`
+main model even when configuration supplies a curator model, including an explicit
+opt-in to GLM inheritance. Absent an explicit curator selection, a GLM main-model
+override keeps the configured non-GLM main model for maintenance. A config whose
+main model is GLM must explicitly configure `curator.model` or disable the curator;
+implicit startup GLM maintenance is rejected. Picker and runtime share this rule.
+`model:default`
 clears the override to configuration. `level:inherit` explicitly inherits main
 effort for the curator; `level:default` clears a compactor/curator effort override.
 The actual effort `none` remains distinct from inheritance. Existing compactor
@@ -122,3 +127,7 @@ acquire the daemon writer lock.
 Protocol references: [OpenAI models](https://developers.openai.com/api/reference/resources/models/methods/list),
 [Claude models](https://platform.claude.com/docs/en/api/models/list),
 [Discord autocomplete callbacks](https://docs.discord.com/developers/interactions/receiving-and-responding).
+
+## Z.ai selection
+
+`zai/glm-5.3` and `zai/glm-5.3-flash` are an explicit current-documentation allowlist, not a live account catalog. Suggestions require `zai.enabled=true` and `ZAI_API_KEY`. Efforts are low/high/max (default max); exact image capability and unknown pricing are exposed in `models` results. Native transcripts are fresh on provider changes, not translated across providers. See [Z.ai details](zai.md).

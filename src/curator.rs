@@ -99,6 +99,30 @@ impl CuratorConfig {
         Ok(())
     }
 }
+// A dynamic main-model selection must not silently reroute enabled maintenance.
+// `none` is a durable, explicit inheritance selection, not an absent override.
+pub(crate) fn effective_model(
+    main: &str,
+    configured_main: &str,
+    configured_curator: Option<&str>,
+    selected: Option<&str>,
+) -> Result<String> {
+    match selected {
+        Some("none") => Ok(main.to_owned()),
+        Some(model) => Ok(model.to_owned()),
+        None => match configured_curator {
+            Some(model) => Ok(model.to_owned()),
+            None if main.starts_with("zai/") => {
+                ensure!(
+                    !configured_main.starts_with("zai/"),
+                    "implicit GLM curator inference is disabled; set curator.model to an explicit model, select /model kind:curator model:none to opt in to inheritance, or disable the curator"
+                );
+                Ok(configured_main.to_owned())
+            }
+            None => Ok(main.to_owned()),
+        },
+    }
+}
 const DRAFT: &str = include_str!("curator.txt");
 const REVIEW: &str = r#"You are Pantheon's private curator reviewer. You share the originating
 orchestrator's frozen settled memory, but your task is solely to review staged
@@ -358,7 +382,7 @@ impl Session<'_> {
                     .provider
                     .with_cache_subscope("hosted-search")
                     .search_limited(
-                        self.env.model,
+                        self.env.web.search_model(self.env.model),
                         crate::tools::string(a, "query")?,
                         a["max_results"].as_u64().unwrap_or(5) as usize,
                         &domains,

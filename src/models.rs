@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path, sync::RwLock};
 
-pub const PROVIDERS: [&str; 3] = ["codex", "openai", "anthropic"];
+pub const PROVIDERS: [&str; 4] = ["codex", "openai", "anthropic", "zai"];
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Model {
     pub id: String,
@@ -69,8 +69,12 @@ impl Catalog {
             })
             .unwrap_or_default();
         let mut entries = self.entries.write().unwrap();
-        for provider in available(&config.auth) {
-            let mut models = cached.get(provider).cloned().unwrap_or_default();
+        for provider in available(config) {
+            let mut models = if provider == "zai" {
+                crate::provider::zai::catalog()
+            } else {
+                cached.get(provider).cloned().unwrap_or_default()
+            };
             if provider == "codex" && models.is_empty() {
                 let local = codex_cache(&config.auth);
                 if !local.is_empty() {
@@ -93,7 +97,7 @@ impl Catalog {
         }
     }
     pub async fn refresh(&self, config: &Config, provider: &Provider) {
-        let available = available(&config.auth);
+        let available = available(config);
         self.entries
             .write()
             .unwrap()
@@ -187,7 +191,7 @@ impl Catalog {
             ));
             if kind == "curator" {
                 choices.push((
-                    "Inherit main model · clear curator override".into(),
+                    "Explicitly inherit main model · opt in".into(),
                     "none".into(),
                 ));
             }
@@ -265,6 +269,9 @@ impl Catalog {
                 .cloned()
                 .unwrap_or_else(|| preferred.into());
         }
+        if model.starts_with("zai/") && crate::provider::zai::validate_effort(preferred).is_err() {
+            return "max".into();
+        }
         preferred.into()
     }
     pub fn set_chat_model(&self, channel: u64, model: &str) {
@@ -272,7 +279,8 @@ impl Catalog {
     }
     /// Mirror durable channel model selections for deadline-safe autocomplete.
     /// None removes an override: compact uses configuration; curator inherits
-    /// its configured fallback, or the current main model when unconfigured.
+    /// its configured fallback, or the current non-GLM main model when unconfigured.
+    /// Implicit GLM inheritance keeps the configured non-GLM main route or fails.
     pub fn set_kind_model(&self, channel: u64, kind: &str, model: Option<&str>) -> Result<()> {
         ensure!(
             ["chat", "compact", "curator"].contains(&kind),
@@ -306,8 +314,19 @@ impl Catalog {
             return Some(main);
         }
         let kinds = self.kinds.read().unwrap();
+        if kind == "curator" {
+            return crate::curator::effective_model(
+                &main,
+                &chats.0,
+                kinds.defaults.get(kind).map(String::as_str),
+                kinds
+                    .overrides
+                    .get(&(channel, kind.into()))
+                    .map(String::as_str),
+            )
+            .ok();
+        }
         match kinds.overrides.get(&(channel, kind.into())) {
-            Some(model) if kind == "curator" && model == "none" => Some(main),
             Some(model) => Some(model.clone()),
             None => Some(kinds.defaults.get(kind).cloned().unwrap_or(main)),
         }
@@ -362,6 +381,9 @@ impl Catalog {
     }
     pub fn validate_effort(&self, model: &str, effort: &str) -> Result<()> {
         crate::config::validate_reasoning(effort)?;
+        if model.starts_with("zai/") {
+            crate::provider::zai::validate_effort(effort)?;
+        }
         if let Some(m) = self.metadata(model)
             && !m.efforts.is_empty()
         {
@@ -426,7 +448,8 @@ impl Catalog {
                 json!({"id":format!("{p}/{}",m.id),"name":m.name,"reasoning_levels":if m.efforts.is_empty(){Value::Null}else{json!(m.efforts)},"default_reasoning":m.default_effort,"source":m.source,"observed_at":m.observed_at,
                     "pricing":prices,
                     "api_price_reference":if p.as_str()=="codex"{self.prices.api_reference(&m.id, &m.name, crate::store::now())}else{Value::Null},
-                    "billing":if p.as_str()=="codex"{"ChatGPT subscription; published credit-billing rates do not predict included quota or remaining limits"}else{"API; public list prices are estimates, not account-specific billing"}})
+                    "capabilities":if p.as_str()=="zai"{json!({"images":crate::provider::zai::supports_images(&format!("zai/{}",m.id)),"native_files":false,"hosted_search":false})}else{Value::Null},
+                    "billing":if p.as_str()=="zai"{"Explicit Coding Plan endpoint; compatibility does not establish entitlement. No quota/price conversion inferred."}else if p.as_str()=="codex"{"ChatGPT subscription; published credit-billing rates do not predict included quota or remaining limits"}else{"API; public list prices are estimates, not account-specific billing"}})
             }).collect::<Vec<_>>(),
             "total":rows.len(),"next_offset":if offset.saturating_add(limit)<rows.len(){Some(offset+limit)}else{None},
             "note":"Live provider discovery with last-known local snapshots during outages. Prices come separately from official public Standard text-token tables; check units (USD versus credits), source, observed_at, stale, applicability and context bands. Unknown metadata is null. Codex credits apply to credit-billed usage, not included subscription quota; API references are separate. Do not invent dollar conversions or quota weights. Catalog visibility does not guarantee access. Use exact IDs and advertised efforts when spawning workers."})
@@ -444,11 +467,15 @@ fn normalize(models: &mut Vec<Model>) {
     models.sort_by(|a, b| a.id.cmp(&b.id));
     models.dedup_by(|a, b| a.id == b.id);
 }
-fn available(auth: &AuthConfig) -> Vec<&'static str> {
+fn available(config: &Config) -> Vec<&'static str> {
     PROVIDERS
         .into_iter()
         .filter(|p| match *p {
-            "codex" => auth.inspect().is_ok(),
+            "codex" => config.auth.inspect().is_ok(),
+            "zai" => {
+                config.zai.enabled
+                    && std::env::var("ZAI_API_KEY").is_ok_and(|s| !s.trim().is_empty())
+            }
             "openai" => std::env::var("OPENAI_API_KEY").is_ok_and(|s| !s.trim().is_empty()),
             "anthropic" => std::env::var("ANTHROPIC_API_KEY").is_ok_and(|s| !s.trim().is_empty()),
             _ => false,

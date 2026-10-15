@@ -43,7 +43,11 @@ impl Default for WebConfig {
 impl WebConfig {
     pub fn validate(&self) -> Result<()> {
         if let Some(model) = &self.search_model {
-            crate::provider::model_parts(model)?;
+            let (vendor, _) = crate::provider::model_parts(model)?;
+            ensure!(
+                vendor != "zai",
+                "web.search_model must select an existing hosted-search provider, not Z.ai"
+            );
         }
         ensure!(
             self.request_timeout_seconds > 0 && self.search_timeout_seconds > 0,
@@ -81,6 +85,10 @@ struct CachedPage {
     truncated: bool,
 }
 impl Web {
+    /// Hosted search has an independent route, shared by root, workers and curators.
+    pub fn search_model<'a>(&'a self, inherited: &'a str) -> &'a str {
+        self.config.search_model.as_deref().unwrap_or(inherited)
+    }
     pub fn new(cache_dir: PathBuf, config: WebConfig) -> Result<Self> {
         config.validate()?;
         let http = reqwest::Client::builder()

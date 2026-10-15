@@ -81,7 +81,9 @@ async fn main() -> Result<()> {
         std::fs::create_dir_all(&config.state_dir)?;
         let catalog = pantheon::models::Catalog::default();
         catalog.initialize(&config);
-        let api = pantheon::provider::Provider::new(30)?.with_auth(config.auth.clone());
+        let api = pantheon::provider::Provider::new(30)?
+            .with_auth(config.auth.clone())
+            .with_zai(config.zai.clone())?;
         catalog.refresh(&config, &api).await;
         println!(
             "{}",
@@ -200,7 +202,11 @@ fn doctor(config: &Config) -> Result<()> {
     if std::env::var("DISCORD_TOKEN").is_err() {
         missing.push("DISCORD_TOKEN".to_string());
     }
-    for model in [&config.agent.model, &config.agent.compactor_model] {
+    let mut inference_models = vec![&config.agent.model, &config.agent.compactor_model];
+    if config.curator.enabled {
+        inference_models.extend(config.curator.model.iter());
+    }
+    for model in &inference_models {
         if model.starts_with("codex/") {
             if config.auth.inspect().is_err() && !missing.iter().any(|s| s == "Codex ChatGPT login")
             {
@@ -209,7 +215,12 @@ fn doctor(config: &Config) -> Result<()> {
             continue;
         }
         let (vendor, _) = pantheon::provider::model_parts(model)?;
-        let key = if vendor == "openai" {
+        let key = if vendor == "zai" {
+            if !config.zai.enabled {
+                missing.push("zai.enabled=true".into());
+            }
+            "ZAI_API_KEY"
+        } else if vendor == "openai" {
             "OPENAI_API_KEY"
         } else {
             "ANTHROPIC_API_KEY"
@@ -223,7 +234,12 @@ fn doctor(config: &Config) -> Result<()> {
             config.auth.inspect()?;
         } else {
             let (vendor, _) = pantheon::provider::model_parts(model)?;
-            let key = if vendor == "openai" {
+            let key = if vendor == "zai" {
+                if !config.zai.enabled {
+                    missing.push("zai.enabled=true".into());
+                }
+                "ZAI_API_KEY"
+            } else if vendor == "openai" {
                 "OPENAI_API_KEY"
             } else {
                 "ANTHROPIC_API_KEY"
@@ -233,7 +249,7 @@ fn doctor(config: &Config) -> Result<()> {
             }
         }
     }
-    if [&config.agent.model, &config.agent.compactor_model]
+    if inference_models
         .into_iter()
         .any(|model| model.starts_with("codex/"))
         || config
