@@ -92,7 +92,20 @@ impl Request {
     }
     pub fn prepare(body: &Value, capabilities: Capabilities, affinity: Uuid) -> Result<Self> {
         let mut request: Self = serde_json::from_value(body.clone())?;
-        request.lite = capabilities.use_responses_lite == Some(true);
+        // Hosted search is server-executed. Responses Lite supports only client
+        // tools: moving web_search into additional_tools hides it from the
+        // gateway, while leaving it top-level is explicitly rejected. Keep
+        // this isolated request on standard Responses, with no Lite header.
+        // Never retry a rejected request under a different mode.
+        let hosted_search = request.tools.as_ref().is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                matches!(
+                    tool["type"].as_str(),
+                    Some("web_search" | "web_search_preview")
+                )
+            })
+        });
+        request.lite = capabilities.use_responses_lite == Some(true) && !hosted_search;
         request.prompt_cache_key = Some(affinity.to_string());
         // Rebind only our generated base-instruction prefix, never saved native history IDs.
         if let Some(first) = request.input.first_mut()

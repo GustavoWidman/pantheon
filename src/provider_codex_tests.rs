@@ -153,22 +153,56 @@ fn missing_false_and_malformed_metadata_are_standard_without_summary_inference()
     );
 }
 #[test]
-fn mixed_hosted_tools_keep_native_coalescing_and_search_contract() {
+fn hosted_search_uses_standard_responses_even_when_model_advertises_lite() {
+    for kind in ["web_search", "web_search_preview"] {
+        for capability in [None, Some(false), Some(true)] {
+            let mut body =
+                Provider::request_body("codex/unknown", "low", "sys", &[], &[function()]).unwrap();
+            body["tools"] = json!([{"type":kind,"filters":{"allowed_domains":["example.org"]}}, body["tools"][0]]);
+            body["tool_choice"] = json!({"type":kind});
+            body["include"] = json!([
+                "reasoning.encrypted_content",
+                "web_search_call.action.sources"
+            ]);
+            let request = wire(&body, capability);
+            let value = request.value().unwrap();
+            assert!(!request.lite);
+            assert_eq!(value["tools"], body["tools"]);
+            assert_eq!(value["tool_choice"], body["tool_choice"]);
+            assert_eq!(value["include"], body["include"]);
+            assert_eq!(value["stream"], true);
+            assert_eq!(value["parallel_tool_calls"], true);
+            assert!(value["reasoning"].get("context").is_none());
+            assert!(
+                value["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|item| item["type"] != "additional_tools")
+            );
+            let http = request
+                .apply_mode_header(reqwest::Client::new().post("http://localhost.invalid/"))
+                .json(&request)
+                .build()
+                .unwrap();
+            assert!(http.headers().get(LITE_HEADER).is_none());
+        }
+    }
+}
+#[test]
+fn mixed_client_tools_keep_native_lite_coalescing() {
     let base = Provider::request_body("codex/unknown", "low", "sys", &[], &[function()]).unwrap();
     let mut body = base.clone();
     let mut f2 = base["tools"][0].clone();
     f2["name"] = json!("other");
-    body["tools"] = json!([{"type":"web_search","filters":{"allowed_domains":["example.org"]}}, base["tools"][0], {"type":"namespace","name":"functions","description":"explicit","tools":[f2]}, {"type":"other_builtin"}]);
-    body["tool_choice"] = json!({"type":"web_search"});
+    body["tools"] = json!([base["tools"][0], {"type":"namespace","name":"functions","description":"explicit","tools":[f2]}, {"type":"custom","name":"custom_fixture","description":"inert"}]);
     let request = wire(&body, Some(true));
     let tools = request.input[0]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 3);
-    assert_eq!(tools[0], body["tools"][0]);
-    assert_eq!(tools[1]["name"], "functions");
-    assert_eq!(tools[1]["description"], "explicit");
-    assert_eq!(tools[1]["tools"].as_array().unwrap().len(), 2);
-    assert_eq!(tools[2], body["tools"][3]);
-    assert_eq!(request.tool_choice, body["tool_choice"]);
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["name"], "functions");
+    assert_eq!(tools[0]["description"], "explicit");
+    assert_eq!(tools[0]["tools"].as_array().unwrap().len(), 3);
+    assert!(request.lite);
     assert!(request.tools.is_none());
 }
 #[test]

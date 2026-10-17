@@ -2218,6 +2218,56 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
+    async fn codex_hosted_search_overrides_lite_and_preserves_server_search_results() {
+        use axum::{Json, Router, routing::post};
+        use std::future::IntoFuture;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("auth.json"),
+            json!({"tokens":{"access_token":"test-token","account_id":"test-account"}}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("models_cache.json"),
+            json!({"models":[{"slug":"test","use_responses_lite":true}]}).to_string(),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(axum::serve(listener, Router::new().route("/", post(|headers: axum::http::HeaderMap, Json(body): Json<Value>| async move {
+            // These assertions reproduce the gateway's pre-inference rejection:
+            // Lite cannot execute hosted tools, even if the model prefers Lite.
+            assert!(headers.get(codex::LITE_HEADER).is_none());
+            assert_eq!(body["tools"], json!([{"type":"web_search","filters":{"allowed_domains":["primary.example"]}}]));
+            assert_eq!(body["tool_choice"], json!({"type":"web_search"}));
+            assert_eq!(body["stream"], true);
+            assert_eq!(body["include"], json!(["reasoning.encrypted_content","web_search_call.action.sources"]));
+            assert!(body["reasoning"].get("context").is_none());
+            assert_eq!(body["input"].as_array().unwrap().len(), 2);
+            let search = json!({"type":"web_search_call","id":"ws_test","action":{"type":"search","sources":[{"type":"url","url":"https://primary.example/docs"}]}});
+            let message = json!({"type":"message","content":[{"type":"output_text","text":"Found current documentation.","annotations":[{"type":"url_citation","url":"https://primary.example/docs","title":"Docs"}]}]});
+            // Codex may omit native items from response.completed; search still
+            // requires real server-tool evidence from output_item.done.
+            axum::response::Response::new(axum::body::Body::from(format!("data: {}\n\ndata: {}\n\ndata: {}\n\n",
+                json!({"type":"response.output_item.done","output_index":0,"item":search}),
+                json!({"type":"response.output_item.done","output_index":1,"item":message}),
+                json!({"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":25,"output_tokens":10}}}))))
+        }))).into_future());
+        let result = Provider::mock(endpoint)
+            .with_auth(AuthConfig {
+                codex_home: Some(directory.path().into()),
+                codex_cli: None,
+            })
+            .search("codex/test", "current docs", 3, &["primary.example".into()])
+            .await
+            .unwrap();
+        assert_eq!(result["answer"], "Found current documentation.");
+        assert_eq!(result["sources"].as_array().unwrap().len(), 1);
+        assert_eq!(result["sources"][0]["url"], "https://primary.example/docs");
+        assert_eq!(result["usage"]["input_tokens"], 25);
+        server.abort();
+    }
+    #[tokio::test]
     async fn anthropic_search_resumes_pause_with_native_server_blocks_and_sums_usage() {
         use axum::{Json, Router, routing::post};
         use std::{
