@@ -16,7 +16,10 @@ or the documented default home. The cache reader is bounded to 4 MiB. It does no
 read credentials when selecting the request mode, and it does not mutate the CLI
 cache. There is no model-name heuristic or forced Sol/Luna mode.
 
-Only an explicit Boolean `use_responses_lite: true` selects Lite. Missing, null,
+Only an explicit Boolean `use_responses_lite: true` selects Lite for client-tool
+requests. Hosted web search selects standard Responses even for a Lite-capable
+model: the Lite gateway supports client-executed tools, not server-executed search.
+Missing, null,
 malformed, unreadable, oversized, or unknown-model capability data selects the
 conservative **standard** contract. An explicit discovered false/unknown record
 is not overridden by the fallback CLI cache. Last-known catalog capabilities may
@@ -44,12 +47,15 @@ canonical history is not mutated. Subscription requests continue to set
   parallel tool calls disabled, and `reasoning.context: all_turns` when reasoning
   is requested. Nonempty tools become a developer-role `additional_tools` input
   item before base instructions; empty tools produce no such item. Flat functions
-  are coalesced in the default `functions` namespace; hosted built-ins stay
-  outside that namespace. Additional-tools IDs are deterministic `at_` UUIDv5 IDs
+  are coalesced in the default `functions` namespace. Hosted web search is
+  never moved into this prefix; it uses the standard request mode instead.
+  Additional-tools IDs are deterministic `at_` UUIDv5 IDs
   scoped to the affinity and serialized tool payload.
 
-Hosted search retains its explicitly selected built-in tool, filters, include
-fields, and search-specific tool choice. Public `openai/`, Anthropic and Z.ai
+Hosted search retains its explicitly selected built-in tool at top level, filters,
+include fields, and search-specific tool choice, without the Lite header or
+`reasoning.context`. This is chosen before sending, not a fallback after failure.
+Public `openai/`, Anthropic and Z.ai
 contracts do not use this subscription projection.
 
 ## Calls and continuation
