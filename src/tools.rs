@@ -35,8 +35,8 @@ pub fn definitions_with_claude(child: bool, coordinator: bool, claude_enabled: b
         ),
         tool(
             "zoom",
-            "Open a memory node into its two children, or retrieve an original message when n=1.",
-            json!({"id":{"type":"integer","minimum":0},"n":{"type":"integer","minimum":1}}),
+            "Open a native memory span into its two children, or an original page when n=1. at is a UTF-16 character offset within that page (default 0); follow the returned cursor for long output.",
+            json!({"id":{"type":"integer","minimum":0},"n":{"type":"integer","minimum":1},"at":{"type":"integer","minimum":0}}),
             &["id", "n"],
         ),
         tool(

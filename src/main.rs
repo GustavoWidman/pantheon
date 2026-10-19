@@ -78,7 +78,9 @@ async fn main() -> Result<()> {
         limit,
     }) = &cli.command
     {
-        std::fs::create_dir_all(&config.state_dir)?;
+        // Model discovery persists its catalogue: use the same native writer
+        // admission as the daemon, even when this is the first command.
+        let _lock = pantheon::state_namespace::acquire(&config.state_dir)?;
         let catalog = pantheon::models::Catalog::default();
         catalog.initialize(&config);
         let api = pantheon::provider::Provider::new(30)?
@@ -96,17 +98,8 @@ async fn main() -> Result<()> {
         );
         return Ok(());
     }
-    std::fs::create_dir_all(&config.state_dir)?;
-    // Entire daemon, operational DB and offline CLI share one lifetime writer lock.
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(config.state_dir.join("daemon.lock"))?;
-    fs2::FileExt::try_lock_exclusive(&lock).context(
-        "another Pantheon process owns this state directory; stop it before offline export/import",
-    )?;
+    // Read-only native admission precedes lock creation; revalidated under lock.
+    let lock = pantheon::state_namespace::acquire(&config.state_dir)?;
     match cli.command.unwrap_or(Action::Run) {
         Action::Export { channel, output } => {
             let m = Memory::open(

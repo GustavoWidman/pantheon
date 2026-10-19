@@ -56,9 +56,39 @@ access when not already enabled), then run `systemctl --user daemon-reload` and
 at boot and keeps it running after logout. This uses the existing user account;
 the NixOS module additionally provides its dedicated account and service sandbox.
 
-## Moving an existing instance
+## 0.21.0 native-state boundary
 
-Use the same Discord application, token, allowed users and model settings to keep
+**0.21.0 is not an in-place upgrade of earlier state.** Start with an empty
+`state_dir`; the daemon durably initializes its native `state-format` marker.
+A nonempty unmarked namespace or unsupported marker is refused read-only, before
+creating a daemon lock, Discord ingress/operational databases, gateway or queued
+workers. Under the writer lock, startup checks again and validates every native
+chat/subagent bank, including idle banks. A lone regular `daemon.lock` is the only
+allowed interrupted-empty-bootstrap residue. Do not create or copy markers by
+hand to bypass admission. The guard validates native schemas, not historical
+formats; it never decodes, converts or replays another format.
+
+An external converter and sealed-history preflight are separate from this
+runtime. A synthetic converter test does not establish real-history readiness.
+Preserve the old instance/archive unchanged until export, paid-replay authority,
+exact-history reference repair, recall checks, delivery reconciliation, ownership
+fencing and rollback have separately passed. Never copy old jobs into a new
+instance or run both bots against the same Discord identity. No migration,
+service activation or self-deployment is implied by this source change.
+
+Merging a version-bumped PR triggers this repository's validated tag/release
+workflow, not a service switch. Consumers still choose their package and state
+paths. An unattended consumer that automatically updates and restarts against an
+older state directory will be refused; pin the old package until an explicit
+migration/cutover is ready. The NixOS module does not perform conversion. The `models` command persists a
+catalogue, so it uses the same native namespace admission and writer lock; stop
+the daemon before standalone model discovery. `doctor` does not initialize state.
+
+## Moving an existing compatible native instance
+
+The instructions below apply only to an already compatible native schema, not
+an upgrade from an earlier memory format. Use the same Discord application, token,
+allowed users and model settings to keep
 the bot identity and channel mapping. The existing Discord display name does not
 change just because the service changes its name.
 
@@ -83,7 +113,8 @@ change just because the service changes its name.
    executable, gateway checkpoint progress, slash command registration, database
    integrity, preserved history/skill revisions and boot enablement.
 
-If startup verification fails, stop the new service and restore the old executable
+For a same-format move only, if startup verification fails, stop the new service
+and restore the old executable
 and service configuration against the **current** state. Never roll memory back to
 the snapshot once the new instance may have received messages. Keep the snapshot
 for inspection and recovery.

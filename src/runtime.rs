@@ -119,13 +119,14 @@ pub fn system_prompt_with_claude(
         "This agent has direct execution tools. shell is available and can inspect the actual machine and requested environment values. browser is available for authorized account activities and credential entry. Use these tools instead of asking the user to perform available checks."
     };
     format!(
-        "{}\n{}\nCurrent harness capabilities (authoritative over obsolete chat claims): {names}.\n{execution}\n{instructions}\n{skill_index}",
+        "{}\n{}\nCurrent harness capabilities (authoritative over obsolete chat claims): {names}.\n{execution}\n{instructions}\n{skill_index}\n\n# Compactions\n{}",
         if child {
             include_str!("child.txt")
         } else {
             include_str!("master.txt")
         },
-        include_str!("behavior.txt")
+        include_str!("behavior.txt"),
+        COMPACT
     )
 }
 fn curator_note(note: &Value) -> Result<String> {
@@ -161,7 +162,7 @@ impl Harness {
         discord: Arc<Discord>,
         shutdown: CancellationToken,
     ) -> Result<Arc<Self>> {
-        std::fs::create_dir_all(&config.state_dir)?;
+        crate::state_namespace::initialize(&config.state_dir)?;
         std::fs::create_dir_all(&config.workspace)?;
         let store = Store::open(&config.state_dir.join("runtime.sqlite"))?;
         store.recover()?;
@@ -1054,7 +1055,14 @@ impl Harness {
                 {
                     error = true;
                 }
-                let output = crate::memory::cap_tool_result(&output);
+                // Native zoom already pages by UTF-16 units. A full page plus
+                // its header can exceed the generic tool cap; clipping here
+                // would silently destroy exact-history content without a cursor.
+                let output = if call.name == "zoom" && !error {
+                    output
+                } else {
+                    crate::memory::cap_tool_result(&output)
+                };
                 self.log_run(run, Kind::Echo, &output).await?;
                 let image =
                     if call.name == "browser" && call.arguments["action"] == "screenshot" && !error
@@ -1264,12 +1272,11 @@ impl Harness {
                 value
             }
             "zoom" => {
-                return run
-                    .memory
-                    .memory
-                    .lock()
-                    .await
-                    .zoom(tools::number(a, "id")?, tools::number(a, "n")?);
+                return run.memory.memory.lock().await.zoom_at(
+                    tools::number(a, "id")?,
+                    tools::number(a, "n")?,
+                    a["at"].as_u64().unwrap_or(0) as usize,
+                );
             }
             "date" => return run.memory.memory.lock().await.date(tools::number(a, "id")?),
             "read" => {
@@ -2944,7 +2951,7 @@ impl Harness {
             }
             let candidates = c.memory.lock().await.ready_jobs(usize::MAX);
             for key in candidates {
-                if workers.len() >= 8 {
+                if workers.len() >= crate::memory::COMPACTOR_JOBS {
                     break;
                 }
                 if busy.contains(&key) || retry.get(&key).is_some_and(|t| *t > Instant::now()) {
@@ -3016,56 +3023,72 @@ impl Harness {
     ) -> Result<String> {
         let (vendor, _) = model_parts(model)?;
         self.discord.models.validate_effort(model, reasoning)?;
-        let example = "user: Build Pantheon in Rust as an always-on NixOS Discord agent; preserve every message durably and start each turn with a stable binary summary view. Background workers summarize in order; zoom retrieves exact history. echo: inspected Thoth's gateway and found steering, mention and delivery races. work: browser implementation assigns separate displays and permanent noVNC URLs, with explicit handoff leases. talk: chosen append-only daily files and a durable inbox/outbox; live deployment still needs credentials.";
-        let mut scale = example.to_string();
-        while scale.len() > 512 {
-            scale.pop();
-        }
-        while scale.len() < 512 {
-            scale.push(' ');
-        }
-        let step = format!(
-            "For scale, this line is exactly 512 bytes:\n{scale}\n\n{} into one line, in at most 512 bytes:\n{source}",
-            if key.level == 0 {
-                "Compress this message"
-            } else {
-                "Merge these two lines"
-            }
+        // Same frozen catalogue and root system prefix as normal channel turns;
+        // compactions carry no executable tools. Separate durable affinity is
+        // retained deliberately: transport/session identity is not memory state.
+        let catalogue = self.skills.cache_catalogue(
+            &channel.to_string(),
+            &self
+                .skills
+                .catalogue(self.config.curator.description_chars)?,
+            false,
+        )?;
+        let system = system_prompt_with_claude(
+            false,
+            self.config.agent.coordinator_root,
+            self.config.claude.enabled,
+            &format!("{}\n{catalogue}", crate::skill_library::INDEX),
+            &self.curator_instructions,
         );
-        let mut history = Provider::start(vendor, context, &step);
+        let step = crate::memory::compaction_task(key, source);
+        let original = Provider::start(vendor, context, &step);
+        let mut note: Option<String> = None;
         let mut best: Option<String> = None;
         let provider = self
             .provider
             .clone()
             .with_cache_affinity(self.store.cache_affinity(&format!("compactor:{channel}"))?);
+        // A retry is the original context/task + at most one latest cutoff
+        // note. Never feed prior answers or reasoning back into compaction.
         for _ in 0..5 {
-            let response = provider
-                .step(model, reasoning, COMPACT, &history, &[])
-                .await?;
+            let mut history = original.clone();
+            if let Some(note) = &note {
+                history.push(Provider::user(vendor, note));
+            }
+            let response = match provider
+                .step(model, reasoning, &system, &history, &[])
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    if let Some(best) = best {
+                        return Ok(best);
+                    }
+                    return Err(error);
+                }
+            };
             let line = response
                 .texts
                 .iter()
                 .filter(|(_, thought)| !*thought)
                 .map(|(t, _)| t.as_str())
                 .collect::<Vec<_>>()
-                .join("\n")
-                .trim()
-                .to_string();
-            ensure!(!line.is_empty(), "empty summary");
-            Provider::append_response(vendor, &mut history, &response);
+                .join("\n");
+            let line = crate::memory::summary_trim(&line).to_owned();
+            if line.is_empty() {
+                break;
+            }
             if best.as_ref().is_none_or(|s| line.len() < s.len()) {
                 best = Some(line.clone());
             }
             if line.len() <= 512 {
                 break;
             }
-            let mut end = 512;
-            while !line.is_char_boundary(end) {
-                end -= 1;
-            }
-            history.push(Provider::user(vendor,&format!("That line is {} bytes; the limit is 512. It must end where it is cut here:\n{}| ← LIMIT",line.len(),&line[..end])));
+            note = Some(crate::memory::compaction_over(&line));
         }
-        best.context("no summary")
+        // An answered refusal/empty line is its input's doing: retain a clipped
+        // source, just like UniiChat. Transport failures remain patient retries.
+        Ok(best.unwrap_or_else(|| crate::memory::compaction_fallback(source)))
     }
 }
 
@@ -4645,9 +4668,9 @@ mod tests {
         assert_eq!(requests[0]["input"].as_array().unwrap().len(), 2);
         assert_eq!(
             requests[0]["input"][1]["content"].as_array().unwrap().len(),
-            2
+            3
         );
-        assert_eq!(requests[0]["input"][1]["content"][1]["text"], "do work");
+        assert_eq!(requests[0]["input"][1]["content"][2]["text"], "do work");
         server.abort();
     }
     #[tokio::test]
@@ -5141,6 +5164,7 @@ for line in sys.stdin:
     }
     include!("runtime_attachment_tests.rs");
     include!("runtime_curator_tests.rs");
+    include!("runtime_optmem_tests.rs");
     include!("runtime_request_retry_tests.rs");
     #[tokio::test]
     async fn zai_tool_loop_preserves_native_reasoning_but_never_publishes_or_logs_it() {

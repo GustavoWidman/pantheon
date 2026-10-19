@@ -17,6 +17,7 @@ pub mod runtime;
 pub mod skill_dashboard;
 pub mod skill_library;
 pub mod skills;
+pub mod state_namespace;
 pub mod store;
 pub mod tools;
 mod transport;

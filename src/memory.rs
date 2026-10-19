@@ -1,12 +1,14 @@
-//! OptChat's append-only history, binary summary tree, and incremental view.
+//! Native OptMem engine following UniiChat 0500bf6.
+//! Algorithm/task adaptation: Victor Taelin, Apache-2.0; see THIRD_PARTY_NOTICES.md.
 //!
 //! Callers serialize mutations (the harness uses a Tokio mutex). No provider
 //! requests happen here: ready jobs are completed by the background compactor.
 
 use anyhow::{Context, Result, ensure};
-use chrono::Local;
+use chrono::{Local, NaiveDate};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use std::os::unix::fs::FileExt as UnixFileExt;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs::{self, File, OpenOptions},
@@ -19,7 +21,10 @@ pub const VIEW_BYTES: usize = 128_000;
 pub const TOOL_CHARS: usize = 30_000;
 pub const COMPACT: &str = include_str!("compact.txt");
 const PLACEHOLDER: &str = "(not summarized yet: zoom it)";
-const VIEW_FRAME_BYTES: usize = "<chat>\n</chat>".len();
+pub const COMPACTOR_BYTES: usize = 32_000;
+pub const COMPACTOR_JOBS: usize = 64;
+const FORMAT: &str = "pantheon-optmem-uniichat-0500bf6-v1\n";
+const INDEX_SLOT: u64 = 24;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -58,7 +63,7 @@ impl NodeKey {
         self.index.saturating_mul(self.count())
     }
 
-    fn end(self) -> Option<u64> {
+    pub fn end(self) -> Option<u64> {
         self.index.checked_add(1)?.checked_mul(self.count())
     }
 
@@ -69,7 +74,7 @@ impl NodeKey {
         }
     }
 
-    fn children(self) -> [Self; 2] {
+    pub fn children(self) -> [Self; 2] {
         [
             Self {
                 level: self.level - 1,
@@ -83,6 +88,8 @@ impl NodeKey {
     }
 }
 
+// Each ID is one native page, not one UI message. `more` makes the whole
+// page group visible only after its last journal record is durable.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Message {
     i: u64,
@@ -92,200 +99,322 @@ struct Message {
     date: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_id: Option<String>,
+    #[serde(default)]
+    more: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    images: Vec<String>,
 }
-
 #[derive(Debug, Deserialize, Serialize)]
 struct Node {
     l: u32,
     i: u64,
     text: String,
     size: usize,
+    serial: u64,
 }
-
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct View {
+    parts: Vec<NodeKey>,
+    batch: bool,
+}
 #[derive(Deserialize, Serialize)]
 struct SavedView {
     version: u32,
     messages: u64,
-    merging: bool,
-    parts: Vec<NodeKey>,
+    view: View,
+    seen: View,
 }
 
-struct DailyLog {
+// Rebuildable sparse indexes contain day, byte offset and record length. They
+// never contain text. Tree slots use UniiChat's (2*i+1)*2^l-1 layout. Journals
+// are authoritative; an index write failure poisons the writer too.
+#[cfg(test)]
+#[derive(Default)]
+struct WriteFault {
+    short: Option<usize>,
+    sync: bool,
+    index: bool,
+}
+struct Journal {
+    #[cfg(test)]
+    fault: WriteFault,
     directory: PathBuf,
+    index: File,
     current: Option<(String, File)>,
 }
-
-impl DailyLog {
-    fn append<T: Serialize>(&mut self, entry: &T) -> Result<()> {
-        let day = Local::now().format("%Y-%m-%d").to_string();
+impl Journal {
+    fn open(path: &Path, stream: &str) -> Result<Self> {
+        Ok(Self {
+            #[cfg(test)]
+            fault: WriteFault::default(),
+            directory: path.join(stream),
+            index: OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(path.join(format!("{stream}.index")))?,
+            current: None,
+        })
+    }
+    fn slot(key: NodeKey) -> u64 {
+        ((2 * key.index + 1) << key.level) - 1
+    }
+    fn position(&self, slot: u64) -> Result<Option<[u64; 3]>> {
+        let mut bytes = [0; 24];
+        let mut read = 0;
+        while read < bytes.len() {
+            let n = self
+                .index
+                .read_at(&mut bytes[read..], slot * INDEX_SLOT + read as u64)?;
+            if n == 0 {
+                return Ok(None);
+            }
+            read += n;
+        }
+        let p = std::array::from_fn(|i| {
+            u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap())
+        });
+        Ok((p[2] != 0).then_some(p))
+    }
+    fn place(&self, slot: u64, pos: [u64; 3]) -> Result<()> {
+        let bytes: Vec<u8> = pos.into_iter().flat_map(u64::to_le_bytes).collect();
+        self.index.write_all_at(&bytes, slot * INDEX_SLOT)?;
+        Ok(())
+    }
+    fn day_path(&self, day: u64) -> Result<PathBuf> {
+        let date = NaiveDate::from_num_days_from_ce_opt(day as i32).context("invalid index day")?;
+        Ok(self.directory.join(format!("{date}.jsonl")))
+    }
+    fn read<T: serde::de::DeserializeOwned>(&self, slot: u64) -> Result<Option<T>> {
+        let Some([day, offset, len]) = self.position(slot)? else {
+            return Ok(None);
+        };
+        ensure!(len < 128_000_000, "corrupt index record length");
+        let file = File::open(self.day_path(day)?)?;
+        let mut bytes = vec![0; len as usize];
+        file.read_exact_at(&mut bytes, offset)?;
+        Ok(Some(
+            serde_json::from_slice(&bytes).context("invalid indexed journal record")?,
+        ))
+    }
+    // A group is one append + fsync. IDs/indexes become visible only afterwards.
+    fn append<T: Serialize>(&mut self, records: &[(u64, T)]) -> Result<()> {
+        use chrono::Datelike;
+        let now = Local::now();
+        let day = now.format("%Y-%m-%d").to_string();
         if self.current.as_ref().map(|(d, _)| d) != Some(&day) {
             let path = self.directory.join(format!("{day}.jsonl"));
-            let existed = path.exists();
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .with_context(|| format!("open {}", path.display()))?;
-            if !existed {
-                // The directory entry must survive a power loss too.
-                File::open(&self.directory)?.sync_all()?;
-            }
+            let file = OpenOptions::new().create(true).append(true).open(path)?;
+            File::open(&self.directory)?.sync_all()?;
             self.current = Some((day, file));
         }
-        let mut bytes = serde_json::to_vec(entry)?;
-        bytes.push(b'\n');
-        let file = &mut self.current.as_mut().expect("opened daily log").1;
-        // One write, as specified. A short write is an error, never silently
-        // completed by write_all: recovery skips its torn JSON on restart.
-        let written = file.write(&bytes)?;
+        let file = &mut self.current.as_mut().unwrap().1;
+        let mut bytes = Vec::new();
+        let mut places = Vec::new();
+        let base = file.metadata()?.len();
+        for (slot, rec) in records {
+            let offset = bytes.len();
+            serde_json::to_writer(&mut bytes, rec)?;
+            places.push((
+                *slot,
+                [
+                    now.date_naive().num_days_from_ce() as u64,
+                    base + offset as u64,
+                    (bytes.len() - offset) as u64,
+                ],
+            ));
+            bytes.push(b'\n');
+        }
+        #[cfg(test)]
+        let write_len = self.fault.short.unwrap_or(bytes.len()).min(bytes.len());
+        #[cfg(not(test))]
+        let write_len = bytes.len();
+        let n = file.write(&bytes[..write_len])?;
         ensure!(
-            written == bytes.len(),
-            "short journal write ({written}/{} bytes)",
+            n == bytes.len(),
+            "short journal write ({n}/{})",
             bytes.len()
         );
+        #[cfg(test)]
+        if self.fault.sync {
+            anyhow::bail!("injected fsync failure");
+        }
         file.sync_all()?;
+        #[cfg(test)]
+        if self.fault.index {
+            anyhow::bail!("injected index failure after journal fsync");
+        }
+        for (slot, pos) in places {
+            self.place(slot, pos)?;
+        }
+        self.index.sync_all()?;
+        Ok(())
+    }
+    // Stream originals once on recovery; never retain their bodies in RAM.
+    // Strict parsing prevents hiding a missing permanent ID after corruption.
+    fn scan<T: serde::de::DeserializeOwned>(
+        &self,
+        mut visit: impl FnMut(T, [u64; 3]) -> Result<()>,
+    ) -> Result<()> {
+        use chrono::Datelike;
+        let mut paths = fs::read_dir(&self.directory)?
+            .map(|e| e.map(|e| e.path()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        paths.retain(|p| p.extension().is_some_and(|s| s == "jsonl"));
+        paths.sort();
+        for path in paths {
+            let date = NaiveDate::parse_from_str(
+                path.file_stem()
+                    .unwrap()
+                    .to_str()
+                    .context("invalid journal name")?,
+                "%Y-%m-%d",
+            )?;
+            let mut reader = BufReader::new(File::open(&path)?);
+            let mut offset = 0;
+            let mut bytes = Vec::new();
+            loop {
+                bytes.clear();
+                let n = reader.read_until(b'\n', &mut bytes)?;
+                if n == 0 {
+                    break;
+                }
+                // A torn final write is retained and terminated, never interpreted.
+                if !bytes.ends_with(b"\n") {
+                    let mut file = OpenOptions::new().append(true).open(&path)?;
+                    file.write_all(b"\n")?;
+                    file.sync_all()?;
+                    bytes.push(b'\n');
+                }
+                if let Ok(rec) = serde_json::from_slice::<T>(&bytes) {
+                    visit(
+                        rec,
+                        [
+                            date.num_days_from_ce() as u64,
+                            offset,
+                            (bytes.len() - 1) as u64,
+                        ],
+                    )?;
+                } else {
+                    tracing::warn!(path=%path.display(), offset, "skipped invalid journal record");
+                }
+                offset += bytes.len() as u64;
+            }
+        }
         Ok(())
     }
 }
 
 pub struct Memory {
-    // An advisory flock is released by the kernel on process death, including
-    // SIGKILL. Never remove the lock inode: that would let another writer in.
     _lock: File,
-    root: Vec<Message>,
+    directory: PathBuf,
+    count: u64,
+    open: u64,
+    serial: u64,
     sources: HashMap<String, u64>,
+    // Only lines of either view and their ancestors live here. Descendants are
+    // looked up on disk when zoomed; originals never live here.
     nodes: BTreeMap<NodeKey, String>,
     ready: BTreeSet<NodeKey>,
-    next_leaf: u64,
-    view: Vec<NodeKey>,
-    mergeable: BTreeSet<NodeKey>,
-    view_bytes: usize,
+    busy: BTreeMap<NodeKey, String>,
+    view: View,
+    seen: View,
     budget: usize,
-    merging: bool,
-    view_path: PathBuf,
-    view_dirty: bool,
-    main_log: DailyLog,
-    tree_log: DailyLog,
+    main_log: Journal,
+    tree_log: Journal,
     poisoned: bool,
 }
 
-/// A settled, immutable view and its exact read-only expansion data.
-/// Private research can retain this across later main-session compaction without
-/// opening another writer or reading future messages from the live session.
+// A frozen partition with immutable journal frontiers. Private readers cannot
+// see future originals or summaries completed after this snapshot. It serializes
+// paths/frontiers and view lines, not an O(history) copy of the whole bank.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct MemorySnapshot {
-    root: Vec<Message>,
-    #[serde(with = "snapshot_nodes")]
-    nodes: BTreeMap<NodeKey, String>,
-    view: Vec<NodeKey>,
+    version: u32,
+    directory: PathBuf,
+    count: u64,
+    serial: u64,
+    rendered: String,
 }
-
-mod snapshot_nodes {
-    use super::*;
-    use serde::{Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(
-        nodes: &BTreeMap<NodeKey, String>,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        nodes.iter().collect::<Vec<_>>().serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<BTreeMap<NodeKey, String>, D::Error> {
-        Ok(Vec::<(NodeKey, String)>::deserialize(deserializer)?
-            .into_iter()
-            .collect())
-    }
-}
-
 impl MemorySnapshot {
     pub fn message_count(&self) -> u64 {
-        self.root.len() as u64
+        self.count
     }
-
     pub fn render(&self) -> String {
-        let mut out = String::from("<chat>\n");
-        for &key in &self.view {
-            out.push_str(&self.render_line(key));
-            out.push('\n');
-        }
-        out.push_str("</chat>");
-        out
+        self.rendered.clone()
     }
-
-    pub fn zoom(&self, id: u64, n: u64) -> Result<String> {
+    fn journals(&self) -> Result<(Journal, Journal)> {
+        ensure!(self.version == 2, "unsupported memory snapshot format");
         ensure!(
-            n.is_power_of_two()
-                && id.is_multiple_of(n)
-                && id
-                    .checked_add(n)
-                    .is_some_and(|end| end <= self.message_count()),
-            "No line {id}+{n}."
+            fs::read_to_string(self.directory.join("format"))? == FORMAT,
+            "snapshot memory format changed"
         );
-        if n == 1 {
-            let message = &self.root[id as usize];
-            return Ok(format!(
-                "{id}+0|{}: {}",
-                message.kind.as_str(),
-                message.text
-            ));
-        }
-        let key = NodeKey {
-            level: n.ilog2(),
-            index: id / n,
+        // Read-only: never create files or alter indexes in a private reader.
+        let open = |stream: &str| -> Result<Journal> {
+            Ok(Journal {
+                #[cfg(test)]
+                fault: WriteFault::default(),
+                directory: self.directory.join(stream),
+                index: File::open(self.directory.join(format!("{stream}.index")))?,
+                current: None,
+            })
         };
-        let [left, right] = key.children();
-        ensure!(
-            self.nodes.contains_key(&left) && self.nodes.contains_key(&right),
-            "No line {id}+{n}."
-        );
-        Ok(format!(
-            "{}\n{}",
-            self.render_line(left),
-            self.render_line(right)
-        ))
+        Ok((open("main")?, open("tree")?))
     }
-
+    pub fn zoom(&self, id: u64, n: u64) -> Result<String> {
+        self.zoom_at(id, n, 0)
+    }
+    pub fn zoom_at(&self, id: u64, n: u64, at: usize) -> Result<String> {
+        let (main, tree) = self.journals()?;
+        zoom(&main, &tree, self.count, self.serial, id, n, at)
+    }
     pub fn date(&self, id: u64) -> Result<String> {
-        Ok(self
-            .root
-            .get(id as usize)
-            .with_context(|| format!("No message {id}."))?
-            .date
-            .clone())
-    }
-
-    fn render_line(&self, key: NodeKey) -> String {
-        format!(
-            "{}+{}|{}",
-            key.start(),
-            key.count(),
-            self.nodes
-                .get(&key)
-                .map_or_else(|| PLACEHOLDER.to_owned(), |text| flatten(text))
-        )
+        ensure!(id < self.count, "No message {id}.");
+        let (main, _) = self.journals()?;
+        Ok(main.read::<Message>(id)?.context("missing original")?.date)
     }
 }
-
 impl Drop for Memory {
     fn drop(&mut self) {
-        // Closing the parent descriptor alone can retain flock briefly if a
-        // concurrent process spawn inherited the open file description before
-        // exec applies CLOEXEC. Explicit unlock releases ownership on a
-        // deliberate close even while such a child still holds its descriptor.
-        // Kernel close remains the fallback for process death/SIGKILL.
-        if let Err(error) = FileExt::unlock(&self._lock) {
-            tracing::error!(%error, "failed to release memory writer lock");
+        if let Err(e) = FileExt::unlock(&self._lock) {
+            tracing::error!(error=%e, "memory unlock failed");
         }
     }
 }
-
 impl Memory {
+    /// Validate native schema without creating locks, indexes, or journals.
+    pub fn validate_namespace(path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => ensure!(
+                metadata.is_dir(),
+                "memory namespace must be a real directory"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        if path.join("format").try_exists()? {
+            ensure!(
+                fs::symlink_metadata(path.join("format"))?
+                    .file_type()
+                    .is_file()
+                    && fs::read_to_string(path.join("format"))? == FORMAT,
+                "unsupported memory format"
+            );
+        } else {
+            ensure!(
+                fs::read_dir(path)?.next().is_none(),
+                "memory directory is nonempty but has no native format marker"
+            );
+        }
+        Ok(())
+    }
     pub fn open(path: impl AsRef<Path>, budget: usize) -> Result<Self> {
         ensure!(budget > 0, "view budget must be positive");
         let path = path.as_ref();
+        // Must precede mkdir, lock creation, index repair, or checkpoint writes.
+        Self::validate_namespace(path)?;
         create_durable_dir(path)?;
         let lock = OpenOptions::new()
             .create(true)
@@ -293,193 +422,343 @@ impl Memory {
             .read(true)
             .write(true)
             .open(path.join("lock"))?;
-        FileExt::try_lock_exclusive(&lock)
-            .with_context(|| format!("chat {} already has a writer", path.display()))?;
-        let main_dir = path.join("main");
-        let tree_dir = path.join("tree");
-        create_durable_dir(&main_dir)?;
-        create_durable_dir(&tree_dir)?;
-        File::open(path)?.sync_all()?;
-
-        let mut root: Vec<Message> = read_journals(&main_dir)?;
-        root.sort_unstable_by_key(|message| message.i);
-        let mut sources = HashMap::new();
-        for (index, message) in root.iter().enumerate() {
-            ensure!(
-                message.i == index as u64,
-                "non-contiguous history: expected id {index}, found {}; refusing to renumber permanent IDs",
-                message.i
-            );
-            ensure!(
-                message.size == message.kind.as_str().len() + 2 + message.text.len(),
-                "incorrect size of message {}",
-                message.i
-            );
-            chrono::DateTime::parse_from_rfc3339(&message.date)
-                .with_context(|| format!("invalid date on message {}", message.i))?;
-            if let Some(source) = &message.source_id {
-                ensure!(
-                    !source.is_empty(),
-                    "empty provenance on message {}",
-                    message.i
-                );
-                ensure!(
-                    sources.insert(source.clone(), message.i).is_none(),
-                    "duplicate provenance {source:?} in history"
-                );
-            }
+        FileExt::try_lock_exclusive(&lock).context("memory already has a writer")?;
+        if !path.join("format").exists() {
+            let mut marker = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(path.join("format"))?;
+            marker.write_all(FORMAT.as_bytes())?;
+            marker.sync_all()?;
+            File::open(path)?.sync_all()?;
         }
-        let records: Vec<Node> = read_journals(&tree_dir)?;
-        let mut nodes = BTreeMap::new();
-        for node in records {
+        create_durable_dir(&path.join("main"))?;
+        create_durable_dir(&path.join("tree"))?;
+        let main_log = Journal::open(path, "main")?;
+        let tree_log = Journal::open(path, "tree")?;
+        // Sidecars are disposable. Always rebuild them from fsynced journals;
+        // never renumber IDs or treat an index as an authoritative journal.
+        main_log.index.set_len(0)?;
+        tree_log.index.set_len(0)?;
+        let mut count = 0;
+        let mut visible = 0;
+        let mut sources = HashMap::new();
+        let mut pending_sources = Vec::new();
+        main_log.scan::<Message>(|msg, pos| {
+            // Native positional IDs are published only by a closing page.
+            // Restarted writers may shadow an unfinished group's positions,
+            // never a visible ID. Physical journal records remain immutable.
+            if msg.i != count {
+                ensure!(
+                    count > visible && msg.i == visible,
+                    "original ID may only restart at unfinished frontier {visible}, got {}",
+                    msg.i
+                );
+                for source in pending_sources.drain(..) {
+                    sources.remove(&source);
+                }
+                count = visible;
+            }
+            ensure!(msg.i == count, "non-contiguous original IDs");
+            ensure!(msg.size == show(&msg, true).len(), "invalid original size");
+            chrono::DateTime::parse_from_rfc3339(&msg.date)?;
+            if let Some(source) = &msg.source_id {
+                ensure!(
+                    !source.is_empty() && sources.insert(source.clone(), msg.i).is_none(),
+                    "duplicate/empty source ID"
+                );
+                pending_sources.push(source.clone());
+            }
+            main_log.place(msg.i, pos)?;
+            count += 1;
+            if !msg.more {
+                visible = count;
+                pending_sources.clear();
+            }
+            Ok(())
+        })?;
+        // Match UniiChat load: incomplete trailing groups do not survive as
+        // active `open` pages. Their fsynced records stay in the journal, but
+        // their unpublished positions/source IDs may be replaced on append.
+        for source in pending_sources {
+            sources.remove(&source);
+        }
+        let open = 0;
+        let count = visible;
+        let mut serial = 0;
+        tree_log.scan::<Node>(|node, pos| {
             let key = NodeKey {
                 level: node.l,
                 index: node.i,
             };
             ensure!(
-                key.count() > 0 && key.end().is_some_and(|end| end <= root.len() as u64),
-                "summary {:?} extends outside the history",
-                key
+                key.count() > 0 && key.end().is_some_and(|e| e <= count),
+                "tree extends outside originals"
             );
             ensure!(
-                node.size == node.text.len() && !node.text.trim().is_empty(),
-                "invalid summary {:?}",
-                key
+                node.serial == serial && node.size == node.text.len() && !node.text.is_empty(),
+                "invalid tree record"
             );
             ensure!(
-                nodes.insert(key, node.text).is_none(),
-                "duplicate summary {:?}",
-                key
+                tree_log.position(Journal::slot(key))?.is_none(),
+                "duplicate summary"
             );
-        }
-        for key in nodes.keys().filter(|key| key.level > 0) {
-            ensure!(
-                key.children().iter().all(|child| nodes.contains_key(child)),
-                "summary {:?} is missing a child",
-                key
-            );
-        }
-
+            if key.level > 0 {
+                for half in key.children() {
+                    ensure!(
+                        tree_log.position(Journal::slot(half))?.is_some(),
+                        "summary child missing"
+                    );
+                }
+            }
+            tree_log.place(Journal::slot(key), pos)?;
+            serial += 1;
+            Ok(())
+        })?;
+        main_log.index.sync_all()?;
+        tree_log.index.sync_all()?;
         let mut mem = Self {
             _lock: lock,
-            root,
+            directory: fs::canonicalize(path)?,
+            count,
+            open,
+            serial,
             sources,
-            nodes,
+            nodes: BTreeMap::new(),
             ready: BTreeSet::new(),
-            next_leaf: 0,
-            view: Vec::new(),
-            mergeable: BTreeSet::new(),
-            view_bytes: VIEW_FRAME_BYTES,
+            busy: BTreeMap::new(),
+            view: View::default(),
+            seen: View::default(),
             budget,
-            merging: false,
-            view_path: path.join("view.json"),
-            view_dirty: true,
-            main_log: DailyLog {
-                directory: main_dir,
-                current: None,
-            },
-            tree_log: DailyLog {
-                directory: tree_dir,
-                current: None,
-            },
+            main_log,
+            tree_log,
             poisoned: false,
         };
-        // Restore the exact partition, including an unfinished merge batch.
-        // Only legacy chats without a checkpoint need a one-time fold.
-        let covered = mem.restore_view()?;
-        for index in covered..mem.root.len() {
-            let key = NodeKey {
-                level: 0,
-                index: index as u64,
-            };
-            mem.view_bytes += mem.part_size(key);
-            mem.view.push(key);
-            mem.view_dirty = true;
-            mem.consider_view_pair(key);
-            mem.fit(index as u64 + 1);
+        // Discover only missing subtrees from maximal roots. Built ancestors
+        // shortcut traversal, just like Memory.todo/down in the reference.
+        for root in roots(count) {
+            mem.todo(root)?;
         }
-        mem.update_leaf_ready();
-        let built: Vec<NodeKey> = mem.nodes.keys().copied().collect();
-        for key in built {
-            mem.consider_parent(key);
+        let checkpoint = path.join("view.json");
+        if checkpoint.exists() {
+            let saved: SavedView = serde_json::from_slice(&fs::read(checkpoint)?)
+                .context("invalid saved memory view")?;
+            ensure!(
+                saved.version == 2 && saved.messages <= count,
+                "incompatible saved memory view"
+            );
+            mem.validate_view(&saved.view, saved.messages)?;
+            ensure!(
+                saved.view.parts.last().and_then(|k| k.end()).unwrap_or(0) == saved.messages,
+                "saved main view does not cover its exact original frontier"
+            );
+            mem.validate_view(&saved.seen, saved.messages)?;
+            mem.view = saved.view;
+            mem.seen = saved.seen;
+        } else {
+            for root in roots(count) {
+                let parts = mem.down(root)?;
+                mem.view.parts.extend(parts);
+            }
+            mem.seen = mem.view.clone();
         }
-        mem.build_free_nodes()?;
-        mem.checkpoint_view()?;
+        mem.load_view_nodes()?;
+        mem.fit(false)?;
+        mem.pump_free()?;
+        mem.checkpoint()?;
         Ok(mem)
     }
-
-    /// Every committed append is fsynced before its ID becomes visible.
+    fn healthy(&self) -> Result<()> {
+        ensure!(!self.poisoned, "journal state uncertain; reopen memory");
+        Ok(())
+    }
+    fn message(&self, id: u64) -> Result<Message> {
+        ensure!(id < self.count, "No message {id}.");
+        self.main_log.read(id)?.context("missing original")
+    }
+    fn node(&self, key: NodeKey) -> Result<Option<String>> {
+        if let Some(text) = self.nodes.get(&key) {
+            return Ok(Some(text.clone()));
+        }
+        Ok(self
+            .tree_log
+            .read::<Node>(Journal::slot(key))?
+            .map(|n| n.text))
+    }
+    fn built(&self, key: NodeKey) -> bool {
+        self.nodes.contains_key(&key)
+    }
+    fn todo(&mut self, key: NodeKey) -> Result<()> {
+        if let Some(text) = self.node(key)? {
+            self.nodes.insert(key, text);
+            return Ok(());
+        }
+        if key.level == 0 {
+            self.ready.insert(key);
+            return Ok(());
+        }
+        for half in key.children() {
+            self.todo(half)?;
+        }
+        if key.children().iter().all(|k| self.built(*k)) {
+            self.ready.insert(key);
+        }
+        Ok(())
+    }
+    fn down(&mut self, key: NodeKey) -> Result<Vec<NodeKey>> {
+        if self.built(key) || key.level == 0 {
+            return Ok(vec![key]);
+        }
+        let mut out = Vec::new();
+        for half in key.children() {
+            out.extend(self.down(half)?)
+        }
+        Ok(out)
+    }
+    fn load_view_nodes(&mut self) -> Result<()> {
+        let parts: Vec<_> = self
+            .view
+            .parts
+            .iter()
+            .chain(&self.seen.parts)
+            .copied()
+            .collect();
+        for part in parts {
+            let mut key = part;
+            while key.end().is_some_and(|e| e <= self.count) {
+                if let Some(text) = self.node(key)? {
+                    self.nodes.insert(key, text);
+                }
+                if key.level >= 62 {
+                    break;
+                }
+                key = key.parent();
+            }
+        }
+        Ok(())
+    }
     pub fn append(&mut self, kind: Kind, text: &str) -> Result<u64> {
-        self.append_entry(kind, text, None)
+        self.append_entry(kind, text, &[], false, None, None)
     }
-
-    /// Deduplicate a durable external admission without changing its exact text.
-    /// Source IDs are opaque, stable, and unique within this chat directory.
     pub fn append_with_id(&mut self, kind: Kind, text: &str, source_id: &str) -> Result<u64> {
-        ensure!(
-            !source_id.is_empty(),
-            "admission source ID must not be empty"
-        );
-        if let Some(index) = self.lookup_source(source_id) {
-            let existing = &self.root[index as usize];
+        ensure!(!source_id.is_empty(), "empty source ID");
+        if let Some(id) = self.sources.get(source_id).copied() {
+            let mut joined = String::new();
+            let mut i = id;
+            loop {
+                let msg = self.message(i)?;
+                ensure!(msg.kind == kind, "admission kind mismatch");
+                joined.push_str(&msg.text);
+                i += 1;
+                if !msg.more {
+                    break;
+                }
+            }
             ensure!(
-                existing.kind == kind && existing.text == text,
-                "admission {source_id:?} was already committed with different content"
+                joined == text,
+                "admission {source_id:?} already committed with different content"
             );
-            return Ok(index);
+            return Ok(id);
         }
-        self.append_entry(kind, text, Some(source_id))
+        self.append_entry(kind, text, &[], false, Some(source_id), None)
     }
-    /// Read-only admission lookup for durable cross-database delivery bridges.
     pub fn has_source(&self, source_id: &str) -> bool {
-        self.sources.contains_key(source_id)
+        self.lookup_source(source_id).is_some()
     }
-
     pub fn lookup_source(&self, source_id: &str) -> Option<u64> {
-        self.sources.get(source_id).copied()
+        self.sources
+            .get(source_id)
+            .copied()
+            .filter(|id| *id < self.count)
     }
-
-    fn append_entry(&mut self, kind: Kind, text: &str, source_id: Option<&str>) -> Result<u64> {
+    /// Native streaming append: every text/image page has its own ID. `more`
+    /// holds the whole trailing group invisible. Restart abandons the active
+    /// trailing group (not its journal records), matching native Unii semantics.
+    /// Images are immutable names managed by the attachment owner; the memory
+    /// engine stores/retrieves their references, never decodes or executes them.
+    pub fn push(&mut self, kind: Kind, text: &str, images: &[String], more: bool) -> Result<u64> {
+        self.append_entry(kind, text, images, more, None, None)
+    }
+    fn append_entry(
+        &mut self,
+        kind: Kind,
+        text: &str,
+        images: &[String],
+        more: bool,
+        source_id: Option<&str>,
+        date: Option<&str>,
+    ) -> Result<u64> {
         self.healthy()?;
-        let index = self.root.len() as u64;
-        let message = Message {
-            i: index,
-            kind,
-            text: text.to_owned(),
-            size: kind.as_str().len() + 2 + text.len(),
-            date: Local::now().to_rfc3339(),
-            source_id: source_id.map(str::to_owned),
-        };
-        if let Err(error) = self.main_log.append(&message) {
+        let first = self.count + self.open;
+        let texts = clip_pages(text);
+        let n = texts.len().max(images.len().div_ceil(20));
+        let date = date
+            .map(str::to_owned)
+            .unwrap_or_else(|| Local::now().to_rfc3339());
+        let records: Vec<_> = (0..n)
+            .map(|k| {
+                let i = first + k as u64;
+                let text = if k >= n - texts.len() {
+                    texts[k - (n - texts.len())].clone()
+                } else {
+                    String::new()
+                };
+                let end = images.len().saturating_sub((n - 1 - k) * 20);
+                let mut msg = Message {
+                    i,
+                    kind,
+                    size: 0,
+                    text,
+                    date: date.clone(),
+                    source_id: if k == 0 {
+                        source_id.map(str::to_owned)
+                    } else {
+                        None
+                    },
+                    more: k + 1 < n || more,
+                    images: images[end.saturating_sub(20)..end].to_vec(),
+                };
+                msg.size = show(&msg, true).len();
+                (i, msg)
+            })
+            .collect();
+        if let Err(e) = self.main_log.append(&records) {
             self.poisoned = true;
-            return Err(error.context("history journal failed; reopen memory before writing again"));
+            return Err(e.context("original journal failed"));
         }
-        self.root.push(message);
-        if let Some(source_id) = source_id {
-            self.sources.insert(source_id.to_owned(), index);
+        let previous = self.count;
+        if more {
+            self.open += n as u64;
+        } else {
+            self.count += self.open + n as u64;
+            self.open = 0;
         }
-        let key = NodeKey { level: 0, index };
-        self.view_bytes += self.part_size(key);
-        self.view.push(key);
-        self.view_dirty = true;
-        self.consider_view_pair(key);
-        self.update_leaf_ready();
-        self.fit(self.root.len() as u64);
-        self.build_free_nodes()?;
-        self.checkpoint_view()?;
-        Ok(index)
+        if let Some(id) = source_id {
+            self.sources.insert(id.to_owned(), first);
+        }
+        for i in previous..self.count {
+            self.ready.insert(NodeKey { level: 0, index: i });
+        }
+        self.fit(true)?;
+        self.pump_free()?;
+        self.checkpoint()?;
+        Ok(first)
     }
-
+    /// Rejoin complete native pages without separators (not a zoom operation).
+    pub fn say(&self, start: u64, end: u64) -> Result<String> {
+        ensure!(
+            start <= end && end <= self.count,
+            "invalid native page range"
+        );
+        let mut out = String::new();
+        for id in start..end {
+            out.push_str(&self.message(id)?.text)
+        }
+        Ok(out)
+    }
     pub fn render(&self) -> String {
-        let mut out = String::from("<chat>\n");
-        for &key in &self.view {
-            out.push_str(&self.render_line(key));
-            out.push('\n');
-        }
-        out.push_str("</chat>");
-        out
+        render_parts(&self.view.parts, &self.nodes, self.count)
     }
-
     pub fn snapshot(&self) -> Result<MemorySnapshot> {
         self.healthy()?;
         ensure!(
@@ -487,547 +766,491 @@ impl Memory {
             "memory snapshot requires settled summaries"
         );
         Ok(MemorySnapshot {
-            root: self.root.clone(),
-            nodes: self.nodes.clone(),
-            view: self.view.clone(),
+            version: 2,
+            directory: self.directory.clone(),
+            count: self.count,
+            serial: self.serial,
+            rendered: self.render(),
         })
     }
-
-    /// A cacheable, ID-free prefix for the compactor, containing summaries only.
     pub fn compactor_context(&self, key: NodeKey) -> Result<String> {
         self.validate_job(key)?;
-        let cutoff = if key.level == 0 {
-            key.start()
-        } else {
-            key.end().unwrap()
-        };
-        ensure!(
-            cutoff <= self.first_unbuilt(),
-            "compactor context is not summarized yet"
-        );
-        let mut out = String::from("<chat>\n");
-        for &part in &self.view {
-            if part.start() >= cutoff {
-                break;
-            }
-            ensure!(
-                part.end().is_some_and(|end| end <= cutoff),
-                "context crosses node boundary"
-            );
-            let text = self
-                .nodes
-                .get(&part)
-                .context("unbuilt line in compactor context")?;
-            out.push_str(&flatten(text));
-            out.push('\n');
-        }
-        out.push_str("</chat>");
-        Ok(out)
+        self.busy
+            .get(&key)
+            .cloned()
+            .context("node has not been scheduled")
     }
-
-    /// Whole message (never truncated) or precisely the two adjacent children.
     pub fn source(&self, key: NodeKey) -> Result<String> {
         self.validate_job(key)?;
         if key.level == 0 {
-            let message = &self.root[key.index as usize];
-            Ok(format!("{}: {}", message.kind.as_str(), message.text))
+            let msg = self.message(key.index)?;
+            Ok(show(&msg, true))
         } else {
-            let [left, right] = key.children();
+            let [a, b] = key.children();
             Ok(format!(
                 "{}\n{}",
-                flatten(&self.nodes[&left]),
-                flatten(&self.nodes[&right])
+                flatten(&self.node(a)?.context("missing child")?),
+                flatten(&self.node(b)?.context("missing child")?)
             ))
         }
     }
-
-    /// Busy/retry exclusion belongs to the async pump, outside this data store.
-    pub fn ready_jobs(&self, limit: usize) -> Vec<NodeKey> {
-        let first = self.first_unbuilt();
+    fn validate_job(&self, key: NodeKey) -> Result<()> {
+        ensure!(
+            key.count() > 0 && key.end().is_some_and(|e| e <= self.count),
+            "No node {key:?}"
+        );
+        ensure!(self.node(key)?.is_none(), "summary already exists");
+        if key.level > 0 {
+            for half in key.children() {
+                ensure!(self.node(half)?.is_some(), "summary children not ready")
+            }
+        }
+        Ok(())
+    }
+    fn first_unbuilt(&self) -> u64 {
         self.ready
             .iter()
-            .copied()
-            .filter(|key| self.eligible(*key, first))
-            .take(limit)
-            .collect()
+            .find(|k| k.level == 0)
+            .map_or(self.count, |k| k.index)
     }
-
-    /// Persist the shortest trimmed compactor attempt, including slight overshoot.
+    fn candidates(&self, limit: usize) -> Vec<NodeKey> {
+        let end = self
+            .ready
+            .iter()
+            .filter(|k| k.level == 0)
+            .nth(COMPACTOR_JOBS - 1)
+            .map_or(self.count, |k| k.index);
+        let mut ready: Vec<_> = self
+            .ready
+            .iter()
+            .copied()
+            .filter(|k| ctx(*k) <= end)
+            .collect();
+        ready.sort_by_key(|k| (ctx(*k), std::cmp::Reverse(k.level)));
+        ready.truncate(limit);
+        ready
+    }
+    /// Jobs reserved by the immediate pump. The async owner dispatches each at
+    /// most once; failed provider attempts remain reserved (patient retry).
+    pub fn ready_jobs(&self, limit: usize) -> Vec<NodeKey> {
+        let mut jobs: Vec<_> = self.busy.keys().copied().collect();
+        jobs.sort_by_key(|k| (ctx(*k), std::cmp::Reverse(k.level)));
+        jobs.truncate(limit);
+        jobs
+    }
     pub fn finish(&mut self, key: NodeKey, text: &str) -> Result<()> {
         self.healthy()?;
         self.validate_job(key)?;
-        let text = text.trim();
-        ensure!(!text.is_empty(), "compactor returned an empty summary");
-        ensure!(
-            self.eligible(key, self.first_unbuilt()),
-            "summary {:?} completed out of order",
-            key
-        );
-        self.save_node(key, text.to_owned())?;
-        self.build_free_nodes()?;
-        self.checkpoint_view()
+        ensure!(self.busy.contains_key(&key), "node has not been scheduled");
+        let text = summary_trim(text);
+        ensure!(!text.is_empty(), "empty summary");
+        // Concurrent jobs may finish in any order inside the 64-leaf frontier.
+        // Their summaries are durable immediately; publication is separately gated.
+        self.store(vec![(key, text.to_owned())])?;
+        self.busy.remove(&key);
+        self.pump_free()?;
+        self.fit(false)?;
+        self.checkpoint()
     }
-
-    pub fn is_settled(&self) -> bool {
-        self.next_leaf == self.root.len() as u64
-    }
-
-    pub fn zoom(&self, id: u64, n: u64) -> Result<String> {
-        ensure!(
-            n.is_power_of_two()
-                && id.is_multiple_of(n)
-                && id
-                    .checked_add(n)
-                    .is_some_and(|end| end <= self.root.len() as u64),
-            "No line {id}+{n}."
-        );
-        if n == 1 {
-            let message = &self.root[id as usize];
-            return Ok(format!(
-                "{id}+0|{}: {}",
-                message.kind.as_str(),
-                message.text
-            ));
-        }
-        let key = NodeKey {
-            level: n.ilog2(),
-            index: id / n,
-        };
-        let [left, right] = key.children();
-        ensure!(
-            self.nodes.contains_key(&left) && self.nodes.contains_key(&right),
-            "No line {id}+{n}."
-        );
-        Ok(format!(
-            "{}\n{}",
-            self.render_line(left),
-            self.render_line(right)
-        ))
-    }
-
-    pub fn date(&self, id: u64) -> Result<String> {
-        Ok(self
-            .root
-            .get(id as usize)
-            .with_context(|| format!("No message {id}."))?
-            .date
-            .clone())
-    }
-
-    pub fn stats(&self) -> serde_json::Value {
-        serde_json::json!({
-            "messages": self.root.len(), "summaries": self.nodes.len(),
-            "view_lines": self.view.len(), "view_bytes": self.view_size(),
-            "view_budget_bytes": self.budget, "settled": self.is_settled(),
-            "ready_jobs": self.ready_jobs(usize::MAX).len(), "journal_healthy": !self.poisoned,
-        })
-    }
-
-    pub fn export_html(&self) -> String {
-        let mut out = String::from(
-            "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>Pantheon memory</title><style>body{max-width:1000px;margin:2em auto;padding:0 1em;font:16px system-ui;background:#111;color:#eee}pre{white-space:pre-wrap;overflow-wrap:anywhere}summary{cursor:pointer;color:#9cf}small{color:#aaa}details{padding:.4em;border-bottom:1px solid #333}</style><h1>Pantheon memory</h1><h2>Current view</h2><pre>",
-        );
-        out.push_str(&html_escape(&self.render()));
-        out.push_str("</pre><h2>ROOT — original messages</h2>");
-        for message in &self.root {
-            out.push_str(&format!("<details id=\"message-{}\"><summary>{}+1 · {} · {} · {} bytes</summary><pre>{}</pre></details>",
-                message.i, message.i, message.kind.as_str(), html_escape(&message.date), message.size, html_escape(&message.text)));
-        }
-        let mut level = None;
-        for (&key, text) in &self.nodes {
-            if level != Some(key.level) {
-                out.push_str(&format!("<h2>Tree level {}</h2>", key.level));
-                level = Some(key.level);
-            }
-            let first = &self.root[key.start() as usize];
-            let last = &self.root[key.end().unwrap() as usize - 1];
-            out.push_str(&format!(
-                "<details><summary>{}+{} · {} — {} · {} bytes</summary><pre>{}</pre></details>",
-                key.start(),
-                key.count(),
-                html_escape(&first.date),
-                html_escape(&last.date),
-                text.len(),
-                html_escape(text)
-            ));
-        }
-        out.push_str("</html>");
-        out
-    }
-
-    fn healthy(&self) -> Result<()> {
-        ensure!(
-            !self.poisoned,
-            "journal state uncertain after an I/O failure; reopen memory"
-        );
-        Ok(())
-    }
-
-    fn validate_job(&self, key: NodeKey) -> Result<()> {
-        ensure!(
-            key.count() > 0 && key.end().is_some_and(|end| end <= self.root.len() as u64),
-            "No node {:?}",
-            key
-        );
-        ensure!(
-            !self.nodes.contains_key(&key),
-            "summary {:?} already exists",
-            key
-        );
-        if key.level > 0 {
-            ensure!(
-                key.children()
-                    .iter()
-                    .all(|child| self.nodes.contains_key(child)),
-                "summary children are not ready"
-            );
-        }
-        Ok(())
-    }
-
-    fn first_unbuilt(&self) -> u64 {
-        // An unbuilt leaf cannot be under a built parent. Hence the oldest
-        // unbuilt view line starts exactly at the oldest unbuilt leaf.
-        self.next_leaf
-    }
-
-    fn eligible(&self, key: NodeKey, first: u64) -> bool {
-        let end = if key.level == 0 {
-            key.index
-        } else {
-            key.end().unwrap_or(u64::MAX)
-        };
-        end <= first
-    }
-
-    fn consider_parent(&mut self, key: NodeKey) {
-        if key.level >= 63 {
-            return;
-        }
-        let parent = key.parent();
-        if parent
-            .end()
-            .is_some_and(|end| end <= self.root.len() as u64)
-            && !self.nodes.contains_key(&parent)
-            && parent
-                .children()
-                .iter()
-                .all(|child| self.nodes.contains_key(child))
-        {
-            self.ready.insert(parent);
-        }
-    }
-
-    // There is only ever one eligible unbuilt leaf. Keeping the frontier avoids
-    // scanning the complete uncompressed tail on every imported-history job.
-    fn update_leaf_ready(&mut self) {
-        while self.next_leaf < self.root.len() as u64
-            && self.nodes.contains_key(&NodeKey {
-                level: 0,
-                index: self.next_leaf,
+    fn store(&mut self, parts: Vec<(NodeKey, String)>) -> Result<()> {
+        let records: Vec<_> = parts
+            .iter()
+            .enumerate()
+            .map(|(n, (k, t))| {
+                (
+                    Journal::slot(*k),
+                    Node {
+                        l: k.level,
+                        i: k.index,
+                        text: t.clone(),
+                        size: t.len(),
+                        serial: self.serial + n as u64,
+                    },
+                )
             })
-        {
-            self.next_leaf += 1;
-        }
-        if self.next_leaf < self.root.len() as u64 {
-            self.ready.insert(NodeKey {
-                level: 0,
-                index: self.next_leaf,
-            });
-        }
-    }
-
-    fn save_node(&mut self, key: NodeKey, text: String) -> Result<()> {
-        let node = Node {
-            l: key.level,
-            i: key.index,
-            size: text.len(),
-            text,
-        };
-        if let Err(error) = self.tree_log.append(&node) {
+            .collect();
+        if let Err(e) = self.tree_log.append(&records) {
             self.poisoned = true;
-            return Err(error.context("tree journal failed; reopen memory before writing again"));
+            return Err(e.context("tree journal failed"));
         }
-        if self
-            .view
-            .binary_search_by_key(&key.start(), |part| part.start())
-            .is_ok_and(|index| self.view[index] == key)
-        {
-            self.view_bytes =
-                self.view_bytes - self.part_size(key) + node.size + line_header_size(key);
-            self.view_dirty = true;
+        self.serial += records.len() as u64;
+        for (key, text) in &parts {
+            self.nodes.insert(*key, text.clone());
+            self.ready.remove(key);
         }
-        self.nodes.insert(key, node.text);
-        self.ready.remove(&key);
-        if key.level == 0 {
-            self.update_leaf_ready();
+        for (key, _) in parts {
+            let parent = key.parent();
+            if parent.end().is_some_and(|e| e <= self.count)
+                && self.node(parent)?.is_none()
+                && parent.children().iter().all(|k| self.built(*k))
+            {
+                self.ready.insert(parent);
+            }
         }
-        self.consider_parent(key);
-        if key.level > 0 {
-            self.consider_view_pair(key.children()[0]);
-        }
-        self.fit(self.root.len() as u64);
         Ok(())
     }
-
-    fn build_free_nodes(&mut self) -> Result<()> {
+    fn pump_free(&mut self) -> Result<()> {
         loop {
-            let first = self.first_unbuilt();
-            let mut free = None;
-            for &key in &self.ready {
-                if !self.eligible(key, first) {
+            let mut free = Vec::new();
+            for key in self.candidates(usize::MAX) {
+                if self.busy.len() >= COMPACTOR_JOBS {
+                    break;
+                }
+                if self.busy.contains_key(&key) {
                     continue;
                 }
-                let source = if key.level == 0 {
-                    let message = &self.root[key.index as usize];
-                    if message.size > NODE_BYTES {
-                        continue;
-                    }
-                    format!("{}: {}", message.kind.as_str(), message.text)
+                let text = self.source(key)?;
+                if text.len() <= NODE_BYTES {
+                    free.push((key, text));
                 } else {
-                    let [left, right] = key.children();
-                    let a = &self.nodes[&left];
-                    let b = &self.nodes[&right];
-                    if a.len() + 1 + b.len() > NODE_BYTES {
-                        continue;
-                    }
-                    format!("{a}\n{b}")
-                };
-                free = Some((key, source));
-                break;
-            }
-            match free {
-                Some((key, text)) => self.save_node(key, text)?,
-                None => return Ok(()),
-            }
-        }
-    }
-
-    fn part_size(&self, key: NodeKey) -> usize {
-        self.nodes.get(&key).map_or(PLACEHOLDER.len(), String::len) + line_header_size(key)
-    }
-
-    fn view_size(&self) -> usize {
-        self.view_bytes
-    }
-
-    fn view_index(&self, key: NodeKey) -> Option<usize> {
-        self.view
-            .binary_search_by_key(&key.start(), |part| part.start())
-            .ok()
-            .filter(|&index| self.view[index] == key)
-    }
-
-    // Only an append, newly built parent, or merge can enable a view pair.
-    // Tracking those pairs avoids repeatedly scanning an uncompressed tail.
-    fn consider_view_pair(&mut self, part: NodeKey) {
-        if part.level >= 63 {
-            return;
-        }
-        let left = NodeKey {
-            level: part.level,
-            index: part.index & !1,
-        };
-        let right = NodeKey {
-            level: left.level,
-            index: left.index + 1,
-        };
-        if self.nodes.contains_key(&left.parent())
-            && self.view_index(left).is_some()
-            && self.view_index(right).is_some()
-        {
-            self.mergeable.insert(left);
-        }
-    }
-
-    fn fit(&mut self, total: u64) {
-        // Grow only at the tail until the high watermark; finish a batch down
-        // to half the budget even if its parents arrive across several jobs.
-        if !self.merging && self.view_bytes > self.budget {
-            self.merging = true;
-            self.view_dirty = true;
-        }
-        if !self.merging {
-            return;
-        }
-        let target = self.budget / 2;
-        let mut size = self.view_bytes;
-        while size > target {
-            let mut best: Option<(NodeKey, u64)> = None;
-            for &a in &self.mergeable {
-                let last = a.parent().end().expect("built pair has a valid end") - 1;
-                let age = total.saturating_sub(last);
-                // Compare age / 2^level exactly. u128 protects the cross
-                // product; no floating point ties or overflow for long chats.
-                let better = best.as_ref().is_none_or(|(previous, previous_age)| {
-                    let due = (age as u128) * previous.count() as u128;
-                    let previous_due = (*previous_age as u128) * a.count() as u128;
-                    due > previous_due || (due == previous_due && a.start() < previous.start())
-                });
-                if better {
-                    best = Some((a, age));
+                    let end = ctx(key).min(self.first_unbuilt());
+                    let context = render_parts(&self.seen.parts, &self.nodes, end);
+                    self.busy.insert(key, context);
                 }
             }
-            let Some((child, _)) = best else {
+            if free.is_empty() {
                 break;
-            };
-            let index = self
-                .view_index(child)
-                .expect("mergeable pair is in the live view");
-            let parent = child.parent();
-            size = size - self.part_size(self.view[index]) - self.part_size(self.view[index + 1])
-                + self.part_size(parent);
-            self.view[index] = parent;
-            self.view.remove(index + 1);
-            self.view_dirty = true;
-            self.mergeable.remove(&child);
-            self.consider_view_pair(parent);
+            }
+            self.store(free)?;
         }
-        self.view_bytes = size;
-        if size <= target {
-            self.merging = false;
-            self.view_dirty = true;
-        }
+        self.fit(false)
     }
-
-    fn restore_view(&mut self) -> Result<usize> {
-        let bytes = match fs::read(&self.view_path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(error) => return Err(error.into()),
-        };
-        let saved: SavedView =
-            serde_json::from_slice(&bytes).context("invalid saved memory view")?;
-        ensure!(saved.version == 1, "unsupported saved memory view version");
-        ensure!(
-            saved.messages <= self.root.len() as u64,
-            "saved view exceeds history"
-        );
+    pub fn is_settled(&self) -> bool {
+        self.first_unbuilt() >= self.count
+    }
+    fn validate_view(&self, view: &View, count: u64) -> Result<()> {
         let mut end = 0;
-        for &part in &saved.parts {
-            ensure!(
-                part.count() > 0 && part.start() == end,
-                "saved view has a gap or overlap"
-            );
-            end = part.end().context("saved view range overflow")?;
-            ensure!(
-                end <= saved.messages,
-                "saved view exceeds its message count"
-            );
-            ensure!(
-                part.level == 0 || self.nodes.contains_key(&part),
-                "saved view summary is missing"
-            );
+        for key in &view.parts {
+            ensure!(key.count() > 0 && key.start() == end, "view gap/overlap");
+            end = key.end().context("view overflow")?;
+            ensure!(end <= count, "view exceeds originals");
+            if key.level > 0 {
+                ensure!(self.node(*key)?.is_some(), "view summary missing")
+            }
         }
-        ensure!(
-            end == saved.messages,
-            "saved view does not cover its history"
-        );
-        self.view = saved.parts;
-        self.merging = saved.merging;
-        self.view_dirty = false;
-        self.view_bytes = VIEW_FRAME_BYTES
-            + self
-                .view
-                .iter()
-                .map(|&key| self.part_size(key))
-                .sum::<usize>();
-        for index in 0..self.view.len() {
-            self.consider_view_pair(self.view[index]);
-        }
-        Ok(saved.messages as usize)
+        Ok(())
     }
-
-    fn checkpoint_view(&mut self) -> Result<()> {
-        if !self.view_dirty {
-            return Ok(());
+    fn fit(&mut self, next: bool) -> Result<()> {
+        let frontier = self.first_unbuilt();
+        let mut view = std::mem::take(&mut self.view);
+        let mut seen = std::mem::take(&mut self.seen);
+        self.fit_view(&mut view, self.count, self.budget, next)?;
+        self.fit_view(&mut seen, frontier, COMPACTOR_BYTES, next)?;
+        self.view = view;
+        self.seen = seen;
+        // Prune anything strictly below both partitions, retaining ancestors.
+        let view = &self.view;
+        let seen = &self.seen;
+        self.nodes
+            .retain(|key, _| held(view, *key) || held(seen, *key));
+        Ok(())
+    }
+    fn fit_view(&self, view: &mut View, end: u64, high: usize, next: bool) -> Result<()> {
+        view.parts.retain(|k| k.end().is_some_and(|e| e <= end));
+        let at = view.parts.last().and_then(|k| k.end()).unwrap_or(0);
+        view.parts
+            .extend((at..end).map(|index| NodeKey { level: 0, index }));
+        let size = part_bytes(&view.parts, &self.nodes);
+        if size > high || (next && view.batch) {
+            let merged = merge(view, end, high, &self.nodes);
+            let merged_size = part_bytes(&merged, &self.nodes);
+            if next || merged_size <= std::cmp::max(high / 2, size.saturating_sub(high)) {
+                view.parts = merged;
+            }
+            view.batch = part_bytes(&view.parts, &self.nodes) > high / 2;
         }
-        let temporary = self.view_path.with_extension("json.tmp");
+        Ok(())
+    }
+    fn checkpoint(&mut self) -> Result<()> {
+        self.healthy()?;
         let result = (|| -> Result<()> {
             let bytes = serde_json::to_vec(&SavedView {
-                version: 1,
-                messages: self.root.len() as u64,
-                merging: self.merging,
-                parts: self.view.clone(),
+                version: 2,
+                messages: self.count,
+                view: self.view.clone(),
+                seen: self.seen.clone(),
             })?;
+            let path = self.directory.join("view.json");
+            if fs::read(&path).ok().as_deref() == Some(bytes.as_slice()) {
+                return Ok(());
+            }
+            let tmp = self.directory.join("view.json.new");
             let mut file = OpenOptions::new()
                 .create(true)
                 .truncate(true)
                 .write(true)
-                .open(&temporary)?;
+                .open(&tmp)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
-            fs::rename(&temporary, &self.view_path)?;
-            File::open(self.view_path.parent().expect("view has a directory"))?.sync_all()?;
+            fs::rename(tmp, path)?;
+            File::open(&self.directory)?.sync_all()?;
             Ok(())
         })();
-        if let Err(error) = result {
+        if let Err(e) = result {
             self.poisoned = true;
-            return Err(error.context("view checkpoint failed; reopen memory before writing again"));
+            return Err(e.context("view checkpoint failed"));
         }
-        self.view_dirty = false;
         Ok(())
     }
-
-    fn render_line(&self, key: NodeKey) -> String {
-        format!(
-            "{}+{}|{}",
-            key.start(),
-            key.count(),
-            self.nodes
-                .get(&key)
-                .map_or_else(|| PLACEHOLDER.to_owned(), |text| flatten(text))
+    pub fn zoom(&self, id: u64, n: u64) -> Result<String> {
+        self.zoom_at(id, n, 0)
+    }
+    pub fn zoom_at(&self, id: u64, n: u64, at: usize) -> Result<String> {
+        zoom(
+            &self.main_log,
+            &self.tree_log,
+            self.count,
+            self.serial,
+            id,
+            n,
+            at,
         )
     }
-}
-
-fn line_header_size(key: NodeKey) -> usize {
-    // id+n| and the terminating newline also consume the view byte budget.
-    key.start().checked_ilog10().unwrap_or(0) as usize
-        + key.count().checked_ilog10().unwrap_or(0) as usize
-        + 5
-}
-
-/// Invalid JSON (including torn UTF-8) is reported and skipped. Repair only the
-/// missing final newline, without modifying a byte of existing history.
-fn read_journals<T: serde::de::DeserializeOwned>(directory: &Path) -> Result<Vec<T>> {
-    let mut paths = fs::read_dir(directory)?
-        .map(|entry| entry.map(|e| e.path()))
-        .collect::<std::io::Result<Vec<_>>>()?;
-    paths.retain(|path| path.extension().is_some_and(|ext| ext == "jsonl"));
-    paths.sort();
-    let mut entries = Vec::new();
-    for path in paths {
-        let mut reader = BufReader::new(File::open(&path)?);
-        let mut bytes = Vec::new();
-        let mut line = 0;
-        let mut missing_newline = false;
-        loop {
-            bytes.clear();
-            if reader.read_until(b'\n', &mut bytes)? == 0 {
-                break;
-            }
-            line += 1;
-            missing_newline = !bytes.ends_with(b"\n");
-            match serde_json::from_slice(&bytes) {
-                Ok(entry) => entries.push(entry),
-                Err(error) => {
-                    tracing::warn!(path = %path.display(), line, %error, "skipping invalid journal line")
-                }
+    pub fn date(&self, id: u64) -> Result<String> {
+        Ok(self.message(id)?.date)
+    }
+    pub fn stats(&self) -> serde_json::Value {
+        serde_json::json!({"format":"uniichat-0500bf6-v1","messages":self.count,"open_pages":self.open,"summaries":self.serial,
+            "resident_nodes":self.nodes.len(),"view_lines":self.view.parts.len(),"view_bytes":part_bytes(&self.view.parts,&self.nodes),
+            "view_budget_bytes":self.budget,"compactor_view_bytes":part_bytes(&self.seen.parts,&self.nodes),
+            "compactor_frontier":self.first_unbuilt(),"settled":self.is_settled(),"ready_jobs":self.ready.len(),"journal_healthy":!self.poisoned})
+    }
+    pub fn export_html(&self) -> String {
+        // An operator export deliberately materializes its output, not live RAM.
+        let mut out = String::from(
+            "<!doctype html><html><meta charset=\"utf-8\"><title>Pantheon memory</title><h1>Current view</h1><pre>",
+        );
+        out.push_str(&html_escape(&self.render()));
+        out.push_str("</pre><h2>Original pages</h2>");
+        for id in 0..self.count {
+            match self.message(id) {
+                Ok(msg) => out.push_str(&format!(
+                    "<details><summary>{id}+1 · {}</summary><pre>{}</pre></details>",
+                    html_escape(&msg.date),
+                    html_escape(&msg.text)
+                )),
+                Err(e) => out.push_str(&format!(
+                    "<pre>Read failed: {}</pre>",
+                    html_escape(&e.to_string())
+                )),
             }
         }
-        if missing_newline {
-            let mut file = OpenOptions::new().append(true).open(&path)?;
-            ensure!(
-                file.write(b"\n")? == 1,
-                "cannot terminate torn journal line"
-            );
-            file.sync_all()?;
+        out.push_str("</html>");
+        out
+    }
+}
+fn ctx(key: NodeKey) -> u64 {
+    if key.level == 0 {
+        key.index
+    } else {
+        key.end().unwrap_or(u64::MAX)
+    }
+}
+fn roots(count: u64) -> Vec<NodeKey> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    for l in (0..63).rev() {
+        let n = 1u64 << l;
+        if count - at >= n {
+            out.push(NodeKey {
+                level: l,
+                index: at / n,
+            });
+            at += n
         }
     }
-    Ok(entries)
+    out
+}
+fn held(view: &View, key: NodeKey) -> bool {
+    view.parts
+        .iter()
+        .find(|p| p.end().is_some_and(|e| e > key.start()))
+        .is_none_or(|p| p.level <= key.level)
+}
+fn part_bytes(parts: &[NodeKey], nodes: &BTreeMap<NodeKey, String>) -> usize {
+    parts
+        .iter()
+        .filter_map(|k| nodes.get(k))
+        .map(String::len)
+        .sum()
+}
+fn render_parts(parts: &[NodeKey], nodes: &BTreeMap<NodeKey, String>, end: u64) -> String {
+    let mut out = String::from("<chat>\n");
+    for key in parts.iter().filter(|k| k.end().is_some_and(|e| e <= end)) {
+        if let Some(text) = nodes.get(key) {
+            out.push_str(&format!(
+                "{}+{}|{}\n",
+                key.start(),
+                key.count(),
+                flatten(text)
+            ))
+        }
+    }
+    out.push_str("</chat>\n");
+    out
+}
+// Same normalized pair age and oldest-on-tie ordering as Memory.merge. Scan
+// candidates after each merge; deterministic reference tests pin the policy.
+fn merge(view: &View, end: u64, high: usize, nodes: &BTreeMap<NodeKey, String>) -> Vec<NodeKey> {
+    let mut parts = view.parts.clone();
+    let mut size = part_bytes(&parts, nodes);
+    while size > high / 2 {
+        let mut best: Option<usize> = None;
+        for k in 0..parts.len().saturating_sub(1) {
+            let a = parts[k];
+            let b = parts[k + 1];
+            if !a.index.is_multiple_of(2)
+                || a.level != b.level
+                || b.index != a.index + 1
+                || !nodes.contains_key(&a.parent())
+            {
+                continue;
+            }
+            if best.is_none_or(|j| {
+                let old = parts[j];
+                let age = (end as u128 + 1) - (a.index as u128 * a.count() as u128);
+                let previous = (end as u128 + 1) - (old.index as u128 * old.count() as u128);
+                age * old.count() as u128 > previous * a.count() as u128
+            }) {
+                best = Some(k)
+            }
+        }
+        let Some(k) = best else { break };
+        let a = parts[k];
+        let b = parts[k + 1];
+        let up = a.parent();
+        size = size - nodes.get(&a).map_or(0, String::len) - nodes.get(&b).map_or(0, String::len)
+            + nodes[&up].len();
+        parts[k] = up;
+        parts.remove(k + 1);
+    }
+    parts
+}
+fn zoom(
+    main: &Journal,
+    tree: &Journal,
+    count: u64,
+    serial: u64,
+    id: u64,
+    n: u64,
+    at: usize,
+) -> Result<String> {
+    ensure!(
+        n.is_power_of_two()
+            && id.is_multiple_of(n)
+            && id.checked_add(n).is_some_and(|e| e <= count),
+        "No line {id}+{n}."
+    );
+    if n == 1 {
+        let msg: Message = main.read(id)?.context("missing original")?;
+        let mut page = msg.clone();
+        page.text = clip_page(&msg.text, at)?;
+        return Ok(format!("{id}+0|{}", show(&page, at == 0)));
+    }
+    let key = NodeKey {
+        level: n.ilog2(),
+        index: id / n,
+    };
+    let mut lines = Vec::new();
+    for half in key.children() {
+        let node = tree
+            .read::<Node>(Journal::slot(half))?
+            .filter(|n| n.serial < serial);
+        let text = node.map_or_else(|| PLACEHOLDER.to_owned(), |n| flatten(&n.text));
+        lines.push(format!("{}+{}|{text}", half.start(), half.count()));
+    }
+    Ok(lines.join("\n"))
 }
 
+/// JavaScript Clip.clip_end: count UTF-16 code units, prefer the last newline
+/// within CAP, otherwise stop on a Unicode scalar boundary (never half a pair).
+fn page_end(text: &str, start: usize) -> usize {
+    let mut units = 0;
+    let mut end = text.len();
+    let mut newline = None;
+    for (relative, ch) in text[start..].char_indices() {
+        if units + ch.len_utf16() > TOOL_CHARS {
+            end = start + relative;
+            break;
+        }
+        units += ch.len_utf16();
+        if ch == '\n' {
+            newline = Some(start + relative + 1)
+        }
+    }
+    if end == text.len() {
+        end
+    } else {
+        newline.unwrap_or(end)
+    }
+}
+pub fn clip_pages(text: &str) -> Vec<String> {
+    let mut pages = Vec::new();
+    let mut at = 0;
+    loop {
+        let end = page_end(text, at);
+        pages.push(text[at..end].to_owned());
+        at = end;
+        if at == text.len() {
+            break;
+        }
+    }
+    pages
+}
+fn clip_page(text: &str, at: usize) -> Result<String> {
+    let mut units = 0;
+    let mut start = None;
+    for (byte, ch) in text.char_indices() {
+        if units == at {
+            start = Some(byte);
+            break;
+        }
+        units += ch.len_utf16();
+    }
+    if at == text.encode_utf16().count() {
+        start = Some(text.len())
+    }
+    let start = start.context("at must be a UTF-16 character boundary within the page")?;
+    let end = page_end(text, start);
+    let mut out = text[start..end].to_owned();
+    if end < text.len() {
+        let next = text[..end].encode_utf16().count();
+        out.push_str(&format!(
+            "\n[characters {}-{next} of {}; go on with at {next}]",
+            at + 1,
+            text.encode_utf16().count()
+        ))
+    }
+    Ok(out)
+}
+
+/// Four-line blocks, with a separate opening and incomplete tail. Provider
+/// adapters mark only the last whole block, or the opener if there is none.
+/// Concatenation reproduces the view exactly. Never split original text here.
+pub fn cache_chunks(view: &str) -> Vec<String> {
+    let Some(inner) = view.strip_prefix("<chat>\n").and_then(|s| {
+        s.strip_suffix("</chat>\n")
+            .or_else(|| s.strip_suffix("</chat>"))
+    }) else {
+        return vec![view.to_owned()];
+    };
+    let lines: Vec<_> = inner.split_inclusive('\n').collect();
+    let whole = lines.len() / 4;
+    let mut blocks = vec!["<chat>\n".to_owned()];
+    for k in 0..whole {
+        blocks.push(lines[k * 4..(k + 1) * 4].concat())
+    }
+    blocks.push(format!(
+        "{}{suffix}",
+        lines[whole * 4..].concat(),
+        suffix = if view.ends_with("</chat>\n") {
+            "</chat>\n"
+        } else {
+            "</chat>"
+        }
+    ));
+    blocks
+}
 // A newly created chat directory must survive along with its contents. Sync
 // every new component's parent, including the case of a nested new state path.
 fn create_durable_dir(path: &Path) -> Result<()> {
@@ -1054,7 +1277,14 @@ fn create_durable_dir(path: &Path) -> Result<()> {
 }
 
 fn flatten(text: &str) -> String {
-    text.replace(['\n', '\r'], " ")
+    if !text.contains('\n') {
+        text.to_owned()
+    } else {
+        static NEWLINE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"[\u0009-\u000d\u0020\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]*\n[\u0009-\u000d\u0020\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]*").unwrap()
+        });
+        NEWLINE.replace_all(text, " ").into_owned()
+    }
 }
 
 fn html_escape(text: &str) -> String {
@@ -1063,38 +1293,6 @@ fn html_escape(text: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
-}
-
-/// Stable Unicode-character breakpoints, always at the previous line ending.
-/// Concatenating the returned blocks reproduces the original view byte for byte.
-pub fn cache_chunks(view: &str) -> Vec<String> {
-    let marks = [50_000, 80_000, 100_000];
-    let mut mark = 0;
-    let mut last_newline = 0;
-    let mut cuts = Vec::new();
-    let length = view.chars().count();
-    for (count, (byte, character)) in view.char_indices().enumerate() {
-        let position = count + 1;
-        if character == '\n' {
-            last_newline = byte + 1;
-        }
-        if mark < marks.len() && position == marks[mark] {
-            if length >= marks[mark] && last_newline > cuts.last().copied().unwrap_or(0) {
-                cuts.push(last_newline);
-            }
-            mark += 1;
-        }
-    }
-    let mut start = 0;
-    let mut chunks = Vec::new();
-    for cut in cuts {
-        chunks.push(view[start..cut].to_owned());
-        start = cut;
-    }
-    if start < view.len() || chunks.is_empty() {
-        chunks.push(view[start..].to_owned());
-    }
-    chunks
 }
 
 /// Retain equal head/tail portions. The omission notice counts toward CAP, so
@@ -1129,586 +1327,68 @@ pub fn cap_tool_result(text: &str) -> String {
     format!("{}{}{}", &text[..head_end], notice, &text[tail_start..])
 }
 
+/// ECMAScript TrimString whitespace, not Rust's Unicode White_Space set.
+/// In particular JS trims BOM but does not trim U+0085 NEXT LINE.
+pub fn summary_trim(text: &str) -> &str {
+    text.trim_matches(|ch|matches!(ch, '\u{0009}'..='\u{000d}'|' '| '\u{00a0}'|'\u{1680}'|'\u{2000}'..='\u{200a}'|'\u{2028}'|'\u{2029}'|'\u{202f}'|'\u{205f}'|'\u{3000}'|'\u{feff}'))
+}
+
+/// Native task/ruler from UniiChat Memory.task. Target, not a hard cap:
+/// shortest of five answers may remain oversized, as in pinned upstream.
+pub fn compaction_task(key: NodeKey, source: &str) -> String {
+    let ruler = "-".repeat(NODE_BYTES);
+    let task = if key.level == 0 {
+        format!(
+            "Compaction: compress message {} into one line of at most 512 bytes\n(about 70 words), the length of this ruler:\n{ruler}\n<input>\n",
+            key.start()
+        )
+    } else {
+        let [a, b] = key.children();
+        format!(
+            "Compaction: merge lines {}+{} and {}+{}, adjacent, into one line of at most\n512 bytes (about 70 words), the length of this ruler:\n{ruler}\n<chat> may hold their messages, {} to {}, in more detail: take details\nof them from there too.\n<input>\n",
+            a.start(),
+            a.count(),
+            b.start(),
+            b.count(),
+            key.start(),
+            key.end().unwrap() - 1
+        )
+    };
+    format!("{task}{source}\n</input>")
+}
+pub fn compaction_cut(text: &str) -> String {
+    let mut end = text.len().min(NODE_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1
+    }
+    // Node's cut removes replacement characters left by a split UTF-8 scalar.
+    text[..end].trim_end_matches('\u{fffd}').to_owned()
+}
+pub fn compaction_over(line: &str) -> String {
+    format!(
+        "Too long: your last line for this <input> was {} bytes,\nover the 512-byte limit. Write the whole line again, cutting just\nenough of the least valuable items to fit before this cut:\n{}| ← LIMIT",
+        line.len(),
+        compaction_cut(line)
+    )
+}
+
+fn show(msg: &Message, images: bool) -> String {
+    let mut out = format!("{}: {}", msg.kind.as_str(), msg.text);
+    if images {
+        for name in &msg.images {
+            out.push_str(&format!("\n[image docs/images/{name}]"))
+        }
+    }
+    out
+}
+
+/// Empty/refused answer fallback is flat source, unlike overlength feedback,
+/// which cuts the actual last answer before any flattening.
+pub fn compaction_fallback(source: &str) -> String {
+    compaction_cut(&flatten(source))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    #[test]
-    fn read_only_snapshot_roundtrips_and_preserves_original_bounds_after_live_changes() {
-        let directory = TempDir::new().unwrap();
-        let mut memory = Memory::open(directory.path(), 128000).unwrap();
-        memory.append(Kind::User, "remember λ\nexactly").unwrap();
-        memory.append(Kind::Talk, "settled answer").unwrap();
-        let snapshot = memory.snapshot().unwrap();
-        let before = memory.export_html();
-        let encoded = serde_json::to_string(&snapshot).unwrap();
-        let decoded: MemorySnapshot = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded.render(), memory.render());
-        assert_eq!(decoded.zoom(0, 1).unwrap(), memory.zoom(0, 1).unwrap());
-        assert_eq!(decoded.zoom(0, 2).unwrap(), memory.zoom(0, 2).unwrap());
-        assert_eq!(decoded.date(0).unwrap(), memory.date(0).unwrap());
-        assert_eq!(
-            memory.export_html(),
-            before,
-            "reading must not mutate live logs"
-        );
-        memory.append(Kind::User, "new main conversation").unwrap();
-        assert_eq!(snapshot.render(), decoded.render());
-        assert_eq!(snapshot.message_count(), 2);
-        for (id, n) in [(2, 1), (1, 2), (0, 3), (u64::MAX, 1)] {
-            assert!(snapshot.zoom(id, n).is_err());
-        }
-        assert!(snapshot.date(2).is_err());
-        drop(memory);
-        assert_eq!(
-            snapshot.zoom(0, 1).unwrap(),
-            "0+0|user: remember λ\nexactly"
-        );
-        let reopened = Memory::open(directory.path(), 128000).unwrap();
-        assert_eq!(reopened.stats()["messages"], 3);
-    }
-
-    #[test]
-    fn snapshot_requires_settlement_and_retains_expanded_summaries() {
-        let directory = TempDir::new().unwrap();
-        let mut memory = Memory::open(directory.path(), 1800).unwrap();
-        memory
-            .append(Kind::User, &"long original ".repeat(100))
-            .unwrap();
-        assert!(memory.snapshot().is_err());
-        drain(&mut memory);
-        for index in 0..10 {
-            memory
-                .append(
-                    Kind::Talk,
-                    &format!("message {index} {}", "evidence ".repeat(80)),
-                )
-                .unwrap();
-            drain(&mut memory);
-        }
-        let snapshot = memory.snapshot().unwrap();
-        let decoded: MemorySnapshot =
-            serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
-        assert_eq!(decoded.render(), memory.render());
-        assert_eq!(decoded.zoom(0, 8).unwrap(), memory.zoom(0, 8).unwrap());
-        assert_eq!(decoded.zoom(0, 1).unwrap(), memory.zoom(0, 1).unwrap());
-    }
-
-    fn key(level: u32, index: u64) -> NodeKey {
-        NodeKey { level, index }
-    }
-
-    fn drain(mem: &mut Memory) {
-        while let Some(job) = mem.ready_jobs(1).first().copied() {
-            // Deliberately above half NODE so parents need real compression.
-            mem.finish(job, &format!("user: {}", "summary ".repeat(35)))
-                .unwrap();
-        }
-    }
-
-    #[test]
-    fn durable_journals_restart_without_recomputing_summaries() {
-        let temp = TempDir::new().unwrap();
-        let (view, tree_bytes);
-        {
-            let mut mem = Memory::open(temp.path(), VIEW_BYTES).unwrap();
-            mem.append(Kind::User, &"大".repeat(700)).unwrap();
-            mem.append(Kind::Talk, &"response ".repeat(100)).unwrap();
-            drain(&mut mem);
-            view = mem.render();
-            tree_bytes = fs::read_dir(temp.path().join("tree"))
-                .unwrap()
-                .map(|entry| fs::read(entry.unwrap().path()).unwrap())
-                .collect::<Vec<_>>();
-            assert!(mem.is_settled());
-        }
-        let mem = Memory::open(temp.path(), VIEW_BYTES).unwrap();
-        assert_eq!(view, mem.render());
-        assert_eq!(mem.stats()["messages"], 2);
-        assert_eq!(mem.stats()["summaries"], 3);
-        assert!(mem.zoom(0, 1).unwrap().ends_with(&"大".repeat(700)));
-        assert_eq!(
-            tree_bytes,
-            fs::read_dir(temp.path().join("tree"))
-                .unwrap()
-                .map(|entry| fs::read(entry.unwrap().path()).unwrap())
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn durable_admission_deduplicates_before_and_after_restart() {
-        let temp = TempDir::new().unwrap();
-        let text = format!("  exact user paste\n{}\nlast line  ", "λ🦀".repeat(300));
-        let journal;
-        let before;
-        {
-            let mut mem = Memory::open(temp.path(), VIEW_BYTES).unwrap();
-            assert_eq!(
-                mem.append_with_id(Kind::User, &text, "discord:123")
-                    .unwrap(),
-                0
-            );
-            assert_eq!(
-                mem.append_with_id(Kind::User, &text, "discord:123")
-                    .unwrap(),
-                0
-            );
-            assert_eq!(mem.lookup_source("discord:123"), Some(0));
-            assert_eq!(mem.lookup_source("discord:missing"), None);
-            assert!(
-                mem.append_with_id(Kind::User, "changed", "discord:123")
-                    .is_err()
-            );
-            assert!(
-                mem.append_with_id(Kind::Talk, &text, "discord:123")
-                    .is_err()
-            );
-            assert!(mem.append_with_id(Kind::User, &text, "").is_err());
-            journal = fs::read_dir(temp.path().join("main"))
-                .unwrap()
-                .next()
-                .unwrap()
-                .unwrap()
-                .path();
-            before = fs::read(&journal).unwrap();
-            assert_eq!(mem.stats()["messages"], 1);
-        }
-        let mut mem = Memory::open(temp.path(), VIEW_BYTES).unwrap();
-        assert_eq!(mem.lookup_source("discord:123"), Some(0));
-        assert_eq!(
-            mem.append_with_id(Kind::User, &text, "discord:123")
-                .unwrap(),
-            0
-        );
-        assert_eq!(mem.zoom(0, 1).unwrap(), format!("0+0|user: {text}"));
-        assert_eq!(
-            fs::read(&journal).unwrap(),
-            before,
-            "dedupe must not write another ROOT record"
-        );
-        assert_eq!(mem.append(Kind::Talk, "ordinary entry").unwrap(), 1);
-        let lines: Vec<serde_json::Value> = fs::read_to_string(&journal)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(lines[0]["source_id"], "discord:123");
-        assert!(
-            lines[1].get("source_id").is_none(),
-            "ordinary appends retain the original schema"
-        );
-        drop(mem);
-        let mem = Memory::open(temp.path(), VIEW_BYTES).unwrap();
-        assert_eq!(mem.stats()["messages"], 2);
-        assert_eq!(mem.lookup_source("discord:123"), Some(0));
-    }
-
-    #[test]
-    fn torn_utf8_is_skipped_preserved_and_terminated() {
-        let temp = TempDir::new().unwrap();
-        let journal;
-        {
-            let mut mem = Memory::open(temp.path(), VIEW_BYTES).unwrap();
-            mem.append(Kind::User, "original").unwrap();
-            journal = fs::read_dir(temp.path().join("main"))
-                .unwrap()
-                .next()
-                .unwrap()
-                .unwrap()
-                .path();
-        }
-        let mut file = OpenOptions::new().append(true).open(&journal).unwrap();
-        file.write_all(b"{\"i\":1,\"text\":\"\xf0\x9f").unwrap();
-        file.sync_all().unwrap();
-        let before = fs::read(&journal).unwrap();
-        let mut mem = Memory::open(temp.path(), VIEW_BYTES).unwrap();
-        assert_eq!(mem.append(Kind::User, "next").unwrap(), 1);
-        let after = fs::read(&journal).unwrap();
-        assert!(after.starts_with(&before));
-        assert_eq!(after[before.len()], b'\n');
-        drop(mem);
-        let mem = Memory::open(temp.path(), VIEW_BYTES).unwrap();
-        assert_eq!(mem.zoom(1, 1).unwrap(), "1+0|user: next");
-    }
-
-    #[test]
-    fn second_writer_is_rejected_and_kernel_lock_is_reusable() {
-        let temp = TempDir::new().unwrap();
-        let first = Memory::open(temp.path(), VIEW_BYTES).unwrap();
-        assert!(Memory::open(temp.path(), VIEW_BYTES).is_err());
-        drop(first);
-        assert!(Memory::open(temp.path(), VIEW_BYTES).is_ok());
-    }
-
-    #[test]
-    fn deliberate_close_unlocks_an_inherited_file_description() {
-        let temp = TempDir::new().unwrap();
-        let first = Memory::open(temp.path(), VIEW_BYTES).unwrap();
-        // dup shares the same open file description, exactly as descriptor
-        // inheritance during fork does, without forking a multithreaded test.
-        let inherited = first._lock.try_clone().unwrap();
-        assert!(Memory::open(temp.path(), VIEW_BYTES).is_err());
-        drop(first);
-        let next = Memory::open(temp.path(), VIEW_BYTES).unwrap();
-        assert!(
-            inherited.metadata().is_ok(),
-            "inherited descriptor stays open"
-        );
-        assert!(
-            Memory::open(temp.path(), VIEW_BYTES).is_err(),
-            "the new owner still excludes writers"
-        );
-        drop(next);
-        drop(inherited);
-        assert!(Memory::open(temp.path(), VIEW_BYTES).is_ok());
-    }
-
-    #[test]
-    fn compression_is_ordered_binary_and_has_no_address_markers() {
-        let temp = TempDir::new().unwrap();
-        let mut mem = Memory::open(temp.path(), VIEW_BYTES).unwrap();
-        mem.append(Kind::User, &"first original ".repeat(100))
-            .unwrap();
-        mem.append(Kind::Talk, &"second original ".repeat(100))
-            .unwrap();
-        assert_eq!(mem.ready_jobs(8), vec![key(0, 0)]);
-        assert_eq!(mem.compactor_context(key(0, 0)).unwrap(), "<chat>\n</chat>");
-        assert!(mem.source(key(0, 0)).unwrap().contains("first original"));
-        assert!(mem.finish(key(0, 1), "premature").is_err());
-        let first = format!("user: {}", "first ".repeat(50));
-        let second = format!("talk: {}", "second ".repeat(45));
-        mem.finish(key(0, 0), &first).unwrap();
-        assert_eq!(mem.ready_jobs(8), vec![key(0, 1)]);
-        assert_eq!(
-            mem.compactor_context(key(0, 1)).unwrap(),
-            format!("<chat>\n{}\n</chat>", first.trim())
-        );
-        mem.finish(key(0, 1), &second).unwrap();
-        assert_eq!(mem.ready_jobs(8), vec![key(1, 0)]);
-        assert_eq!(
-            mem.source(key(1, 0)).unwrap(),
-            format!("{}\n{}", first.trim(), second.trim())
-        );
-        let context = mem.compactor_context(key(1, 0)).unwrap();
-        assert!(!context.contains("0+1|"));
-        assert!(context.find("user:").unwrap() < context.find("talk:").unwrap());
-        mem.finish(key(1, 0), "user: first; talk: second").unwrap();
-        assert!(mem.is_settled());
-    }
-
-    #[test]
-    fn short_messages_are_free_and_zoom_preserves_exact_original() {
-        let temp = TempDir::new().unwrap();
-        let mut mem = Memory::open(temp.path(), VIEW_BYTES).unwrap();
-        mem.append(Kind::User, "keep\nverbatim λ").unwrap();
-        mem.append(Kind::Talk, "understood").unwrap();
-        assert!(mem.ready_jobs(8).is_empty());
-        assert_eq!(
-            mem.nodes[&key(1, 0)],
-            "user: keep\nverbatim λ\ntalk: understood"
-        );
-        assert_eq!(mem.zoom(0, 1).unwrap(), "0+0|user: keep\nverbatim λ");
-        assert_eq!(
-            mem.zoom(0, 2).unwrap(),
-            "0+1|user: keep verbatim λ\n1+1|talk: understood"
-        );
-        assert!(mem.zoom(1, 2).is_err());
-        assert!(mem.zoom(0, 3).is_err());
-        assert!(mem.zoom(u64::MAX, 1).is_err());
-        assert!(mem.date(0).unwrap().contains('T'));
-    }
-
-    #[test]
-    fn view_only_coarsens_and_preserves_prefix_while_under_budget() {
-        let temp = TempDir::new().unwrap();
-        // A tiny budget can be smaller than the irreducible binary tiling
-        // (popcount(T) parts), so leave room for seven parts at this scale.
-        let mut mem = Memory::open(temp.path(), 3000).unwrap();
-        for _ in 0..96 {
-            let previous = mem.view.clone();
-            let old_prefix = mem.render().trim_end_matches("</chat>").to_owned();
-            let was_small = !mem.merging && mem.view_size() + 400 <= mem.budget;
-            mem.append(Kind::User, &"input ".repeat(120)).unwrap();
-            drain(&mut mem);
-            assert!(mem.view_size() <= mem.budget);
-            for old in previous {
-                let replacement = mem
-                    .view
-                    .iter()
-                    .find(|new| {
-                        new.start() <= old.start() && new.end().unwrap() >= old.end().unwrap()
-                    })
-                    .unwrap();
-                assert!(replacement.level >= old.level, "a live view part split");
-            }
-            if was_small {
-                assert!(mem.render().starts_with(&old_prefix));
-            }
-            assert_eq!(
-                mem.view_bytes,
-                VIEW_FRAME_BYTES
-                    + mem
-                        .view
-                        .iter()
-                        .map(|&key| mem.part_size(key))
-                        .sum::<usize>()
-            );
-        }
-        assert!(mem.view.first().unwrap().level > mem.view.last().unwrap().level);
-    }
-
-    #[test]
-    fn merge_age_uses_pairs_last_message_matching_rollback_push() {
-        let temp = TempDir::new().unwrap();
-        let mut mem = Memory::open(temp.path(), VIEW_BYTES).unwrap();
-        for _ in 0..10 {
-            mem.append(Kind::User, &"original ".repeat(80)).unwrap();
-            drain(&mut mem);
-        }
-        // The published counterexample: measuring from the first message
-        // incorrectly selects 0..7 instead of the newest siblings 8 and 9.
-        mem.view = vec![key(2, 0), key(2, 1), key(0, 8), key(0, 9)];
-        mem.mergeable.clear();
-        for part in mem.view.clone() {
-            mem.consider_view_pair(part);
-        }
-        mem.view_bytes = mem.render().len();
-        mem.budget = 2000;
-        mem.merging = true;
-        let prefix = mem.render().split("8+1|").next().unwrap().to_owned();
-        mem.fit(10);
-        assert_eq!(mem.view, vec![key(2, 0), key(2, 1), key(1, 4)]);
-        assert!(mem.render().starts_with(&prefix));
-        assert!(!mem.merging);
-    }
-
-    #[test]
-    fn view_grows_then_batches_to_half_budget_and_survives_restart() {
-        let temp = TempDir::new().unwrap();
-        let mut mem = Memory::open(temp.path(), 6000).unwrap();
-        let mut batches = 0;
-        for _ in 0..200 {
-            let before = mem.render();
-            mem.append(Kind::User, &"original ".repeat(80)).unwrap();
-            drain(&mut mem);
-            let after = mem.render();
-            assert_eq!(after.len(), mem.view_size());
-            if !after.starts_with(before.trim_end_matches("</chat>")) {
-                batches += 1;
-                assert!(mem.view_size() <= mem.budget / 2);
-            } else {
-                assert!(mem.view_size() <= mem.budget);
-            }
-            let partition = mem.view.clone();
-            let merging = mem.merging;
-            drop(mem);
-            mem = Memory::open(temp.path(), 6000).unwrap();
-            assert_eq!(mem.view, partition);
-            assert_eq!(mem.merging, merging);
-            assert_eq!(mem.render(), after, "restart must preserve every view byte");
-        }
-        assert!(
-            batches > 2 && batches < 25,
-            "expected infrequent batches, got {batches}"
-        );
-    }
-
-    #[test]
-    fn unfinished_batch_survives_restart_and_waits_for_built_parents() {
-        let temp = TempDir::new().unwrap();
-        let mut mem = Memory::open(temp.path(), 3000).unwrap();
-        // Finish leaves while deliberately leaving every parent queued.
-        for _ in 0..20 {
-            mem.append(Kind::User, &"original ".repeat(80)).unwrap();
-        }
-        for index in 0..20 {
-            mem.finish(key(0, index), &"summary ".repeat(35)).unwrap();
-        }
-        assert!(mem.merging);
-        assert!(mem.view_size() > mem.budget);
-        let before = mem.render();
-        drop(mem);
-        let mut mem = Memory::open(temp.path(), 3000).unwrap();
-        assert!(mem.merging);
-        assert_eq!(mem.render(), before);
-        drain(&mut mem);
-        assert!(!mem.merging);
-        assert!(mem.view_size() <= mem.budget / 2);
-    }
-
-    #[test]
-    fn checkpoint_recovers_only_appended_journal_tail_and_ignores_torn_temporary() {
-        let temp = TempDir::new().unwrap();
-        let mut mem = Memory::open(temp.path(), VIEW_BYTES).unwrap();
-        mem.append(Kind::User, "saved exact prefix").unwrap();
-        let prefix = mem.render().trim_end_matches("</chat>").to_owned();
-        // Simulate a crash after the immutable journal committed but before
-        // the atomic checkpoint rename. Recovery adds only this missing tail.
-        mem.main_log
-            .append(&Message {
-                i: 1,
-                kind: Kind::User,
-                text: "committed tail".into(),
-                size: "user: committed tail".len(),
-                date: Local::now().to_rfc3339(),
-                source_id: None,
-            })
-            .unwrap();
-        fs::write(temp.path().join("view.json.tmp"), b"{torn").unwrap();
-        drop(mem);
-        let mem = Memory::open(temp.path(), VIEW_BYTES).unwrap();
-        assert!(mem.render().starts_with(&prefix));
-        assert!(mem.render().contains("1+1|user: committed tail"));
-        assert_eq!(mem.stats()["messages"], 2);
-        drop(mem);
-        let mem = Memory::open(temp.path(), VIEW_BYTES).unwrap();
-        assert!(mem.render().starts_with(&prefix));
-    }
-
-    #[test]
-    fn legacy_chat_gets_checkpoint_once_and_invalid_partition_is_rejected() {
-        let temp = TempDir::new().unwrap();
-        let mut mem = Memory::open(temp.path(), 6000).unwrap();
-        for _ in 0..40 {
-            mem.append(Kind::User, &"original ".repeat(80)).unwrap();
-            drain(&mut mem);
-        }
-        drop(mem);
-        fs::remove_file(temp.path().join("view.json")).unwrap();
-        let mem = Memory::open(temp.path(), 6000).unwrap();
-        let migrated = mem.render();
-        assert!(temp.path().join("view.json").exists());
-        drop(mem);
-        assert_eq!(Memory::open(temp.path(), 6000).unwrap().render(), migrated);
-        let path = temp.path().join("view.json");
-        let mut saved: serde_json::Value =
-            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        saved["parts"][0]["index"] = serde_json::json!(1);
-        fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
-        assert!(
-            Memory::open(temp.path(), 6000).is_err(),
-            "never silently retile a corrupt checkpoint"
-        );
-    }
-
-    #[test]
-    fn checkpoint_failure_poisoning_preserves_committed_history_for_recovery() {
-        let temp = TempDir::new().unwrap();
-        let mut mem = Memory::open(temp.path(), VIEW_BYTES).unwrap();
-        // A directory in place of the temporary file forces a real write error
-        // after the immutable message and its free summary have committed.
-        fs::create_dir(temp.path().join("view.json.tmp")).unwrap();
-        assert!(
-            mem.append(Kind::User, "committed before checkpoint failure")
-                .is_err()
-        );
-        assert!(mem.append(Kind::User, "must not commit").is_err());
-        assert_eq!(mem.stats()["journal_healthy"], false);
-        drop(mem);
-        fs::remove_dir(temp.path().join("view.json.tmp")).unwrap();
-        let mem = Memory::open(temp.path(), VIEW_BYTES).unwrap();
-        assert_eq!(mem.stats()["messages"], 1);
-        assert!(mem.render().contains("committed before checkpoint failure"));
-    }
-
-    #[test]
-    fn parents_outside_the_live_view_do_not_rewrite_its_checkpoint() {
-        use std::os::unix::fs::MetadataExt;
-        let temp = TempDir::new().unwrap();
-        let mut mem = Memory::open(temp.path(), VIEW_BYTES).unwrap();
-        for _ in 0..2 {
-            mem.append(Kind::User, &"original ".repeat(80)).unwrap();
-        }
-        for index in 0..2 {
-            mem.finish(key(0, index), &"summary ".repeat(35)).unwrap();
-        }
-        let inode = fs::metadata(temp.path().join("view.json")).unwrap().ino();
-        mem.finish(key(1, 0), "merged parent outside view").unwrap();
-        assert_eq!(
-            fs::metadata(temp.path().join("view.json")).unwrap().ino(),
-            inode
-        );
-    }
-
-    #[test]
-    fn unsummarized_import_maintains_only_one_leaf_job() {
-        let temp = TempDir::new().unwrap();
-        fs::create_dir(temp.path().join("main")).unwrap();
-        let mut journal = Vec::new();
-        let text = "large imported message ".repeat(30);
-        for i in 0..2_000 {
-            let message = Message {
-                i,
-                kind: Kind::Note,
-                size: 6 + text.len(),
-                text: text.clone(),
-                date: "2026-01-01T00:00:00+00:00".into(),
-                source_id: None,
-            };
-            serde_json::to_writer(&mut journal, &message).unwrap();
-            journal.push(b'\n');
-        }
-        fs::write(temp.path().join("main/2026-01-01.jsonl"), journal).unwrap();
-        let mut mem = Memory::open(temp.path(), 2000).unwrap();
-        assert_eq!(mem.ready_jobs(usize::MAX), vec![key(0, 0)]);
-        assert!(mem.mergeable.is_empty());
-        assert!(!mem.is_settled());
-        mem.finish(key(0, 0), &"note: summarized ".repeat(20))
-            .unwrap();
-        assert_eq!(mem.ready_jobs(usize::MAX), vec![key(0, 1)]);
-        assert!(
-            mem.compactor_context(key(0, 1))
-                .unwrap()
-                .contains("note: summarized")
-        );
-    }
-
-    #[test]
-    fn cache_marks_count_characters_and_preserve_every_byte() {
-        let view = format!(
-            "<chat>\n{}</chat>",
-            "λ".repeat(49980)
-                + "\n"
-                + &"中".repeat(29000)
-                + "\n"
-                + &"x".repeat(19000)
-                + "\n"
-                + &"z".repeat(7000)
-                + "\n"
-        );
-        let chunks = cache_chunks(&view);
-        assert_eq!(chunks.concat(), view);
-        assert_eq!(chunks.len(), 4);
-        assert!(chunks[..3].iter().all(|chunk| chunk.ends_with('\n')));
-        assert!(chunks[0].chars().count() <= 50_000);
-        assert!(chunks[..2].concat().chars().count() <= 80_000);
-        assert!(chunks[..3].concat().chars().count() <= 100_000);
-        assert_eq!(cache_chunks("<chat>\n</chat>"), vec!["<chat>\n</chat>"]);
-    }
-
-    #[test]
-    fn tool_cap_keeps_unicode_head_tail_and_counts_notice() {
-        let text = format!("head{}tail", "🦀".repeat(40_000));
-        let capped = cap_tool_result(&text);
-        assert_eq!(capped.chars().count(), TOOL_CHARS);
-        assert!(capped.starts_with("head"));
-        assert!(capped.ends_with("tail"));
-        assert!(capped.contains("characters omitted"));
-        assert_eq!(cap_tool_result("small"), "small");
-    }
-
-    #[test]
-    fn html_export_escapes_untrusted_history() {
-        let temp = TempDir::new().unwrap();
-        let mut mem = Memory::open(temp.path(), VIEW_BYTES).unwrap();
-        mem.append(Kind::User, "<script>alert('x')</script>")
-            .unwrap();
-        let html = mem.export_html();
-        assert!(!html.contains("<script>"));
-        assert!(html.contains("&lt;script&gt;"));
-        assert!(html.contains("Tree level 0"));
-        assert!(html.contains("ROOT"));
-    }
+    include!("memory_tests.rs");
 }

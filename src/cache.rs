@@ -103,7 +103,10 @@ impl Store {
         hash.update(system.as_bytes());
         hash.update([0]);
         hash.update(serde_json::to_vec(defs)?);
-        let body = view.strip_suffix("</chat>").unwrap_or(view);
+        let body = view
+            .strip_suffix("</chat>\n")
+            .or_else(|| view.strip_suffix("</chat>"))
+            .unwrap_or(view);
         let snapshot = Snapshot {
             model: model.into(),
             reasoning: reasoning.into(),
@@ -389,7 +392,7 @@ mod tests {
                 .unwrap();
         let trace: Value = serde_json::from_str(&trace).unwrap();
         assert_eq!(trace["previous_view_bytes"], first.len());
-        assert_eq!(trace["shared_view_bytes"], first.len() - 7);
+        assert_eq!(trace["shared_view_bytes"], first.len() - "</chat>\n".len());
         s.cache_turn(
             1,
             "openai/test",

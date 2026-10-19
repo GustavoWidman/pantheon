@@ -20,6 +20,7 @@ class NixPackagingTests(unittest.TestCase):
         "src/behavior.txt": "\ncache-key regression\n",
         "skills/engineering/SKILL.md": "\ncache-key regression\n",
         "tests/mcp_integration.rs": "\n// cache-key regression\n",
+        "tests/fixtures/uniichat-0500bf6.json": "\n",
         "Cargo.toml": '\n[package.metadata.cache-regression]\nvalue = true\n',
         "Cargo.lock": "\n# cache-key regression\n",
     }
@@ -81,7 +82,7 @@ class NixPackagingTests(unittest.TestCase):
     def test_rust_and_embedded_inputs_recompile_rust(self):
         for relative in (
             "src/lib.rs", "src/behavior.txt", "skills/engineering/SKILL.md",
-            "tests/mcp_integration.rs", "Cargo.toml", "Cargo.lock",
+            "tests/mcp_integration.rs", "tests/fixtures/uniichat-0500bf6.json", "Cargo.toml", "Cargo.lock",
         ):
             with self.subTest(path=relative):
                 before, after = self.identities["baseline"], self.identities[relative]

@@ -50,7 +50,10 @@ symlinkJoin {
   passthru.unwrapped = rustBinary;
   meta = {
     description = "Durable always-on Discord agent harness";
-    license = lib.licenses.mit;
+    license = [
+      lib.licenses.mit
+      lib.licenses.asl20
+    ];
     mainProgram = "pantheon";
     platforms = lib.platforms.linux;
   };
