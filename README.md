@@ -73,7 +73,9 @@ model-response cycles per run; one cycle may contain multiple tool calls.
 Existing positive values keep their cap after upgrading: remove that setting or
 set it to `0` to opt into unlimited cycles. Runs still stop on normal completion,
 `/stop`, service shutdown or errors; request/tool timeouts and other resource
-limits remain active. The curator's separate bounded step limits are unchanged.
+limits remain active. The curator also defaults to unlimited model cycles, with
+independent optional draft/reviewer caps and a fifteen-minute whole-pass deadline
+([configuration](docs/skills.md#configuration-and-durability)).
 Unlimited cycles can consume ongoing provider quota until completion or cancellation.
 
 Optional [Claude Code background tasks](docs/claude.md) are disabled by default and require a manually installed, directly authenticated CLI on the daemon PATH; Pantheon does not bundle it through Nix.

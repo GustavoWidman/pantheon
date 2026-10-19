@@ -179,21 +179,31 @@ minimum_steps = 3
 description_chars = 240
 reviewers = 2
 timeout_seconds = 900
-max_steps = 8
-review_steps = 4
+max_steps = 0
+review_steps = 0
 max_input_chars = 256000
 max_research_calls = 4
 ```
 
-Defaults bound the whole pass to fifteen minutes, eight drafting steps, four steps
-per reviewer, 256,000 characters per request and four hosted-search calls shared
-across the job. Each hosted search allows at most two provider continuations and
+Defaults bound the whole pass to fifteen minutes, 256,000 characters per request
+and four hosted-search calls shared across the job. Drafting (`max_steps`) and
+each reviewer (`review_steps`) have no model-cycle cap by default: omit the
+setting or use `0` for unlimited cycles. A positive integer sets an independent
+cap for that phase; one cycle may contain multiple tool calls. Existing explicit
+positive settings retain their limits after upgrading (including `8`/`4` from
+older example configs); remove them or set both to `0` to disable those caps.
+Exhausting either finite cap fails the pass without publication; unlimited
+reviewers must still return valid verdicts and all reviewers must approve. Each
+hosted search allows at most two provider continuations and
 records reported usage for diagnostics. There is no cumulative token cap: rereading
 inherited context, including cached input, never aborts drafting or review. Legacy
 `curator.token_budget` settings are accepted and ignored. The configurable
 `timeout_seconds` deadline starts when the fork executes, after the idle wait, and
-covers drafting plus all reviewers together. Cancellation, step, request-size and
-research-call limits still apply.
+covers drafting plus all reviewers together, including when both step caps are
+disabled. Deadline expiry is distinct from step-cap exhaustion. Cancellation,
+request-size and research-call limits still apply; disabling a cycle cap does not
+bypass read-only review, atomic publication checks or the deadline. Unlimited
+cycles can consume more provider quota within that deadline.
 
 For NixOS use `services.pantheon.skillDirectories`, `bundledSkills`, `skillCurator`
 and `settings.curator`. Seed files include `SKILL.md` with YAML name/description

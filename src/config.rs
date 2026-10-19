@@ -263,7 +263,8 @@ mod tests {
             std::fs::write(&path, format!("{base}[agent]\n{setting}\n")).unwrap();
             let config = Config::load(&path).unwrap();
             assert_eq!(config.agent.max_steps, expected);
-            assert_eq!(config.curator.max_steps, 8);
+            assert_eq!(config.curator.max_steps, 0);
+            assert_eq!(config.curator.review_steps, 0);
             let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
             assert_eq!(roundtrip.agent.max_steps, expected);
         }
@@ -276,10 +277,36 @@ mod tests {
             std::fs::write(&path, format!("{base}[agent]\n{setting}\n")).unwrap();
             assert!(Config::load(&path).is_err(), "{setting}");
         }
-        // The curator deliberately retains its independent finite bounds.
-        for cap in [0, 17] {
-            std::fs::write(&path, format!("{base}[curator]\nmax_steps={cap}\n")).unwrap();
-            assert!(Config::load(&path).is_err());
+    }
+
+    #[test]
+    fn curator_cycle_caps_load_independently_of_agent_caps() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pantheon.toml");
+        let base = "[discord]\napplication_id=1\nallowed_users=[2]\n[agent]\nmax_steps=1\n";
+        for (draft, review) in [(0, 0), (1, 0), (0, 1), (8, 4), (17, 9), (128, 128)] {
+            std::fs::write(
+                &path,
+                format!("{base}[curator]\nmax_steps={draft}\nreview_steps={review}\n"),
+            )
+            .unwrap();
+            let config = Config::load(&path).unwrap();
+            assert_eq!(config.agent.max_steps, 1);
+            assert_eq!(
+                (config.curator.max_steps, config.curator.review_steps),
+                (draft, review)
+            );
+            let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(
+                (roundtrip.curator.max_steps, roundtrip.curator.review_steps),
+                (draft, review)
+            );
+        }
+        for field in ["max_steps", "review_steps"] {
+            for value in ["-1", "'none'", "1.5"] {
+                std::fs::write(&path, format!("{base}[curator]\n{field}={value}\n")).unwrap();
+                assert!(Config::load(&path).is_err());
+            }
         }
     }
 

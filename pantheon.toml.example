@@ -88,8 +88,9 @@ description_chars = 240
 reviewers = 2
 # Total running deadline for drafting and review, separate from the idle wait.
 timeout_seconds = 900
-max_steps = 8
-review_steps = 4
+# Model-response cycles: 0 (or omitted) is unlimited, positive values cap each phase.
+max_steps = 0
+review_steps = 0
 max_input_chars = 256000
 max_research_calls = 4
 
