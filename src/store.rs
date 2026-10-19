@@ -2143,6 +2143,42 @@ mod tests {
         assert!(s.next_outbound().unwrap().is_none());
     }
     #[test]
+    fn silent_completion_preserves_atomic_steering_barrier_without_outbox() {
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::open(&d.path().join("db")).unwrap();
+        for id in ["first", "steer"] {
+            s.admit(&Input {
+                id: id.into(),
+                channel: 1,
+                user: 2,
+                text: "task".into(),
+            })
+            .unwrap();
+        }
+        s.input_state("first", "running").unwrap();
+        assert!(
+            !s.complete_turn(&["first".into()], "silent", 1, 2, &[])
+                .unwrap()
+        );
+        assert!(s.next_outbound().unwrap().is_none());
+        let state: String =
+            s.db.lock()
+                .unwrap()
+                .query_row("SELECT state FROM inbox WHERE id='first'", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(state, "running");
+        s.input_state("steer", "running").unwrap();
+        assert!(
+            s.complete_turn(&["first".into(), "steer".into()], "silent", 1, 2, &[])
+                .unwrap()
+        );
+        assert!(s.next_outbound().unwrap().is_none());
+        s.recover().unwrap();
+        assert!(s.queued(1).unwrap().is_empty());
+        assert!(s.next_outbound().unwrap().is_none());
+    }
+
+    #[test]
     fn accepted_input_can_be_reconciled_without_reexecuting_it() {
         let d = tempfile::tempdir().unwrap();
         let s = Store::open(&d.path().join("db")).unwrap();
