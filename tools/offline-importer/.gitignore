@@ -1,0 +1,4 @@
+/target/
+/validation/native-reader/target/
+/result
+*.partial/

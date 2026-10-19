@@ -1,0 +1,24 @@
+{
+  "source": "frozen Pantheon OptMem V5",
+  "all_source_manifest_sha256": "b61a7a491a3720c25e1d3bb5367b4961d8c88f4698e8aad61a749de3ef250af9",
+  "upstream_uniichat": "0500bf6a8ea4bf0ce047488562022b1b6532cc30",
+  "copied_files": [
+    {
+      "source_path": "src/memory.rs",
+      "sha256": "a41f256a0f2d1bc85710bd8c4443268659301a3ec6d8073960370d601b9c0267"
+    },
+    {
+      "source_path": "src/memory_tests.rs",
+      "sha256": "66c348d5c949fdef783be118f5aa60bbe3838710d000ef24fccf3d201dff6a0f"
+    },
+    {
+      "source_path": "src/compact.txt",
+      "sha256": "921275bbce1c62218336e6dfb601c8e92ac7e55e8e4e31100c1dcf4f5e345a28"
+    },
+    {
+      "source_path": "tests/fixtures/uniichat-0500bf6.json",
+      "sha256": "87918737212591217fb5d2d584c8df882b34c73a3a6b886f5b20d501a24409b1"
+    }
+  ],
+  "adapter": "src/native.rs is exact src/memory.rs followed only by generic push_record_at(kind,text,images,date), calling existing private append_entry. No legacy recognition in engine. vendor/native-v5.rs is entirely byte-identical for independent reopen validation."
+}

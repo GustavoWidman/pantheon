@@ -1,0 +1,15 @@
+{
+  "format": "pantheon-original-export-v1",
+  "source_version": "pantheon-0.20.4-originals",
+  "checkpoint": "synthetic-only-C",
+  "channel": "synthetic-only",
+  "count": 4,
+  "bytes": 1049,
+  "sha256": "d68251f6f48a1092f7a9e94beda00f9d028c18c2f9d06edaee8f8d4e58e93078",
+  "result_links": [
+    {
+      "call": 1,
+      "result": 2
+    }
+  ]
+}
