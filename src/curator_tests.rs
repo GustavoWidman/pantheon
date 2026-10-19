@@ -167,6 +167,14 @@ impl Drop for Mock {
 impl Mock {
     async fn new(draft: Vec<Value>, verdicts: Vec<Value>, pause_at: usize) -> Self {
         let reviewers = verdicts.len();
+        Self::with_reviewers(draft, verdicts, pause_at, reviewers).await
+    }
+    async fn with_reviewers(
+        draft: Vec<Value>,
+        verdicts: Vec<Value>,
+        pause_at: usize,
+        reviewers: usize,
+    ) -> Self {
         let state = Arc::new(MockState {
             draft: Mutex::new(draft.into()),
             verdicts: Mutex::new(verdicts.into()),
@@ -1111,4 +1119,175 @@ async fn curator_search_uses_pinned_route_and_unpinned_glm_fails_before_network(
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0]["model"], "search-pinned");
     assert_eq!(requests[0]["tools"][0]["type"], "web_search");
+}
+
+#[test]
+fn step_caps_default_to_unlimited_and_accept_independent_positive_limits() {
+    let defaults = CuratorConfig::default();
+    assert_eq!((defaults.max_steps, defaults.review_steps), (0, 0));
+    assert_eq!(defaults.timeout_seconds, 900);
+    for (draft, review) in [(0, 0), (1, 0), (0, 1), (8, 4), (17, 9), (128, 128)] {
+        let settings = format!("max_steps={draft}\nreview_steps={review}");
+        let config: CuratorConfig = toml::from_str(&settings).unwrap();
+        config.validate().unwrap();
+        let roundtrip: CuratorConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            (roundtrip.max_steps, roundtrip.review_steps),
+            (draft, review)
+        );
+    }
+    for field in ["max_steps", "review_steps"] {
+        for value in ["-1", "'none'", "1.5"] {
+            assert!(toml::from_str::<CuratorConfig>(&format!("{field}={value}")).is_err());
+        }
+    }
+    // Disabling model-cycle caps does not disable other resource bounds.
+    for setting in [
+        "timeout_seconds=0",
+        "max_input_chars=0",
+        "max_research_calls=0",
+        "reviewers=0",
+    ] {
+        assert!(
+            toml::from_str::<CuratorConfig>(setting)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+    }
+}
+
+fn evidence_read() -> Value {
+    let mut research = call("read", "evidence", "");
+    research.arguments = json!({"path":"evidence.txt"});
+    response(vec![research], 100)
+}
+
+#[tokio::test]
+async fn unlimited_drafting_and_each_reviewer_exceed_old_maximum_caps_before_publication() {
+    let f = Fixture::new();
+    let job = f.job();
+    let mut draft = vec![response(
+        vec![call(
+            "create_skill",
+            "deployment-checks",
+            "Check observable state.",
+        )],
+        100,
+    )];
+    draft.extend((0..16).map(|_| evidence_read()));
+    draft.push(response(vec![], 100)); // 18 draft cycles, beyond old configurable maximum 16.
+    let mut reviews: Vec<_> = (0..18).map(|_| evidence_read()).collect();
+    reviews.extend([
+        response(vec![verdict(true)], 100),
+        response(vec![verdict(true)], 100),
+    ]);
+    // Barrier pairs every review cycle, so BOTH reviewers need ten cycles (> old max 8).
+    let server = Mock::with_reviewers(draft, reviews, 0, 2).await;
+    let config = CuratorConfig::default();
+    let cancel = CancellationToken::new();
+    let before = f.memory.export_html();
+    run(
+        f.environment(&server, &config, &cancel),
+        &job,
+        f.frozen.clone(),
+    )
+    .await
+    .unwrap();
+    let status = current_status(&f);
+    assert_eq!(status["status"], "published");
+    assert_eq!(status["reviewers_finished"], 2);
+    assert_eq!(server.state.draft_count.load(Ordering::SeqCst), 18);
+    assert_eq!(server.state.requests.lock().unwrap().len(), 38);
+    assert_eq!(f.library.notifications("42").unwrap().len(), 1);
+    assert_eq!(f.memory.export_html(), before);
+}
+
+#[tokio::test]
+async fn finite_draft_cap_preserves_staged_proposal_without_review_or_publication() {
+    for cap in [1, 2, 8] {
+        let f = Fixture::new();
+        let job = f.job();
+        let mut draft = vec![response(
+            vec![call(
+                "create_skill",
+                "deployment-checks",
+                "Check observable state.",
+            )],
+            100,
+        )];
+        draft.extend((1..cap).map(|_| evidence_read()));
+        // Would settle on the NEXT cycle, which must never run.
+        draft.push(response(vec![], 100));
+        let server = Mock::new(draft, vec![], 0).await;
+        let config = CuratorConfig {
+            max_steps: cap,
+            ..Default::default()
+        };
+        let cancel = CancellationToken::new();
+        run(
+            f.environment(&server, &config, &cancel),
+            &job,
+            f.frozen.clone(),
+        )
+        .await
+        .unwrap();
+        assert_inactive(&f, "failed");
+        assert!(
+            current_status(&f)["report"]
+                .as_str()
+                .unwrap()
+                .contains("curator did not settle before step limit")
+        );
+        assert_eq!(server.state.requests.lock().unwrap().len(), cap);
+        assert_eq!(current_status(&f)["reviewers_spawned"], 0);
+        assert_eq!(f.library.proposal("42", &job.id).unwrap().changes.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn finite_reviewer_cap_never_implicitly_approves_staged_changes() {
+    for cap in [1, 4, 9] {
+        let f = Fixture::new();
+        let job = f.job();
+        let server = Mock::with_reviewers(
+            vec![
+                response(
+                    vec![call(
+                        "create_skill",
+                        "deployment-checks",
+                        "Check observable state.",
+                    )],
+                    100,
+                ),
+                response(vec![], 100),
+            ],
+            // No decide verdict in the allotted cycles.
+            (0..2 * cap).map(|_| evidence_read()).collect(),
+            0,
+            2,
+        )
+        .await;
+        let config = CuratorConfig {
+            review_steps: cap,
+            ..Default::default()
+        };
+        let cancel = CancellationToken::new();
+        run(
+            f.environment(&server, &config, &cancel),
+            &job,
+            f.frozen.clone(),
+        )
+        .await
+        .unwrap();
+        assert_inactive(&f, "failed");
+        assert!(
+            current_status(&f)["report"]
+                .as_str()
+                .unwrap()
+                .contains("reviewer did not decide before step limit")
+        );
+        assert_eq!(f.library.proposal("42", &job.id).unwrap().changes.len(), 1);
+        assert!(server.state.requests.lock().unwrap().len() <= 2 + 2 * cap);
+    }
 }

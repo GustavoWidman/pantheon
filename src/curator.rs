@@ -29,6 +29,7 @@ pub struct CuratorConfig {
     pub description_chars: usize,
     pub reviewers: usize,
     pub timeout_seconds: u64,
+    // Zero disables the model-cycle cap; the whole-pass deadline still applies.
     pub max_steps: usize,
     pub review_steps: usize,
     pub max_input_chars: usize,
@@ -48,8 +49,8 @@ impl Default for CuratorConfig {
             description_chars: 240,
             reviewers: 2,
             timeout_seconds: 900,
-            max_steps: 8,
-            review_steps: 4,
+            max_steps: 0,
+            review_steps: 0,
             max_input_chars: 256_000,
             legacy_token_budget: None,
             max_research_calls: 4,
@@ -83,10 +84,6 @@ impl CuratorConfig {
         ensure!(
             (10..=1800).contains(&self.timeout_seconds),
             "curator timeout must be 10–1800 seconds"
-        );
-        ensure!(
-            (2..=16).contains(&self.max_steps) && (1..=8).contains(&self.review_steps),
-            "invalid curator step limits"
         );
         ensure!(
             (16_000..=1_000_000).contains(&self.max_input_chars),
@@ -596,7 +593,9 @@ pub async fn run(
         let tools = draft_tools();
         let mut staged = BTreeMap::new();
         let mut settled = false;
-        for _ in 0..env.config.max_steps {
+        let mut steps = 0;
+        while env.config.max_steps == 0 || steps < env.config.max_steps {
+            steps += 1;
             let response = session.step(&system, &history, &tools).await?;
             Provider::append_response(vendor, &mut history, &response);
             if response.calls.is_empty() {
@@ -667,7 +666,9 @@ pub async fn run(
             async move {
                 let session=Session{env,provider:provider.clone(),memory:memory.clone(),budget};let system=format!("{REVIEW}\nAuthoritative operator constraints:\n{}\nCatalogue description limit: {} Unicode characters.\n{catalogue}",env.instructions,env.config.description_chars);
                 let focus=if slot%2==0{"procedural correctness and evidence"}else{"transferable scope, placement, proportionality, duplication and preservation"};let mut history=Provider::start(vendor,&memory.render(),&json!({"review_focus":focus,"staged":context}).to_string());let tools=review_tools();
-                for _ in 0..env.config.review_steps {
+                let mut steps=0;
+                while env.config.review_steps==0 || steps<env.config.review_steps {
+                    steps+=1;
                     let response=session.step(&system,&history,&tools).await?;ensure!(response.calls.iter().filter(|c|c.name=="decide").count()<=1,"reviewer returned conflicting decisions");Provider::append_response(vendor,&mut history,&response);
                     if response.calls.is_empty(){history.push(Provider::user(vendor,"Return your verdict using decide."));continue;}
                     let mut verdict=None;let mut media=vec![];
