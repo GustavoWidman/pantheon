@@ -926,7 +926,7 @@ impl Harness {
                 false
             };
             for (text, thought) in &response.texts {
-                if text.is_empty() {
+                if text.trim().is_empty() {
                     continue;
                 }
                 if *thought {
@@ -946,53 +946,57 @@ impl Harness {
                 transcript.push('\n');
             }
             if !run.child {
-                let mut text = response
+                let text = response
                     .texts
                     .iter()
-                    .filter(|(_, thought)| !*thought)
+                    .filter(|(text, thought)| !*thought && !text.trim().is_empty())
                     .map(|(t, _)| t.as_str())
                     .collect::<Vec<_>>()
                     .join("\n\n");
-                if text.is_empty() && response.calls.is_empty() && !final_steered {
-                    text = "The model completed without a visible text reply.".into();
-                    self.log_run(run, Kind::Talk, &text).await?;
-                }
-                if !text.is_empty() {
-                    if response.calls.is_empty() && !final_steered {
-                        let completed = self.store.complete_turn(
-                            &run.inputs,
-                            &format!("{run_id}:{step}:final"),
-                            run.channel,
-                            run.user,
-                            &split_message(
-                                &text,
-                                if run.context.reply_to.is_some()
-                                    || run.context.activity.starts_with("peer:")
-                                {
-                                    None
-                                } else {
-                                    Some(run.user)
-                                },
-                            ),
-                        )?;
-                        if !completed {
+                if response.calls.is_empty() && !final_steered {
+                    // An intentionally silent completion still settles inputs and
+                    // checks the atomic steering barrier, but queues no message.
+                    // Do not split empty text: a mention prefix is itself a chunk.
+                    let chunks = if text.is_empty() {
+                        vec![]
+                    } else {
+                        split_message(
+                            &text,
+                            if run.context.reply_to.is_some()
+                                || run.context.activity.starts_with("peer:")
+                            {
+                                None
+                            } else {
+                                Some(run.user)
+                            },
+                        )
+                    };
+                    let completed = self.store.complete_turn(
+                        &run.inputs,
+                        &format!("{run_id}:{step}:final"),
+                        run.channel,
+                        run.user,
+                        &chunks,
+                    )?;
+                    if !completed {
+                        if !text.is_empty() {
                             self.notice(
                                 &format!("{run_id}:{step}:intermediate"),
                                 run.channel,
                                 None,
                                 &text,
                             )?;
-                            self.steer(run, vendor).await?;
-                            continue;
                         }
-                    } else {
-                        self.notice(
-                            &format!("{run_id}:{step}:intermediate"),
-                            run.channel,
-                            None,
-                            &text,
-                        )?;
+                        self.steer(run, vendor).await?;
+                        continue;
                     }
+                } else if !text.is_empty() {
+                    self.notice(
+                        &format!("{run_id}:{step}:intermediate"),
+                        run.channel,
+                        None,
+                        &text,
+                    )?;
                 }
             }
             if response.calls.is_empty() {
@@ -1004,7 +1008,7 @@ impl Harness {
                     response
                         .texts
                         .iter()
-                        .filter(|(_, thought)| !*thought)
+                        .filter(|(text, thought)| !*thought && !text.trim().is_empty())
                         .map(|(text, _)| text.as_str())
                         .collect::<Vec<_>>()
                         .join("\n\n")
@@ -3379,6 +3383,241 @@ mod tests {
             out.push(item);
         }
         out
+    }
+
+    #[tokio::test]
+    async fn silent_completions_settle_without_outbound_or_synthetic_history() {
+        for vendor in ["openai", "anthropic", "zai"] {
+            let no_blocks = match vendor {
+                "openai" => json!({"status":"completed","output":[]}),
+                "anthropic" => json!({"stop_reason":"end_turn","content":[]}),
+                _ => {
+                    json!({"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":null}}]})
+                }
+            };
+            let thought_only = match vendor {
+                "openai" => {
+                    json!({"status":"completed","output":[{"type":"reasoning","summary":[{"type":"summary_text","text":"private thought"}]}]})
+                }
+                "anthropic" => {
+                    json!({"stop_reason":"end_turn","content":[{"type":"thinking","thinking":"private thought","signature":"test"}]})
+                }
+                _ => {
+                    json!({"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":null,"reasoning_content":"private thought"}}]})
+                }
+            };
+            for response in [
+                no_blocks,
+                final_response(vendor, ""),
+                final_response(vendor, " \n\t "),
+                thought_only,
+            ] {
+                let (_dir, h, run, mock, server) = fixture(vendor, vec![response]).await;
+                let memory = run.memory.clone();
+                let before = memory.memory.lock().await.export_html();
+                mock.release.notify_one();
+                let result = h.clone().run_agent(run).await.unwrap();
+                assert_eq!(result, "", "{vendor}");
+                assert_eq!(memory.memory.lock().await.export_html(), before, "{vendor}");
+                assert!(
+                    drain(&h).is_empty(),
+                    "{vendor}: no placeholder or mention-only message"
+                );
+                {
+                    let db = h.store.db.lock().unwrap();
+                    let state: String = db
+                        .query_row("SELECT state FROM inbox WHERE id='first'", [], |r| r.get(0))
+                        .unwrap();
+                    assert_eq!(state, "done");
+                    let closed: bool = db
+                        .query_row(
+                            "SELECT closed FROM ui_sessions WHERE activity='request:first'",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    assert!(closed);
+                    let active: bool = db
+                        .query_row(
+                            "SELECT active FROM ui_agents WHERE owner='channel:1'",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    assert!(!active);
+                }
+                h.store.recover().unwrap();
+                assert!(h.store.queued(1).unwrap().is_empty());
+                assert!(
+                    drain(&h).is_empty(),
+                    "completed silent input is not recovered/replayed"
+                );
+                assert_eq!(mock.requests.lock().await.len(), 1);
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn silent_final_keeps_visible_progress_and_tool_effects_once() {
+        let call = json!({"status":"completed","output":[
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"Checking the file"}]},
+            {"type":"function_call","call_id":"write-once","name":"write","arguments":"{\"path\":\"result.txt\",\"text\":\"verified\"}"}
+        ]});
+        let (dir, h, run, mock, server) =
+            fixture("openai", vec![call, final_response("openai", "")]).await;
+        mock.release.notify_one();
+        let transcript = h.clone().run_agent(run).await.unwrap();
+        assert_eq!(transcript, "Checking the file\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("result.txt")).unwrap(),
+            "verified"
+        );
+        let out = drain(&h);
+        let replies: Vec<_> = out
+            .iter()
+            .filter(|out| !out.id.contains(":activity:"))
+            .collect();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].text, "Checking the file");
+        {
+            let db = h.store.db.lock().unwrap();
+            let tools: i64 = db
+                .query_row(
+                    "SELECT count(*) FROM tool_runs WHERE state='done'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(tools, 1);
+        }
+        h.store.recover().unwrap();
+        assert!(drain(&h).is_empty());
+        assert_eq!(mock.requests.lock().await.len(), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn silent_final_consumes_steering_and_only_sends_revised_answer() {
+        let (_dir, h, run, mock, server) = fixture(
+            "openai",
+            vec![
+                final_response("openai", ""),
+                final_response("openai", "revised answer"),
+            ],
+        )
+        .await;
+        let task = tokio::spawn(h.clone().run_agent(run));
+        mock.started.notified().await;
+        h.store
+            .admit(&Input {
+                id: "200".into(),
+                channel: 1,
+                user: 2,
+                text: "change the plan".into(),
+            })
+            .unwrap();
+        mock.release.notify_one();
+        assert_eq!(task.await.unwrap().unwrap(), "revised answer\n");
+        let out = drain(&h);
+        let replies: Vec<_> = out
+            .iter()
+            .filter(|out| !out.id.contains(":activity:"))
+            .collect();
+        assert_eq!(replies.len(), 1);
+        assert!(replies[0].text.contains("revised answer"));
+        assert_eq!(replies[0].user, Some(2));
+        let requests = mock.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].to_string().contains("change the plan"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn visible_reply_text_and_delivery_are_unchanged() {
+        for vendor in ["openai", "anthropic", "zai"] {
+            let text = "  A real reply.\nKeep this formatting.  ";
+            let (_dir, h, run, mock, server) =
+                fixture(vendor, vec![final_response(vendor, text)]).await;
+            mock.release.notify_one();
+            assert_eq!(h.clone().run_agent(run).await.unwrap(), format!("{text}\n"));
+            let out = drain(&h);
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].text, format!("<@2> {text}"));
+            assert_eq!(out[0].user, Some(2));
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_provider_response_remains_a_turn_error() {
+        let (_dir, h, run, mock, server) =
+            fixture("openai", vec![json!({"status":"incomplete","output":[]})]).await;
+        mock.release.notify_one();
+        let error = h.clone().run_agent(run).await.unwrap_err();
+        assert!(error.to_string().contains("provider response incomplete"));
+        let db = h.store.db.lock().unwrap();
+        let state: String = db
+            .query_row("SELECT state FROM inbox WHERE id='first'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, "failed");
+        let phase: String = db
+            .query_row(
+                "SELECT phase FROM ui_agents WHERE owner='channel:1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, "Stopped");
+        drop(db);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn silent_worker_still_delivers_durable_completion_to_coordinator() {
+        let (_dir, h, mut run, mock, server) =
+            fixture("openai", vec![final_response("openai", "")]).await;
+        let output: Value = serde_json::from_str(&h.execute_tool(&mut run, &ToolCall {
+            id: "spawn-silent".into(), name: "spawn".into(),
+            arguments: json!({"tasks":[{"name":"Silent worker","task":"Finish without a visible reply"}]}),
+        }).await.unwrap()).unwrap();
+        let id = output["ids"][0].as_str().unwrap();
+        mock.started.notified().await;
+        mock.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while h.children.lock().await.contains_key(id) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(h.store.agent(id).unwrap().unwrap().report, "");
+        let inbox = h.store.queued(1).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].text, format!("[{id}] "));
+        let out = drain(&h);
+        assert!(
+            out.iter().all(|out| out.id.contains(":activity:")),
+            "only normal lifecycle activity, no worker text reply"
+        );
+        let db = h.store.db.lock().unwrap();
+        let done: bool = db
+            .query_row("SELECT state='done' FROM tasks WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(done);
+        let runs: i64 = db
+            .query_row(
+                "SELECT count(*) FROM agent_runs WHERE owner=?1 AND state='done'",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(runs, 1);
+        drop(db);
+        h.shutdown.cancel();
+        server.abort();
     }
 
     #[tokio::test]
