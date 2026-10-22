@@ -118,3 +118,13 @@ and restore the old executable
 and service configuration against the **current** state. Never roll memory back to
 the snapshot once the new instance may have received messages. Keep the snapshot
 for inspection and recovery.
+
+## Global-memory successor boundary
+
+The instance-global coordinator uses `state/memory` and the outer marker
+`pantheon-global-state-v2`. Earlier native channel banks (`state/chats`) are
+rejected before state mutation, even when their inner native format is valid.
+Do not point this successor at dummy3 or main live state. No automatic transition
+is provided. A future offline transition must retain all messages received after
+a staged snapshot, channel-owned operational queues and stable cache identities.
+See [global-memory.md](global-memory.md).

@@ -6,7 +6,7 @@ use std::{
     path::Path,
 };
 
-const MARKER: &str = "pantheon-native-state-v1\n";
+const MARKER: &str = "pantheon-global-state-v2\n";
 const NAME: &str = "state-format";
 
 /// Read-only preflight, before opening locks, SQLite, gateways, or workers.
@@ -37,23 +37,37 @@ pub fn validate(path: &Path) -> Result<()> {
             );
         }
     }
-    // Validate idle banks too: startup must not run queued effects while any
-    // bank would fail its lazy channel/subagent open. Never repair indexes here.
-    for name in ["chats", "subagents"] {
-        let directory = path.join(name);
-        if directory.try_exists()? {
-            ensure!(
-                fs::symlink_metadata(&directory)?.is_dir(),
-                "native bank namespace must be a real directory"
-            );
-            for entry in fs::read_dir(&directory)? {
-                let entry = entry?;
-                crate::memory::Memory::validate_namespace(entry.path())
-                    .with_context(|| format!("invalid native bank in {name}"))?;
-            }
+    // Channel-partitioned state must never be silently ignored, reused, or
+    // automatically merged. Any transition is a separately authorized offline
+    // operation, including user messages appended after a staged snapshot.
+    ensure!(
+        !exists_no_follow(&path.join("chats"))?,
+        "native state schema rejects channel-scoped banks for global memory; use a fresh state directory or an explicit offline transition"
+    );
+    let memory = path.join("memory");
+    if exists_no_follow(&memory)? {
+        crate::memory::Memory::validate_namespace(&memory).context("invalid global native bank")?;
+    }
+    let directory = path.join("subagents");
+    if exists_no_follow(&directory)? {
+        ensure!(
+            fs::symlink_metadata(&directory)?.is_dir(),
+            "native bank namespace must be a real directory"
+        );
+        for entry in fs::read_dir(directory)? {
+            crate::memory::Memory::validate_namespace(entry?.path())
+                .context("invalid private worker bank")?;
         }
     }
     Ok(())
+}
+
+fn exists_no_follow(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Admit, acquire the daemon's lifetime lock, and revalidate before any state
@@ -117,7 +131,7 @@ mod tests {
         validate(&state).unwrap();
         assert!(!state.exists());
         initialize(&state).unwrap();
-        crate::memory::Memory::open(state.join("chats/1"), 128000).unwrap();
+        crate::memory::Memory::open(state.join("memory"), 128000).unwrap();
         fs::write(state.join("runtime.sqlite"), b"synthetic operational state").unwrap();
         validate(&state).unwrap();
         initialize(&state).unwrap();
@@ -185,5 +199,51 @@ mod tests {
         crate::memory::Memory::open(&bank, 128000).unwrap();
         symlink(bank, state.join("chats/1")).unwrap();
         assert!(validate(&state).is_err());
+    }
+    #[test]
+    fn global_rejects_previous_native_channel_state_before_any_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path();
+        fs::write(state.join(NAME), "pantheon-native-state-v1\n").unwrap();
+        let bank = state.join("chats/123");
+        let mut m = crate::memory::Memory::open(&bank, 128000).unwrap();
+        m.append(
+            crate::memory::Kind::User,
+            "post-snapshot dummy message must survive",
+        )
+        .unwrap();
+        drop(m);
+        let path = fs::read_dir(bank.join("main"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let before = fs::read(&path).unwrap();
+        assert!(acquire(state).is_err());
+        assert_eq!(
+            fs::read_to_string(state.join(NAME)).unwrap(),
+            "pantheon-native-state-v1\n"
+        );
+        assert!(!state.join("memory").exists());
+        assert!(!state.join("daemon.lock").exists());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        // Even if someone hand-edits the outer marker, old banks are not ignored.
+        fs::write(state.join(NAME), MARKER).unwrap();
+        assert!(initialize(state).is_err());
+        assert!(!state.join("memory").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_rejects_dangling_bank_and_retired_namespace_symlinks() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        initialize(temp.path()).unwrap();
+        for name in ["memory", "chats", "subagents"] {
+            symlink(temp.path().join("absent-target"), temp.path().join(name)).unwrap();
+            assert!(validate(temp.path()).is_err(), "{name}");
+            fs::remove_file(temp.path().join(name)).unwrap();
+        }
     }
 }

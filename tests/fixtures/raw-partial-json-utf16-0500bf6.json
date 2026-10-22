@@ -1,0 +1,114 @@
+{
+  "upstream": "0500bf6a8ea4bf0ce047488562022b1b6532cc30",
+  "network": "global fetch throws; no endpoints or model calls",
+  "scope": "actual pinned Anthropic.read/delta/step Use and native-out; candidate source mismatch only, no native candidate acceptance",
+  "records": [
+    {
+      "name": "raw-high-in-value",
+      "outer_delta_json": [
+        "{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"x\\\":\\\"\\ud800\\\"}\"}"
+      ],
+      "partial_json_units": [
+        123,
+        34,
+        120,
+        34,
+        58,
+        34,
+        55296,
+        34,
+        125
+      ],
+      "use_input": "{\"x\":\"\\ud800\"}",
+      "native_out": "[{\"type\":\"tool_use\",\"id\":\"same\",\"name\":\"synthetic\",\"input\":{\"x\":\"\\ud800\"}}]",
+      "stop": "tools"
+    },
+    {
+      "name": "raw-low-in-key",
+      "outer_delta_json": [
+        "{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"\\udfff\\\":\\\"ok\\\"}\"}"
+      ],
+      "partial_json_units": [
+        123,
+        34,
+        57343,
+        34,
+        58,
+        34,
+        111,
+        107,
+        34,
+        125
+      ],
+      "use_input": "{\"\\udfff\":\"ok\"}",
+      "native_out": "[{\"type\":\"tool_use\",\"id\":\"same\",\"name\":\"synthetic\",\"input\":{\"\\udfff\":\"ok\"}}]",
+      "stop": "tools"
+    },
+    {
+      "name": "raw-high-split-partial",
+      "outer_delta_json": [
+        "{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"x\\\":\\\"\"}",
+        "{\"type\":\"input_json_delta\",\"partial_json\":\"\\ud800\"}",
+        "{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"}\"}"
+      ],
+      "partial_json_units": [
+        123,
+        34,
+        120,
+        34,
+        58,
+        34,
+        55296,
+        34,
+        125
+      ],
+      "use_input": "{\"x\":\"\\ud800\"}",
+      "native_out": "[{\"type\":\"tool_use\",\"id\":\"same\",\"name\":\"synthetic\",\"input\":{\"x\":\"\\ud800\"}}]",
+      "stop": "tools"
+    },
+    {
+      "name": "raw-pair-split-partial",
+      "outer_delta_json": [
+        "{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"x\\\":\\\"\"}",
+        "{\"type\":\"input_json_delta\",\"partial_json\":\"\\ud800\"}",
+        "{\"type\":\"input_json_delta\",\"partial_json\":\"\\udfff\"}",
+        "{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"}\"}"
+      ],
+      "partial_json_units": [
+        123,
+        34,
+        120,
+        34,
+        58,
+        34,
+        55296,
+        57343,
+        34,
+        125
+      ],
+      "use_input": "{\"x\":\"𐏿\"}",
+      "native_out": "[{\"type\":\"tool_use\",\"id\":\"same\",\"name\":\"synthetic\",\"input\":{\"x\":\"𐏿\"}}]",
+      "stop": "tools"
+    },
+    {
+      "name": "raw-high-outside-string-invalid",
+      "outer_delta_json": [
+        "{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"x\\\":\"}",
+        "{\"type\":\"input_json_delta\",\"partial_json\":\"\\ud800\"}",
+        "{\"type\":\"input_json_delta\",\"partial_json\":\"}\"}"
+      ],
+      "partial_json_units": [
+        123,
+        34,
+        120,
+        34,
+        58,
+        55296,
+        125
+      ],
+      "use_input": "null",
+      "native_out": "[{\"type\":\"tool_use\",\"id\":\"same\",\"name\":\"synthetic\",\"input\":{}}]",
+      "stop": "tools"
+    }
+  ]
+}

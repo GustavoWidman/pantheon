@@ -87,7 +87,7 @@ Unlimited cycles can consume ongoing provider quota until completion or cancella
 
 Optional [Claude Code background tasks](docs/claude.md) are disabled by default and require a manually installed, directly authenticated CLI on the daemon PATH; Pantheon does not bundle it through Nix.
 
-Every subagent runs in the background and reports to the master. There are no foreground children or wait/poll tools. By default the root has the full execution toolkit: it handles short or tightly connected work directly and delegates substantial independent work, parallel investigations and noisy exploration. Workers inherit the settled channel memory at spawn and can zoom into earlier findings. Set `agent.coordinator_root = true` for a strict coordinator that delegates all execution; existing configurations that explicitly set it retain that behavior. Root and workers have [web search and fetch](docs/web.md): hosted search with cited source URLs, and credential-free HTTP fetching with a durable, revalidating cache. Browser windows share one durable `pantheon-shared` profile and X display; each window group gets its own loopback VNC and noVNC listener on `0.0.0.0`. Browser handoff pauses automation until explicit resume. Returned LAN/Tailscale URLs are candidates; routing and remote firewall access cannot be established by enumerating local interfaces.
+Every subagent runs in the background and reports to the master. There are no foreground children or wait/poll tools. By default the root has the full execution toolkit: it handles short or tightly connected work directly and delegates substantial independent work, parallel investigations and noisy exploration. Workers inherit the settled global coordinator memory at spawn and can zoom into earlier findings. Set `agent.coordinator_root = true` for a strict coordinator that delegates all execution; existing configurations that explicitly set it retain that behavior. Root and workers have [web search and fetch](docs/web.md): hosted search with cited source URLs, and credential-free HTTP fetching with a durable, revalidating cache. Browser windows share one durable `pantheon-shared` profile and X display; each window group gets its own loopback VNC and noVNC listener on `0.0.0.0`. Browser handoff pauses automation until explicit resume. Returned LAN/Tailscale URLs are candidates; routing and remote firewall access cannot be established by enumerating local interfaces.
 
 Idle workers and coordinators leave default agent listings after one hour (`agent.agent_idle_seconds = 3600`). Their identities, histories and schedules remain durable. All agents can discover and message same-channel workers; coordinators can also find and message known neighboring coordinators using `list_agents(kind="coordinators")` and `tell(id="channel:<id>", message="...")`. `include_archived=true` finds hidden identities; `tell` automatically restores and wakes them, as do user input and scheduled notifications. Memory stays channel-owned; coordinator messages explicitly carry information across channels.
 
@@ -100,7 +100,7 @@ prefix stability. [Transport diagnostics and retries](docs/transport.md) correla
 line counts, exit codes and original-message updates for detached shells. Steering
 queues behind requested tool execution; `/stop` explicitly cancels work.
 
-Back up the state directory. `chats/<channel>/main/` and `tree/` contain immutable daily JSONL records; operational SQLite journals contain inbox/outbox, tasks and schedules; `subagents/` holds private child traces; `browsers/pantheon-shared/profile/` holds shared browser state, and the other browser directories hold viewer metadata and screenshots. State is never committed to this repository.
+Back up the state directory. `memory/main/` and `tree/` contain immutable daily JSONL records; operational SQLite journals contain inbox/outbox, tasks and schedules; `subagents/` holds private child traces; `browsers/pantheon-shared/profile/` holds shared browser state, and the other browser directories hold viewer metadata and screenshots. State is never committed to this repository.
 
 ```sh
 cargo fmt --all -- --check
@@ -112,8 +112,8 @@ nix flake check
 Stop the service before offline memory operations:
 
 ```sh
-pantheon --config pantheon.toml export --channel 123 --output memory.html
-pantheon --config pantheon.toml import --channel 123 --file old-history.txt
+pantheon --config pantheon.toml export --output memory.html
+pantheon --config pantheon.toml import --file note.txt
 ```
 
 Crash recovery resumes queued prompts, wakeups and unsent output. Interrupted turns are reported rather than replaying uncertain tool side effects. Discord delivery is at least once; nonce deduplication has a finite remote window. Complete provider responses are rendered per step; token-by-token prose streaming is not implemented yet. Live bot/model validation requires your credentials.

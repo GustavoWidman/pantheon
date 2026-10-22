@@ -1,0 +1,576 @@
+{
+  "upstream": "0500bf6a8ea4bf0ce047488562022b1b6532cc30",
+  "passing_cases": 14,
+  "scope": "reference expectations only; no native acceptance; storage sink/UI stubbed, actual buffering/flush code unmodified",
+  "cases": [
+    {
+      "name": "cancel-before-use-keeps-all-completed",
+      "events": [
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "call-first",
+          "of": "first"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "call-second",
+          "of": "second"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "tool",
+          "text": "call-first"
+        },
+        {
+          "kind": "tool",
+          "text": "call-second"
+        }
+      ],
+      "sink": "actual on/hold/unanswered; Chat.push in-memory sink; UI stubbed",
+      "held": false
+    },
+    {
+      "name": "cancel-after-first-result",
+      "events": [
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "call-first",
+          "of": "first"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "call-second",
+          "of": "second"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "result-first",
+          "of": "first"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "tool",
+          "text": "call-first"
+        },
+        {
+          "kind": "echo",
+          "text": "result-first"
+        },
+        {
+          "kind": "tool",
+          "text": "call-second"
+        }
+      ],
+      "sink": "actual on/hold/unanswered; Chat.push in-memory sink; UI stubbed",
+      "held": false
+    },
+    {
+      "name": "numeric-unanswered-key-order",
+      "events": [
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "call-10",
+          "of": "10"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "call-2",
+          "of": "2"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "call-01",
+          "of": "01"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "tool",
+          "text": "call-2"
+        },
+        {
+          "kind": "tool",
+          "text": "call-10"
+        },
+        {
+          "kind": "tool",
+          "text": "call-01"
+        }
+      ],
+      "sink": "actual on/hold/unanswered; Chat.push in-memory sink; UI stubbed",
+      "held": false
+    },
+    {
+      "name": "duplicate-overwrites-retains-insertion",
+      "events": [
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "old",
+          "of": "a"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "call-b",
+          "of": "b"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "new",
+          "of": "a"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "tool",
+          "text": "new"
+        },
+        {
+          "kind": "tool",
+          "text": "call-b"
+        }
+      ],
+      "sink": "actual on/hold/unanswered; Chat.push in-memory sink; UI stubbed",
+      "held": false
+    },
+    {
+      "name": "completed-interleaving",
+      "events": [
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "call-a",
+          "of": "a"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before result"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "server-call",
+          "of": "s"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "result-s",
+          "of": "s"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "after server"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "result-a",
+          "of": "a"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before result"
+        },
+        {
+          "kind": "tool",
+          "text": "server-call"
+        },
+        {
+          "kind": "echo",
+          "text": "result-s"
+        },
+        {
+          "kind": "unii",
+          "text": "after server"
+        },
+        {
+          "kind": "tool",
+          "text": "call-a"
+        },
+        {
+          "kind": "echo",
+          "text": "result-a"
+        }
+      ],
+      "sink": "actual on/hold/unanswered; Chat.push in-memory sink; UI stubbed",
+      "held": false
+    },
+    {
+      "name": "unknown-result-still-stored",
+      "events": [
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "result-none",
+          "of": "none"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "echo",
+          "text": "result-none"
+        }
+      ],
+      "sink": "actual on/hold/unanswered; Chat.push in-memory sink; UI stubbed",
+      "held": false
+    },
+    {
+      "name": "empty-id-is-an-id",
+      "events": [
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "empty-id",
+          "of": ""
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "result-",
+          "of": ""
+        }
+      ],
+      "stored": [
+        {
+          "kind": "tool",
+          "text": "empty-id"
+        },
+        {
+          "kind": "echo",
+          "text": "result-"
+        }
+      ],
+      "sink": "actual on/hold/unanswered; Chat.push in-memory sink; UI stubbed",
+      "held": false
+    },
+    {
+      "name": "missing-id-is-inert-immediate",
+      "events": [
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "partial\n[cut off: stopped]"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "tool",
+          "text": "partial\n[cut off: stopped]"
+        }
+      ],
+      "sink": "actual on/hold/unanswered; Chat.push in-memory sink; UI stubbed",
+      "held": false
+    },
+    {
+      "name": "thought-ui-only",
+      "events": [
+        {
+          "$": "Entry",
+          "kind": "mind",
+          "text": "hidden"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "visible"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "visible"
+        }
+      ],
+      "sink": "actual on/hold/unanswered; Chat.push in-memory sink; UI stubbed",
+      "held": false
+    },
+    {
+      "name": "held-storage-order",
+      "events": [
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "call-a",
+          "of": "a"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before result"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "result-a",
+          "of": "a"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before result"
+        },
+        {
+          "kind": "tool",
+          "text": "call-a"
+        },
+        {
+          "kind": "echo",
+          "text": "result-a"
+        }
+      ],
+      "sink": "actual on/hold/unanswered; Chat.push in-memory sink; UI stubbed",
+      "held": true
+    },
+    {
+      "name": "prototype-setter-call-is-not-own-entry",
+      "events": [
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "prototype",
+          "of": "__proto__"
+        }
+      ],
+      "stored": [],
+      "sink": "actual on/hold/unanswered; Chat.push in-memory sink; UI stubbed",
+      "held": false
+    },
+    {
+      "name": "constructor-is-own-entry",
+      "events": [
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "call-constructor",
+          "of": "constructor"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "tool",
+          "text": "call-constructor"
+        }
+      ],
+      "sink": "actual on/hold/unanswered; Chat.push in-memory sink; UI stubbed",
+      "held": false
+    },
+    {
+      "name": "actual-wire-completed-entry",
+      "requests": 1,
+      "executions": 0,
+      "emitted": [
+        {
+          "$": "Delta",
+          "kind": "tool",
+          "text": "synthetic_tool ",
+          "fresh": true
+        },
+        {
+          "$": "Delta",
+          "kind": "tool",
+          "text": "synthetic_tool ",
+          "fresh": true
+        },
+        {
+          "$": "Delta",
+          "kind": "tool",
+          "text": "web_search ",
+          "fresh": true
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "synthetic_tool {\"z\":1,\"a\":2}",
+          "of": "10"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "between"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "synthetic_tool {}",
+          "of": "2"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "web_search {\"query\":\"fake\"}",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "(no output)",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "kind": "unii",
+          "text": "between"
+        },
+        {
+          "kind": "tool",
+          "text": "web_search {\"query\":\"fake\"}"
+        },
+        {
+          "kind": "echo",
+          "text": "(no output)"
+        },
+        {
+          "kind": "unii",
+          "text": "after"
+        },
+        {
+          "kind": "tool",
+          "text": "synthetic_tool {}"
+        },
+        {
+          "kind": "tool",
+          "text": "synthetic_tool {\"z\":1,\"a\":2}"
+        }
+      ],
+      "sink": "actual Agent.loop and Anthropic wire -> Server.Chat.on/hold/unanswered; Chat.push in-memory sink, UI stubbed"
+    },
+    {
+      "name": "actual-wire-completed-first-result",
+      "requests": 1,
+      "executions": 1,
+      "emitted": [
+        {
+          "$": "Delta",
+          "kind": "tool",
+          "text": "synthetic_tool ",
+          "fresh": true
+        },
+        {
+          "$": "Delta",
+          "kind": "tool",
+          "text": "synthetic_tool ",
+          "fresh": true
+        },
+        {
+          "$": "Delta",
+          "kind": "tool",
+          "text": "web_search ",
+          "fresh": true
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "synthetic_tool {\"z\":1,\"a\":2}",
+          "of": "10"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "between"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "synthetic_tool {}",
+          "of": "2"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "web_search {\"query\":\"fake\"}",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "(no output)",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "after"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "first result",
+          "of": "10"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "kind": "unii",
+          "text": "between"
+        },
+        {
+          "kind": "tool",
+          "text": "web_search {\"query\":\"fake\"}"
+        },
+        {
+          "kind": "echo",
+          "text": "(no output)"
+        },
+        {
+          "kind": "unii",
+          "text": "after"
+        },
+        {
+          "kind": "tool",
+          "text": "synthetic_tool {\"z\":1,\"a\":2}"
+        },
+        {
+          "kind": "echo",
+          "text": "first result"
+        },
+        {
+          "kind": "tool",
+          "text": "synthetic_tool {}"
+        }
+      ],
+      "sink": "actual Agent.loop and Anthropic wire -> Server.Chat.on/hold/unanswered; Chat.push in-memory sink, UI stubbed"
+    }
+  ]
+}

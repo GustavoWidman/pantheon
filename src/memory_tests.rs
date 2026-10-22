@@ -678,3 +678,24 @@ fn native_scan_never_permits_superseding_a_published_position() {
     OpenOptions::new().append(true).open(path).unwrap().write_all(&bytes).unwrap();
     assert!(Memory::open(dir.path(),VIEW_BYTES).is_err());
 }
+
+#[test]
+fn actual_upstream_whole_suffix_limits_differential() {
+    let f:Value=serde_json::from_str(include_str!("../tests/fixtures/compactor-contract-0500bf6.json")).unwrap();
+    for case in f["suffixes"].as_array().unwrap() {
+        let dir=TempDir::new().unwrap();let mut mem=Memory::open(dir.path(),VIEW_BYTES).unwrap();
+        let mut groups=Vec::new();
+        for (text,pics) in case["texts"].as_array().unwrap().iter().zip(case["images"].as_array().unwrap()) {
+            let start=mem.count;
+            mem.push(Kind::User,text.as_str().unwrap(),&(0..pics.as_u64().unwrap()).map(|n|format!("image{n}")).collect::<Vec<_>>(),false).unwrap();
+            groups.push((start,mem.count));
+        }
+        let from=mem.whole(0).unwrap();
+        assert_eq!(from,case["from"].as_u64().unwrap(),"{}",case["name"]);
+        assert_eq!(mem.count,case["pages"].as_u64().unwrap());
+        let raw=groups.into_iter().filter(|(_,end)|*end>from).map(|(start,end)|mem.say(start.max(from),end).unwrap()).collect::<Vec<_>>();
+        assert_eq!(json!(raw),case["raw"]);
+        assert!(mem.settled_before(0).unwrap());
+        assert!(mem.whole(mem.count+1).is_err());
+    }
+}

@@ -1,6 +1,6 @@
 [package]
 name = "pantheon"
-version = "0.21.0"
+version = "0.21.1"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT AND Apache-2.0"
@@ -36,8 +36,10 @@ toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
+ryu-js = "1"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 axum = "0.8"
 tempfile = "3"
 
@@ -46,3 +48,7 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = "debuginfo"
+
+# Scoped native tool-argument wire preservation; see vendor/rmcp/PANTHEON-PATCH.md.
+[patch.crates-io]
+rmcp = { path = "vendor/rmcp" }

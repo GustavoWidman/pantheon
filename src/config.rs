@@ -58,6 +58,8 @@ impl Default for ClaudeConfig {
 pub struct DiscordConfig {
     pub application_id: u64,
     pub allowed_users: Vec<u64>,
+    /// Opt-in exact direct-message channel fence; None preserves normal guild/DM routing.
+    pub dm_channel_id: Option<u64>,
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -71,9 +73,11 @@ pub struct AgentConfig {
     pub max_steps: usize,
     pub max_subagents: usize,
     pub agent_idle_seconds: u64,
+    /// Generic Codex/Z.ai/search deadline; native public turns use event-idle.
     pub request_timeout_seconds: u64,
     /// Sensitive selected provider-error diagnostics; disabled unless explicitly opted in.
     pub provider_error_capture: bool,
+    /// Generic transport policy; native public OpenAI/Anthropic uses eight tries.
     pub request_max_attempts: usize,
     pub request_backoff_seconds: u64,
     pub tool_timeout_seconds: u64,
@@ -138,6 +142,10 @@ impl Config {
         ensure!(
             !config.discord.allowed_users.is_empty(),
             "discord.allowed_users must explicitly authorize users"
+        );
+        ensure!(
+            config.discord.dm_channel_id != Some(0),
+            "discord.dm_channel_id must be nonzero"
         );
         ensure!(
             config.agent.view_bytes >= 1024,

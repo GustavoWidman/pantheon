@@ -48,8 +48,18 @@ fn pinned_standard_and_lite_fixtures_execute_real_serializer() {
         } else {
             vec![]
         };
-        let body =
-            Provider::request_body("codex/gpt-6.1-sol", "high", SYSTEM, &history, &tools).unwrap();
+        let body = Provider::request_body(
+            "codex/gpt-6.1-sol",
+            "high",
+            SYSTEM,
+            &history
+                .iter()
+                .cloned()
+                .map(Into::into)
+                .collect::<Vec<crate::provider::NativeValue>>(),
+            &tools,
+        )
+        .unwrap();
         let request = wire(&body, Some(lite));
         let encoded = serde_json::to_vec(&request).unwrap();
         assert!(encoded.starts_with(b"{\"model\":\"gpt-6.1-sol\",\"stream\":true,\"input\":"));
@@ -233,7 +243,7 @@ fn namespace_dispatch_and_continuation_preserve_native_call_ids_images_and_reaso
             Some("iVBORw0KGgo="),
         );
         let user = json!({"role":"user","content":[{"type":"input_text","text":"continue","prompt_cache_breakpoint":{"mode":"explicit"}},{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="} ]});
-        history.push(user);
+        history.push(user.into());
         let original = history.clone();
         let body = Provider::request_body("codex/unknown", "high", "sys", &history, &[function()])
             .unwrap();

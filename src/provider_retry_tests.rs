@@ -111,6 +111,76 @@ mod request_retries {
     }
 
     #[tokio::test]
+    async fn compactor_codex_actual_terminal_sse_matches_public_semantics() {
+        for event in [
+            json!({"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}),
+            json!({"type":"response.failed","response":{"status":"failed","error":{"code":"policy_error"}}}),
+        ] {
+            let (provider, state, task)=server(vec![Reply::Sse(format!("data: {event}\n\n"))],1).await;
+            let home=tempfile::tempdir().unwrap();
+            let provider=provider.with_auth(auth(home.path()));
+            let result=provider.step_compaction("codex/test","none","synthetic",&Provider::start("openai","<chat>\n</chat>\n","task")).await.unwrap();
+            assert_eq!(result,CompactionReply::ModelFailure);
+            let requests=state.requests.lock().unwrap();
+            assert_eq!(requests.len(),1);
+            assert_eq!(requests[0].0["authorization"],"Bearer test-token");
+            assert_eq!(requests[0].1["stream"],true);
+            assert_eq!(requests[0].1["input"][0]["role"],"developer");
+            task.abort();
+        }
+        // Busy/error/EOF never becomes refusal merely because it is Codex.
+        let (provider,_,task)=server(vec![Reply::Sse("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\"}}}\n\n".into())],1).await;
+        let home=tempfile::tempdir().unwrap();
+        assert!(provider.with_auth(auth(home.path())).step_compaction("codex/test","none","",&[]).await.is_err());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn compactor_pause_continuation_can_be_cancelled_during_http() {
+        let count=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let waiting=Arc::new(tokio::sync::Notify::new());
+        let done=Arc::new(tokio::sync::Notify::new());
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider=Provider::mock(format!("http://{}/",listener.local_addr().unwrap()));
+        let n=count.clone();let got=waiting.clone();let release=done.clone();
+        let task=tokio::spawn(async move {
+            axum::serve(listener,Router::new().route("/",post(move || {
+                let n=n.clone();let got=got.clone();let release=release.clone();
+                async move {
+                    if n.fetch_add(1,std::sync::atomic::Ordering::SeqCst)>0 {
+                        got.notify_one(); release.notified().await;
+                    }
+                    Json(json!({"stop_reason":"pause_turn","content":[{"type":"thinking","thinking":"fixture","signature":"opaque"}]}))
+                }
+            }))).await.unwrap();
+        });
+        let history=Provider::start("anthropic","<chat>\n</chat>\n","task");
+        let mut request=Box::pin(provider.step_compaction("anthropic/test","medium","fixed",&history));
+        tokio::select! {
+            _=waiting.notified()=>{},
+            result=&mut request=>panic!("pause call unexpectedly completed: {result:?}"),
+        }
+        drop(request); // same cancellation operation as scheduler future ownership
+        done.notify_waiters();
+        tokio::task::yield_now().await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst),2);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn compactor_anthropic_stream_errors_eof_and_malformed_are_not_model_failure() {
+        for begun in [false,true] {
+            for tail in ["", "data: not-json\n\n", "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\n"] {
+                let head=if begun {"data: {\"type\":\"message_start\",\"message\":{\"content\":[]}}\n\n"} else {""};
+                let (provider,_,task)=server(vec![Reply::Sse(format!("{head}{tail}"))],1).await;
+                let result=provider.step_compaction("anthropic/test","medium","fixed",&Provider::start("anthropic","<chat>\n</chat>\n","task")).await;
+                assert!(result.is_err(),"begun={begun}, tail={tail}");
+                task.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn transient_http_retries_are_linear_bounded_and_preserve_the_native_request() {
         use tracing::instrument::WithSubscriber;
         let (provider, state, task) = server(
@@ -143,7 +213,7 @@ mod request_retries {
                 "codex/test",
                 "none",
                 "stable system",
-                &history,
+                &history.iter().cloned().map(Into::into).collect::<Vec<crate::provider::NativeValue>>(),
                 &[],
                 Some(&on_submitted),
             )
@@ -390,7 +460,7 @@ mod request_retries {
         for (event, kind, retryable, code) in cases {
             let (provider, state, task) = server(vec![Reply::Sse(format!("data: {event}\n\n"))], 3).await;
             let log = DiagnosticLog::default();
-            let error = provider.step("openai/test", "none", "private-system-text", &[json!({"role":"user","content":"private-api-token"})], &[])
+            let error = provider.step("openai/test", "none", "private-system-text", &[json!({"role":"user","content":"private-api-token"}).into()], &[])
                 .with_subscriber(capture(&log)).await.unwrap_err();
             let (text, records) = log.records();
             assert_eq!(state.requests.lock().unwrap().len(), 1);

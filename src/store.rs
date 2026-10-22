@@ -204,6 +204,22 @@ impl Store {
             })?
             .collect::<std::result::Result<_, _>>()?)
     }
+    /// Crash recovery order across all channels. This is durable DB admission
+    /// order, not a reconstruction of external Discord arrival timestamps.
+    pub fn unlogged_global(&self) -> Result<Vec<Input>> {
+        let db = self.db.lock().unwrap();
+        let mut stmt = db.prepare("SELECT id,channel,user,text FROM inbox WHERE logged=0 AND state!='queued' ORDER BY created,rowid")?;
+        Ok(stmt
+            .query_map([], |r| {
+                Ok(Input {
+                    id: r.get(0)?,
+                    channel: r.get::<_, String>(1)?.parse().unwrap_or(0),
+                    user: r.get::<_, String>(2)?.parse().unwrap_or(0),
+                    text: r.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?)
+    }
     pub fn has_active_work(&self) -> Result<bool> {
         Ok(self.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM attachment_ingress WHERE state='pending') OR EXISTS(SELECT 1 FROM inbox WHERE state IN ('queued','running')) OR EXISTS(SELECT 1 FROM agent_runs WHERE state='running') OR EXISTS(SELECT 1 FROM agent_inbox WHERE state='queued') OR EXISTS(SELECT 1 FROM shell_runs WHERE state='running') OR EXISTS(SELECT 1 FROM ui_agents WHERE active=1)", [], |r|r.get(0))?)
     }

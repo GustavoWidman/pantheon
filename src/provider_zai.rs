@@ -166,7 +166,7 @@ fn validate_calls(calls: &Value) -> Result<Vec<ToolCall>> {
             Ok(ToolCall {
                 id: id.into(),
                 name: name.into(),
-                arguments,
+                arguments: arguments.into(),
             })
         })
         .collect()
@@ -185,7 +185,7 @@ fn validate_history(history: &[Value], images: bool) -> Result<()> {
         if role == "tool" {
             let id = identifier(&item["tool_call_id"])?;
             ensure!(
-                pending.remove(id),
+                pending.remove(&super::CallId::from(id)),
                 "Z.ai tool result has no matching pending call"
             );
             ensure!(
@@ -230,9 +230,11 @@ pub(super) fn request_body(
     id: &str,
     effort: &str,
     system: &str,
-    history: &[Value],
+    history: &[super::NativeValue],
     tools: &[Value],
 ) -> Result<Value> {
+    let history = super::projected_history(history);
+    let history = history.as_slice();
     validate_model(id)?;
     validate_effort(effort)?;
     validate_history(history, id == "glm-5.3-flash")?;
@@ -326,7 +328,7 @@ pub(super) fn parse(value: Value) -> Result<Response> {
         }
     }
     Ok(Response {
-        native: vec![native],
+        native: vec![native.into()],
         texts: text
             .into_iter()
             .filter(|s| !s.is_empty())

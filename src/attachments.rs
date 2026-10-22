@@ -1216,6 +1216,54 @@ pub fn remaining_budget(model: &str, history: &[Value]) -> InputBudget {
         .saturating_sub(images),
     }
 }
+/// Preserve existing budgets for ordinary host values, charging opaque native
+/// bytes rather than the smaller lossy projection. This is a resource guard,
+/// never a conversion used by the provider/MCP wire or durable identities.
+pub(crate) fn remaining_budget_native(
+    model: &str,
+    history: &[crate::provider::NativeValue],
+) -> InputBudget {
+    let projection = crate::provider::projected_history(history);
+    let mut budget = remaining_budget(model, &projection);
+    let extra = history
+        .iter()
+        .zip(projection.iter())
+        .filter(|(native, _)| !native.host_compatible())
+        .map(|(native, view)| {
+            native
+                .canonical()
+                .len()
+                .saturating_sub(view.to_string().len()) as u64
+        })
+        .fold(0u64, u64::saturating_add);
+    budget.payload = budget
+        .payload
+        .saturating_sub(extra.saturating_mul(3).saturating_add(3) / 4);
+    budget
+}
+pub(crate) fn budget_with_native_media(
+    model: &str,
+    history: &[crate::provider::NativeValue],
+    media: &[Value],
+) -> InputBudget {
+    let current = remaining_budget_native(model, history);
+    let pending = remaining_budget(model, media);
+    let full = remaining_budget(model, &[]);
+    InputBudget {
+        files: current.files.saturating_sub(full.files - pending.files),
+        payload: current
+            .payload
+            .saturating_sub(full.payload - pending.payload),
+        images: current.images.saturating_sub(full.images - pending.images),
+    }
+}
+pub(crate) fn text_chars_native(value: &crate::provider::NativeValue) -> usize {
+    if value.host_compatible() {
+        text_chars(value)
+    } else {
+        value.canonical().chars().count()
+    }
+}
 /// Account for already queued tool media as well as the existing immutable transcript.
 pub fn budget_with_media(model: &str, history: &[Value], media: &[Value]) -> InputBudget {
     let current = remaining_budget(model, history);
