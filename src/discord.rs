@@ -124,6 +124,7 @@ pub struct Discord {
     token: String,
     application_id: u64,
     allowed_users: HashSet<u64>,
+    dm_channel_id: Option<u64>,
     bot_id: AtomicU64,
     client: Client,
     api: String,
@@ -273,6 +274,7 @@ impl Discord {
             token,
             application_id,
             allowed_users: allowed_users.into_iter().collect(),
+            dm_channel_id: None,
             bot_id: AtomicU64::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(20))
@@ -283,6 +285,116 @@ impl Discord {
             ingress: None,
             models: Arc::default(),
         })
+    }
+
+    /// Optional exact-DM admission fence. It also applies to recovered ingress.
+    pub fn with_dm_channel(mut self, channel: Option<u64>) -> Result<Self> {
+        anyhow::ensure!(channel != Some(0), "DM channel must be nonzero");
+        self.dm_channel_id = channel;
+        Ok(self)
+    }
+
+    fn admits_route(&self, data: &Value, interaction: bool) -> bool {
+        let Some(channel) = self.dm_channel_id else {
+            return true;
+        };
+        // Real DM payloads omit guild/member metadata. Even malformed/null guild
+        // metadata is denied rather than interpreted as a direct message.
+        data.is_object()
+            && data.get("guild_id").is_none()
+            && data.get("member").is_none()
+            && data.get("webhook_id").is_none()
+            && data
+                .get(if interaction { "author" } else { "user" })
+                .is_none()
+            && data
+                .get(if interaction { "user" } else { "author" })
+                .is_some_and(|actor| {
+                    actor["id"]
+                        .as_str()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .is_some_and(|user| self.allowed_users.contains(&user))
+                        && actor.get("bot").is_none_or(|v| v == false)
+                })
+            && data["channel_id"]
+                .as_str()
+                .is_some_and(|id| id == channel.to_string())
+            && data.get("context").is_none_or(|v| v.as_u64() == Some(1))
+            && data.get("channel").is_none_or(|v| {
+                v.is_object()
+                    && v.get("guild_id").is_none()
+                    && v["type"].as_u64() == Some(1)
+                    && v["id"].as_str().is_some_and(|id| id == channel.to_string())
+            })
+    }
+
+    fn admits_recovered(&self, inbound: &Inbound) -> bool {
+        match inbound {
+            Inbound::Prompt { channel, user, .. } => {
+                self.allowed_users.contains(user)
+                    && self.dm_channel_id.is_none_or(|allowed| *channel == allowed)
+            }
+            _ => false,
+        }
+    }
+
+    fn registration_commands(&self) -> Value {
+        let mut commands = command_definitions();
+        if self.dm_channel_id.is_some() {
+            for command in commands
+                .as_array_mut()
+                .expect("command definitions are an array")
+            {
+                command["contexts"] = json!([1]); // BOT_DM, never GUILD or PRIVATE_CHANNEL
+                command["integration_types"] = json!([0]); // guild-installed bot identity
+            }
+        }
+        commands
+    }
+
+    /// Shared by the actual gateway loop and routing tests. Reject fenced events
+    /// before touching the cursor, ingress database, handlers or interaction tasks.
+    fn handle_dispatch(
+        self: &Arc<Self>,
+        event: &Value,
+        session: &mut Session,
+        tx: &mpsc::Sender<Inbound>,
+        shutdown: &CancellationToken,
+        interactions: &mut JoinSet<()>,
+    ) -> Result<Option<Inbound>> {
+        let kind = event["t"].as_str();
+        if self.dm_channel_id.is_some() && event["d"].get("guild_id").is_some() {
+            return Ok(None);
+        }
+        if self.dm_channel_id.is_some()
+            && !matches!(kind, Some("READY" | "RESUMED"))
+            && (!matches!(kind, Some("MESSAGE_CREATE" | "INTERACTION_CREATE"))
+                || !self.admits_route(&event["d"], kind == Some("INTERACTION_CREATE")))
+        {
+            return Ok(None);
+        }
+        if let Some(seq) = event["s"].as_u64() {
+            session.sequence = Some(seq);
+        }
+        let mut prompt = None;
+        match kind {
+            Some("READY") => {
+                session.id = event["d"]["session_id"].as_str().map(str::to_owned);
+                session.resume_url = event["d"]["resume_gateway_url"].as_str().map(str::to_owned);
+                session.bot_id = snowflake(&event["d"]["user"]["id"]).unwrap_or(0);
+                self.bot_id.store(session.bot_id, Ordering::Relaxed);
+                tracing::info!("Discord gateway ready");
+            }
+            Some("MESSAGE_CREATE") => {
+                prompt = self.prompt(&event["d"]);
+            }
+            Some("INTERACTION_CREATE") => {
+                self.dispatch_interaction(&event["d"], tx, shutdown, interactions);
+            }
+            _ => {}
+        }
+        self.checkpoint(session, prompt.as_ref())?;
+        Ok(prompt)
     }
 
     /// Enable process-crash replay. The daemon always supplies its private state directory.
@@ -706,10 +818,10 @@ impl Discord {
         self.bot_id.store(session.bot_id, Ordering::Relaxed);
         // Deliver committed ingress before depending on any network startup operation.
         while let Some(prompt) = pending.pop_front() {
-            if let Inbound::Prompt { ref id, user, .. } = prompt
-                && !self.allowed_users.contains(&user)
-            {
-                self.acknowledge(id)?;
+            if !self.admits_recovered(&prompt) {
+                if let Inbound::Prompt { ref id, .. } = prompt {
+                    self.acknowledge(id)?;
+                }
                 continue;
             }
             tokio::select! {
@@ -724,7 +836,7 @@ impl Discord {
             registration = self.request(
             Method::PUT,
             &commands_path,
-            Some(command_definitions()),
+            Some(self.registration_commands()),
         )
         => { registration?; }
         }
@@ -884,27 +996,9 @@ impl Discord {
                     let event: Value = serde_json::from_str(&text).map_err(|_| anyhow!("Invalid Discord gateway payload"))?;
                     match event["op"].as_u64() {
                         Some(0) => {
-                            if let Some(seq) = event["s"].as_u64() { session.sequence = Some(seq); }
-                            let mut prompt = None;
-                            match event["t"].as_str() {
-                            Some("READY") => {
-                                session.id = event["d"]["session_id"].as_str().map(str::to_owned);
-                                session.resume_url = event["d"]["resume_gateway_url"].as_str().map(str::to_owned);
-                                session.bot_id = snowflake(&event["d"]["user"]["id"]).unwrap_or(0);
-                                self.bot_id.store(session.bot_id, Ordering::Relaxed);
-                                tracing::info!("Discord gateway ready");
+                            if let Some(prompt) = self.handle_dispatch(&event, session, tx, shutdown, interactions)? {
+                                pending.push_back(prompt);
                             }
-                            Some("MESSAGE_CREATE") => {
-                                prompt = self.prompt(&event["d"]);
-                            }
-                            Some("INTERACTION_CREATE") => {
-                                self.dispatch_interaction(&event["d"], tx, shutdown, interactions);
-                            }
-                            _ => {},
-                            }
-                            // Cursor and authorized message are one FULL-synchronous transaction.
-                            self.checkpoint(session, prompt.as_ref())?;
-                            if let Some(prompt) = prompt { pending.push_back(prompt); }
                         },
                         Some(1) => {
                             write.send(Message::Text(json!({"op": 1, "d": session.sequence}).to_string().into())).await
@@ -935,7 +1029,7 @@ impl Discord {
         shutdown: &CancellationToken,
         interactions: &mut JoinSet<()>,
     ) {
-        if !matches!(data["type"].as_u64(), Some(2..=4)) {
+        if !self.admits_route(data, true) || !matches!(data["type"].as_u64(), Some(2..=4)) {
             return;
         }
         let discord = self.clone();
@@ -951,7 +1045,10 @@ impl Discord {
     }
 
     fn prompt(&self, message: &Value) -> Option<Inbound> {
-        if message["author"]["bot"] == true || !message["webhook_id"].is_null() {
+        if !self.admits_route(message, false)
+            || message["author"]["bot"] == true
+            || !message["webhook_id"].is_null()
+        {
             return None;
         }
         let user = snowflake(&message["author"]["id"])?;
@@ -998,6 +1095,11 @@ impl Discord {
     }
 
     async fn interaction(&self, event: Value, tx: mpsc::Sender<Inbound>) {
+        if !self.admits_route(&event, true)
+            || (self.dm_channel_id.is_some() && !matches!(event["type"].as_u64(), Some(2..=4)))
+        {
+            return;
+        }
         let Some(id) = event["id"].as_str() else {
             return;
         };
@@ -1416,6 +1518,464 @@ pub fn split_message(content: &str, mention: Option<u64>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fenced_bot() -> Discord {
+        let bot = Discord::new("synthetic".into(), 1, vec![42])
+            .unwrap()
+            .with_dm_channel(Some(10))
+            .unwrap();
+        bot.bot_id.store(7, Ordering::Relaxed);
+        bot
+    }
+    fn dm_message() -> Value {
+        json!({"id":"100","channel_id":"10","author":{"id":"42","bot":false},"content":"hello","attachments":[]})
+    }
+    fn dm_interaction(kind: u64) -> Value {
+        json!({"id":"101","token":"synthetic","application_id":"1","type":kind,
+            "channel_id":"10","channel":{"id":"10","type":1},"context":1,
+            "user":{"id":"42","bot":false},"data":{"name":"model","options":[]}})
+    }
+
+    #[test]
+    fn dm_fence_config_default_and_zero_validation() {
+        let config: crate::config::Config =
+            toml::from_str("[discord]\napplication_id=1\nallowed_users=[42]\n").unwrap();
+        assert_eq!(config.discord.dm_channel_id, None);
+        assert!(
+            Discord::new("fake".into(), 1, vec![42])
+                .unwrap()
+                .with_dm_channel(Some(0))
+                .is_err()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[discord]\napplication_id=1\nallowed_users=[42]\ndm_channel_id=0\n",
+        )
+        .unwrap();
+        assert!(
+            crate::config::Config::load(&path)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("nonzero")
+        );
+        let normal = Discord::new("fake".into(), 1, vec![42]).unwrap();
+        normal.bot_id.store(7, Ordering::Relaxed);
+        let mut guild = dm_message();
+        guild["guild_id"] = json!("9");
+        guild["mentions"] = json!([{"id":"7"}]);
+        assert!(normal.prompt(&guild).is_some());
+        assert!(fenced_bot().prompt(&guild).is_none());
+        assert_eq!(normal.registration_commands(), command_definitions());
+        for command in fenced_bot().registration_commands().as_array().unwrap() {
+            assert_eq!(command["contexts"], json!([1]));
+            assert_eq!(command["integration_types"], json!([0]));
+        }
+    }
+
+    #[tokio::test]
+    async fn dm_fence_raw_gateway_and_direct_routes_reject_without_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bot = fenced_bot().with_state_dir(dir.path()).unwrap();
+        // Any accidental callback is local and counted, never a real Discord request.
+        use axum::{Router, extract::State, routing::post};
+        let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/interactions/{id}/{token}/callback",
+                post(
+                    |State(n): State<Arc<std::sync::atomic::AtomicUsize>>| async move {
+                        n.fetch_add(1, Ordering::SeqCst);
+                        axum::http::StatusCode::NO_CONTENT
+                    },
+                ),
+            )
+            .with_state(callbacks.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        bot.api = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let bot = Arc::new(bot);
+        let (tx, mut rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        let mut session = Session::default();
+        let mut cases = Vec::new();
+        // Production MESSAGE_CREATE and every supported/unsupported interaction shape.
+        for (kind, base) in std::iter::once(("MESSAGE_CREATE", dm_message()))
+            .chain((2..=5).map(|k| ("INTERACTION_CREATE", dm_interaction(k))))
+        {
+            for guild in [json!("9"), json!(null), json!({}), json!(false), json!(0)] {
+                let mut data = base.clone();
+                data["guild_id"] = guild;
+                cases.push((kind, data));
+            }
+            for channel in [
+                json!("11"),
+                json!(10),
+                json!(null),
+                json!({}),
+                json!("0"),
+                json!("broken"),
+            ] {
+                let mut data = base.clone();
+                data["channel_id"] = channel;
+                cases.push((kind, data));
+            }
+            let mut absent = base.clone();
+            absent.as_object_mut().unwrap().remove("channel_id");
+            cases.push((kind, absent));
+            for (field, value) in [
+                ("member", json!({"user":{"id":"42"}})),
+                ("channel", json!({"id":"10","guild_id":null})),
+                ("context", json!(0)),
+                ("channel", json!({"id":"10","type":3})),
+                ("channel", json!(null)),
+                ("webhook_id", json!("123")),
+            ] {
+                let mut data = base.clone();
+                data[field] = value;
+                cases.push((kind, data));
+            }
+            let mut ambiguous = base.clone();
+            ambiguous["author"] = json!({"id":"42"});
+            ambiguous["user"] = json!({"id":"42"});
+            cases.push((kind, ambiguous));
+            let actor = if kind == "MESSAGE_CREATE" {
+                "author"
+            } else {
+                "user"
+            };
+            for value in [
+                json!({"id":"43"}),
+                json!({"id":"42","bot":true}),
+                json!({"id":42}),
+                json!(null),
+            ] {
+                let mut data = base.clone();
+                data[actor] = value;
+                cases.push((kind, data));
+            }
+        }
+        for (kind, data) in cases {
+            let event = json!({"op":0,"s":99,"t":kind,"d":data});
+            assert!(
+                bot.handle_dispatch(&event, &mut session, &tx, &shutdown, &mut tasks)
+                    .unwrap()
+                    .is_none(),
+                "{event}"
+            );
+            if kind == "MESSAGE_CREATE" {
+                assert!(bot.prompt(&data).is_none());
+            } else {
+                bot.dispatch_interaction(&data, &tx, &shutdown, &mut tasks);
+                bot.interaction(data, tx.clone()).await;
+            }
+            assert!(tasks.is_empty(), "no interaction task may be spawned");
+        }
+        let guild_misc = json!({"op":0,"s":100,"t":"GUILD_CREATE","d":{"id":"9"}});
+        bot.handle_dispatch(&guild_misc, &mut session, &tx, &shutdown, &mut tasks)
+            .unwrap();
+        assert!(session.sequence.is_none());
+        let (saved, pending) = bot.ingress.as_ref().unwrap().load().unwrap();
+        assert!(saved.sequence.is_none());
+        assert!(pending.is_empty());
+        let db = bot.ingress.as_ref().unwrap().db.lock().unwrap();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM gateway_state", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        drop(db);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn dm_fence_actor_shape_and_direct_modal_no_effects() {
+        use axum::{Router, extract::State, routing::post};
+        let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/interactions/{id}/{token}/callback",
+                post(
+                    |State(n): State<Arc<std::sync::atomic::AtomicUsize>>| async move {
+                        n.fetch_add(1, Ordering::SeqCst);
+                        axum::http::StatusCode::NO_CONTENT
+                    },
+                ),
+            )
+            .with_state(callbacks.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut bot = fenced_bot().with_state_dir(dir.path()).unwrap();
+        bot.api = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let bot = Arc::new(bot);
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut tasks = JoinSet::new();
+        let shutdown = CancellationToken::new();
+        let mut session = Session::default();
+        let mut message = dm_message();
+        message.as_object_mut().unwrap().remove("author");
+        message["user"] = json!({"id":"42"});
+        assert!(bot.prompt(&message).is_none());
+        bot.handle_dispatch(
+            &json!({"op":0,"t":"MESSAGE_CREATE","s":100,"d":message}),
+            &mut session,
+            &tx,
+            &shutdown,
+            &mut tasks,
+        )
+        .unwrap();
+        let mut interaction = dm_interaction(2);
+        interaction.as_object_mut().unwrap().remove("user");
+        interaction["author"] = json!({"id":"42"});
+        bot.handle_dispatch(
+            &json!({"op":0,"t":"INTERACTION_CREATE","s":101,"d":interaction}),
+            &mut session,
+            &tx,
+            &shutdown,
+            &mut tasks,
+        )
+        .unwrap();
+        bot.interaction(interaction, tx.clone()).await;
+        assert!(tasks.is_empty());
+        assert!(session.sequence.is_none());
+        {
+            let db = bot.ingress.as_ref().unwrap().db.lock().unwrap();
+            assert_eq!(
+                db.query_row("SELECT count(*) FROM gateway_state", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        // A well-routed modal is unsupported, even through direct invocation.
+        let modal = dm_interaction(5);
+        bot.dispatch_interaction(&modal, &tx, &shutdown, &mut tasks);
+        bot.interaction(modal, tx.clone()).await;
+        assert!(tasks.is_empty());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn dm_fence_supplied_nested_channel_shape_no_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let bot = Arc::new(fenced_bot().with_state_dir(dir.path()).unwrap());
+        let (tx, mut rx) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        let mut session = Session::default();
+        for (kind, base) in [
+            ("MESSAGE_CREATE", dm_message()),
+            ("INTERACTION_CREATE", dm_interaction(2)),
+        ] {
+            for channel in [
+                json!({}),
+                json!({"id":"10"}),
+                json!({"type":1}),
+                json!({"id":10,"type":1}),
+                json!({"id":"+10","type":1}),
+                json!({"id":"010","type":1}),
+                json!({"id":"10","type":"1"}),
+                json!({"id":"10","type":null}),
+                json!({"id":null,"type":1}),
+            ] {
+                let mut data = base.clone();
+                data["channel"] = channel;
+                assert!(!bot.admits_route(&data, kind == "INTERACTION_CREATE"));
+                let event = json!({"op":0,"s":99,"t":kind,"d":data});
+                bot.handle_dispatch(&event, &mut session, &tx, &shutdown, &mut tasks)
+                    .unwrap();
+                if kind == "MESSAGE_CREATE" {
+                    assert!(bot.prompt(&data).is_none());
+                } else {
+                    bot.dispatch_interaction(&data, &tx, &shutdown, &mut tasks);
+                    // No loopback server needed: a rejected direct route returns
+                    // before building any network callback. Timeout detects leaks.
+                    tokio::time::timeout(
+                        Duration::from_millis(100),
+                        bot.interaction(data, tx.clone()),
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            let mut absent = base.clone();
+            absent.as_object_mut().unwrap().remove("channel");
+            assert!(bot.admits_route(&absent, kind == "INTERACTION_CREATE"));
+            let mut valid = base.clone();
+            valid["channel"] = json!({"id":"10","type":1});
+            assert!(bot.admits_route(&valid, kind == "INTERACTION_CREATE"));
+        }
+        assert!(tasks.is_empty());
+        assert!(rx.try_recv().is_err());
+        assert!(session.sequence.is_none());
+        let (saved, pending) = bot.ingress.as_ref().unwrap().load().unwrap();
+        assert!(saved.sequence.is_none());
+        assert!(pending.is_empty());
+        let db = bot.ingress.as_ref().unwrap().db.lock().unwrap();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM gateway_state", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn dm_fence_actual_gateway_dm_and_control_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let bot = Arc::new(fenced_bot().with_state_dir(dir.path()).unwrap());
+        let (tx, _rx) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        let mut session = Session::default();
+        let ready = json!({"op":0,"s":1,"t":"READY","d":{"session_id":"fresh","resume_gateway_url":"wss://example.invalid","user":{"id":"7"}}});
+        bot.handle_dispatch(&ready, &mut session, &tx, &shutdown, &mut tasks)
+            .unwrap();
+        assert_eq!(session.id.as_deref(), Some("fresh"));
+        let event = json!({"op":0,"s":2,"t":"MESSAGE_CREATE","d":dm_message()});
+        let prompt = bot
+            .handle_dispatch(&event, &mut session, &tx, &shutdown, &mut tasks)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            prompt,
+            Inbound::Prompt {
+                channel: 10,
+                user: 42,
+                ..
+            }
+        ));
+        let (saved, pending) = bot.ingress.as_ref().unwrap().load().unwrap();
+        assert_eq!(saved.sequence, Some(2));
+        assert_eq!(pending.len(), 1);
+        let resumed = json!({"op":0,"s":3,"t":"RESUMED","d":{}});
+        bot.handle_dispatch(&resumed, &mut session, &tx, &shutdown, &mut tasks)
+            .unwrap();
+        assert_eq!(session.sequence, Some(3));
+    }
+
+    #[tokio::test]
+    async fn dm_fence_actual_interaction_callbacks_and_dispatch() {
+        use axum::{Json, Router, extract::State, routing::post};
+        let callbacks = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let app = Router::new()
+            .route(
+                "/interactions/{id}/{token}/callback",
+                post(
+                    |State(n): State<Arc<tokio::sync::Mutex<Vec<Value>>>>,
+                     Json(body): Json<Value>| async move {
+                        n.lock().await.push(body);
+                        axum::http::StatusCode::NO_CONTENT
+                    },
+                ),
+            )
+            .with_state(callbacks.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut bot = fenced_bot();
+        bot.api = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let bot = Arc::new(bot);
+        let (tx, mut rx) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        let mut session = Session::default();
+        for kind in [2, 4] {
+            let event = json!({"op":0,"s":kind,"t":"INTERACTION_CREATE","d":dm_interaction(kind)});
+            bot.handle_dispatch(&event, &mut session, &tx, &shutdown, &mut tasks)
+                .unwrap();
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+        }
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Inbound::Command {
+                channel: 10,
+                user: 42,
+                ..
+            })
+        ));
+        assert!(rx.try_recv().is_err());
+        let component_id = "sk1:10:42:pick:-:0";
+        let mut component = dm_interaction(3);
+        component["data"] = json!({"custom_id":component_id});
+        bot.interaction(component, tx.clone()).await;
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Inbound::Component {
+                channel: 10,
+                user: 42,
+                ..
+            })
+        ));
+        let bodies = callbacks.lock().await;
+        assert_eq!(bodies.len(), 3);
+        assert_eq!(bodies[0]["type"], 5);
+        assert_eq!(bodies[1]["type"], 8);
+        assert_eq!(bodies[2]["type"], 6);
+        drop(bodies);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn dm_fence_startup_registration_and_recovered_ingress() {
+        use axum::{Json, Router, extract::State, routing::put};
+        let registrations = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let app = Router::new()
+            .route(
+                "/applications/1/commands",
+                put(
+                    |State(n): State<Arc<tokio::sync::Mutex<Vec<Value>>>>,
+                     Json(body): Json<Value>| async move {
+                        n.lock().await.push(body);
+                        axum::http::StatusCode::UNAUTHORIZED
+                    },
+                ),
+            )
+            .with_state(registrations.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut bot = fenced_bot().with_state_dir(dir.path()).unwrap();
+        bot.api = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for (id, channel, user) in [
+            ("good", 10, 42),
+            ("wrong-channel", 11, 42),
+            ("wrong-user", 10, 43),
+        ] {
+            bot.checkpoint(
+                &Session::default(),
+                Some(&Inbound::Prompt {
+                    id: id.into(),
+                    channel,
+                    user,
+                    text: "saved".into(),
+                    attachments: vec![],
+                }),
+            )
+            .unwrap();
+        }
+        let bot = Arc::new(bot);
+        let (tx, mut rx) = mpsc::channel(8);
+        assert!(bot.clone().run(tx, CancellationToken::new()).await.is_err());
+        assert!(matches!(rx.try_recv(),Ok(Inbound::Prompt{id,..}) if id=="good"));
+        assert!(rx.try_recv().is_err());
+        let (_, pending) = bot.ingress.as_ref().unwrap().load().unwrap();
+        assert_eq!(pending.len(), 1);
+        let calls = registrations.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], bot.registration_commands());
+        server.abort();
+    }
     #[test]
     fn attachment_only_prompt_preserves_authorization_and_gateway_replay() {
         let dir = tempfile::tempdir().unwrap();

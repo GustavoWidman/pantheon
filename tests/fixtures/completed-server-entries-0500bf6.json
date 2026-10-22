@@ -1,0 +1,1209 @@
+{
+  "upstream": "0500bf6a8ea4bf0ce047488562022b1b6532cc30",
+  "passing_cases": 19,
+  "scope": "actual Agent.loop/request/stream + Server.Chat buffering/flush; raw fake wire and inert in-memory Chat.push; reference expectations only, not native acceptance",
+  "cases": [
+    {
+      "name": "anthropic-server-object-order",
+      "raw_input": "{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}",
+      "raw_result": "{\"z\":1,\"a\":2}",
+      "wire": "data: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\" before \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"server\",\"name\":\"web_search\",\"input\":{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"server\",\"content\":{\"z\":1,\"a\":2}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\ndata: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"text\",\"text\":\" after \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+      "emitted": [
+        {
+          "$": "Delta",
+          "kind": "tool",
+          "text": "web_search ",
+          "fresh": true
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "{\"z\":1,\"a\":2}",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}"
+        },
+        {
+          "kind": "echo",
+          "text": "{\"z\":1,\"a\":2}"
+        },
+        {
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "requests": 1
+    },
+    {
+      "name": "anthropic-server-nested-order",
+      "raw_input": "{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}",
+      "raw_result": "{\"z\":{\"q\":1,\"a\":2},\"a\":[{\"q\":1,\"b\":2}]}",
+      "wire": "data: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\" before \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"server\",\"name\":\"web_search\",\"input\":{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"server\",\"content\":{\"z\":{\"q\":1,\"a\":2},\"a\":[{\"q\":1,\"b\":2}]}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\ndata: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"text\",\"text\":\" after \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+      "emitted": [
+        {
+          "$": "Delta",
+          "kind": "tool",
+          "text": "web_search ",
+          "fresh": true
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "{\"z\":{\"q\":1,\"a\":2},\"a\":[{\"q\":1,\"b\":2}]}",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}"
+        },
+        {
+          "kind": "echo",
+          "text": "{\"z\":{\"q\":1,\"a\":2},\"a\":[{\"q\":1,\"b\":2}]}"
+        },
+        {
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "requests": 1
+    },
+    {
+      "name": "anthropic-server-index-keys",
+      "raw_input": "{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}",
+      "raw_result": "{\"10\":\"ten\",\"2\":\"two\",\"01\":\"one\",\"a\":0}",
+      "wire": "data: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\" before \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"server\",\"name\":\"web_search\",\"input\":{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"server\",\"content\":{\"10\":\"ten\",\"2\":\"two\",\"01\":\"one\",\"a\":0}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\ndata: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"text\",\"text\":\" after \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+      "emitted": [
+        {
+          "$": "Delta",
+          "kind": "tool",
+          "text": "web_search ",
+          "fresh": true
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "{\"2\":\"two\",\"10\":\"ten\",\"01\":\"one\",\"a\":0}",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}"
+        },
+        {
+          "kind": "echo",
+          "text": "{\"2\":\"two\",\"10\":\"ten\",\"01\":\"one\",\"a\":0}"
+        },
+        {
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "requests": 1
+    },
+    {
+      "name": "anthropic-server-duplicate-keys",
+      "raw_input": "{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}",
+      "raw_result": "{\"z\":1,\"a\":2,\"z\":3}",
+      "wire": "data: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\" before \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"server\",\"name\":\"web_search\",\"input\":{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"server\",\"content\":{\"z\":1,\"a\":2,\"z\":3}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\ndata: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"text\",\"text\":\" after \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+      "emitted": [
+        {
+          "$": "Delta",
+          "kind": "tool",
+          "text": "web_search ",
+          "fresh": true
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "{\"z\":3,\"a\":2}",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}"
+        },
+        {
+          "kind": "echo",
+          "text": "{\"z\":3,\"a\":2}"
+        },
+        {
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "requests": 1
+    },
+    {
+      "name": "anthropic-server-lone-surrogate",
+      "raw_input": "{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}",
+      "raw_result": "{\"z\":\"\\ud800\",\"a\":2}",
+      "wire": "data: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\" before \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"server\",\"name\":\"web_search\",\"input\":{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"server\",\"content\":{\"z\":\"\\ud800\",\"a\":2}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\ndata: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"text\",\"text\":\" after \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+      "emitted": [
+        {
+          "$": "Delta",
+          "kind": "tool",
+          "text": "web_search ",
+          "fresh": true
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "{\"z\":\"\\ud800\",\"a\":2}",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}"
+        },
+        {
+          "kind": "echo",
+          "text": "{\"z\":\"\\ud800\",\"a\":2}"
+        },
+        {
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "requests": 1
+    },
+    {
+      "name": "anthropic-server-overflow",
+      "raw_input": "{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}",
+      "raw_result": "{\"z\":1e400,\"a\":-0}",
+      "wire": "data: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\" before \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"server\",\"name\":\"web_search\",\"input\":{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"server\",\"content\":{\"z\":1e400,\"a\":-0}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\ndata: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"text\",\"text\":\" after \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+      "emitted": [
+        {
+          "$": "Delta",
+          "kind": "tool",
+          "text": "web_search ",
+          "fresh": true
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "{\"z\":null,\"a\":0}",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}"
+        },
+        {
+          "kind": "echo",
+          "text": "{\"z\":null,\"a\":0}"
+        },
+        {
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "requests": 1
+    },
+    {
+      "name": "anthropic-server-stdout",
+      "raw_input": "{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}",
+      "raw_result": "{\"z\":1,\"stderr\":\" ERR \",\"stdout\":\" OUT \"}",
+      "wire": "data: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\" before \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"server\",\"name\":\"web_search\",\"input\":{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"server\",\"content\":{\"z\":1,\"stderr\":\" ERR \",\"stdout\":\" OUT \"}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\ndata: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"text\",\"text\":\" after \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+      "emitted": [
+        {
+          "$": "Delta",
+          "kind": "tool",
+          "text": "web_search ",
+          "fresh": true
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "OUT  ERR",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}"
+        },
+        {
+          "kind": "echo",
+          "text": "OUT  ERR"
+        },
+        {
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "requests": 1
+    },
+    {
+      "name": "anthropic-server-encrypted",
+      "raw_input": "{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}",
+      "raw_result": "{\"z\":1,\"stderr\":\" ERR \",\"type\":\"encrypted_code_execution_result\"}",
+      "wire": "data: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\" before \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"server\",\"name\":\"web_search\",\"input\":{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"server\",\"content\":{\"z\":1,\"stderr\":\" ERR \",\"type\":\"encrypted_code_execution_result\"}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\ndata: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"text\",\"text\":\" after \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+      "emitted": [
+        {
+          "$": "Delta",
+          "kind": "tool",
+          "text": "web_search ",
+          "fresh": true
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "(output encrypted by the API)\n ERR",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}"
+        },
+        {
+          "kind": "echo",
+          "text": "(output encrypted by the API)\n ERR"
+        },
+        {
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "requests": 1
+    },
+    {
+      "name": "anthropic-server-array",
+      "raw_input": "{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}",
+      "raw_result": "[{\"url\":\"https://invalid.test/a\",\"title\":\"one\"},{\"title\":\"two\",\"url\":\"https://invalid.test/b\"}]",
+      "wire": "data: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\" before \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"server\",\"name\":\"web_search\",\"input\":{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"server\",\"content\":[{\"url\":\"https://invalid.test/a\",\"title\":\"one\"},{\"title\":\"two\",\"url\":\"https://invalid.test/b\"}]}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\ndata: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"text\",\"text\":\" after \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+      "emitted": [
+        {
+          "$": "Delta",
+          "kind": "tool",
+          "text": "web_search ",
+          "fresh": true
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "one https://invalid.test/a\ntwo https://invalid.test/b",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}"
+        },
+        {
+          "kind": "echo",
+          "text": "one https://invalid.test/a\ntwo https://invalid.test/b"
+        },
+        {
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "requests": 1
+    },
+    {
+      "name": "anthropic-server-array-missing",
+      "raw_input": "{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}",
+      "raw_result": "[{\"z\":1},{\"title\":\"two\"}]",
+      "wire": "data: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\" before \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"server\",\"name\":\"web_search\",\"input\":{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"server\",\"content\":[{\"z\":1},{\"title\":\"two\"}]}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\ndata: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"text\",\"text\":\" after \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+      "emitted": [
+        {
+          "$": "Delta",
+          "kind": "tool",
+          "text": "web_search ",
+          "fresh": true
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "undefined undefined\ntwo undefined",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}"
+        },
+        {
+          "kind": "echo",
+          "text": "undefined undefined\ntwo undefined"
+        },
+        {
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "requests": 1
+    },
+    {
+      "name": "anthropic-server-null",
+      "raw_input": "{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}",
+      "raw_result": "null",
+      "wire": "data: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\" before \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"server\",\"name\":\"web_search\",\"input\":{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"server\",\"content\":null}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\ndata: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"text\",\"text\":\" after \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+      "emitted": [
+        {
+          "$": "Delta",
+          "kind": "tool",
+          "text": "web_search ",
+          "fresh": true
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "null",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}"
+        },
+        {
+          "kind": "echo",
+          "text": "null"
+        },
+        {
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "requests": 1
+    },
+    {
+      "name": "anthropic-server-empty-array",
+      "raw_input": "{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}",
+      "raw_result": "[]",
+      "wire": "data: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\" before \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"server\",\"name\":\"web_search\",\"input\":{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"server\",\"content\":[]}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\ndata: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"text\",\"text\":\" after \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+      "emitted": [
+        {
+          "$": "Delta",
+          "kind": "tool",
+          "text": "web_search ",
+          "fresh": true
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "(no output)",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}"
+        },
+        {
+          "kind": "echo",
+          "text": "(no output)"
+        },
+        {
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "requests": 1
+    },
+    {
+      "name": "openai-action-insertion",
+      "raw_action": "{\"z\":1,\"a\":2}",
+      "wire": "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\" before \",\"annotations\":[{\"type\":\"url_citation\",\"title\":\"one\",\"url\":\"https://invalid.test/a\"},{\"type\":\"url_citation\",\"title\":\"one\",\"url\":\"https://invalid.test/a\"}]}]},{\"type\":\"web_search_call\",\"id\":\"server\",\"action\":{\"z\":1,\"a\":2}},{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\" after \"}]}],\"usage\":{}}}\n\n",
+      "emitted": [
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "sources:\none https://invalid.test/a"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "web_search {\"z\":1,\"a\":2}"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "kind": "echo",
+          "text": "sources:\none https://invalid.test/a"
+        },
+        {
+          "kind": "tool",
+          "text": "web_search {\"z\":1,\"a\":2}"
+        },
+        {
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "requests": 1
+    },
+    {
+      "name": "openai-action-nested",
+      "raw_action": "{\"z\":{\"q\":1,\"a\":2},\"a\":[{\"y\":1,\"b\":2}]}",
+      "wire": "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\" before \",\"annotations\":[{\"type\":\"url_citation\",\"title\":\"one\",\"url\":\"https://invalid.test/a\"},{\"type\":\"url_citation\",\"title\":\"one\",\"url\":\"https://invalid.test/a\"}]}]},{\"type\":\"web_search_call\",\"id\":\"server\",\"action\":{\"z\":{\"q\":1,\"a\":2},\"a\":[{\"y\":1,\"b\":2}]}},{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\" after \"}]}],\"usage\":{}}}\n\n",
+      "emitted": [
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "sources:\none https://invalid.test/a"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "web_search {\"z\":{\"q\":1,\"a\":2},\"a\":[{\"y\":1,\"b\":2}]}"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "kind": "echo",
+          "text": "sources:\none https://invalid.test/a"
+        },
+        {
+          "kind": "tool",
+          "text": "web_search {\"z\":{\"q\":1,\"a\":2},\"a\":[{\"y\":1,\"b\":2}]}"
+        },
+        {
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "requests": 1
+    },
+    {
+      "name": "openai-action-indices",
+      "raw_action": "{\"10\":1,\"2\":2,\"01\":3}",
+      "wire": "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\" before \",\"annotations\":[{\"type\":\"url_citation\",\"title\":\"one\",\"url\":\"https://invalid.test/a\"},{\"type\":\"url_citation\",\"title\":\"one\",\"url\":\"https://invalid.test/a\"}]}]},{\"type\":\"web_search_call\",\"id\":\"server\",\"action\":{\"10\":1,\"2\":2,\"01\":3}},{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\" after \"}]}],\"usage\":{}}}\n\n",
+      "emitted": [
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "sources:\none https://invalid.test/a"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "web_search {\"2\":2,\"10\":1,\"01\":3}"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "kind": "echo",
+          "text": "sources:\none https://invalid.test/a"
+        },
+        {
+          "kind": "tool",
+          "text": "web_search {\"2\":2,\"10\":1,\"01\":3}"
+        },
+        {
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "requests": 1
+    },
+    {
+      "name": "openai-action-duplicate",
+      "raw_action": "{\"z\":1,\"a\":2,\"z\":3}",
+      "wire": "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\" before \",\"annotations\":[{\"type\":\"url_citation\",\"title\":\"one\",\"url\":\"https://invalid.test/a\"},{\"type\":\"url_citation\",\"title\":\"one\",\"url\":\"https://invalid.test/a\"}]}]},{\"type\":\"web_search_call\",\"id\":\"server\",\"action\":{\"z\":1,\"a\":2,\"z\":3}},{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\" after \"}]}],\"usage\":{}}}\n\n",
+      "emitted": [
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "sources:\none https://invalid.test/a"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "web_search {\"z\":3,\"a\":2}"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "kind": "echo",
+          "text": "sources:\none https://invalid.test/a"
+        },
+        {
+          "kind": "tool",
+          "text": "web_search {\"z\":3,\"a\":2}"
+        },
+        {
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "requests": 1
+    },
+    {
+      "name": "openai-action-surrogate",
+      "raw_action": "{\"z\":\"\\ud800\",\"a\":1}",
+      "wire": "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\" before \",\"annotations\":[{\"type\":\"url_citation\",\"title\":\"one\",\"url\":\"https://invalid.test/a\"},{\"type\":\"url_citation\",\"title\":\"one\",\"url\":\"https://invalid.test/a\"}]}]},{\"type\":\"web_search_call\",\"id\":\"server\",\"action\":{\"z\":\"\\ud800\",\"a\":1}},{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\" after \"}]}],\"usage\":{}}}\n\n",
+      "emitted": [
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "sources:\none https://invalid.test/a"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "web_search {\"z\":\"\\ud800\",\"a\":1}"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "kind": "echo",
+          "text": "sources:\none https://invalid.test/a"
+        },
+        {
+          "kind": "tool",
+          "text": "web_search {\"z\":\"\\ud800\",\"a\":1}"
+        },
+        {
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "requests": 1
+    },
+    {
+      "name": "openai-action-overflow",
+      "raw_action": "{\"z\":1e400,\"a\":-0}",
+      "wire": "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\" before \",\"annotations\":[{\"type\":\"url_citation\",\"title\":\"one\",\"url\":\"https://invalid.test/a\"},{\"type\":\"url_citation\",\"title\":\"one\",\"url\":\"https://invalid.test/a\"}]}]},{\"type\":\"web_search_call\",\"id\":\"server\",\"action\":{\"z\":1e400,\"a\":-0}},{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\" after \"}]}],\"usage\":{}}}\n\n",
+      "emitted": [
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "sources:\none https://invalid.test/a"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "web_search {\"z\":null,\"a\":0}"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "kind": "echo",
+          "text": "sources:\none https://invalid.test/a"
+        },
+        {
+          "kind": "tool",
+          "text": "web_search {\"z\":null,\"a\":0}"
+        },
+        {
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "requests": 1
+    },
+    {
+      "name": "openai-action-null",
+      "raw_action": "null",
+      "wire": "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\" before \",\"annotations\":[{\"type\":\"url_citation\",\"title\":\"one\",\"url\":\"https://invalid.test/a\"},{\"type\":\"url_citation\",\"title\":\"one\",\"url\":\"https://invalid.test/a\"}]}]},{\"type\":\"web_search_call\",\"id\":\"server\",\"action\":null},{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\" after \"}]}],\"usage\":{}}}\n\n",
+      "emitted": [
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "sources:\none https://invalid.test/a"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "web_search {}"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "kind": "echo",
+          "text": "sources:\none https://invalid.test/a"
+        },
+        {
+          "kind": "tool",
+          "text": "web_search {}"
+        },
+        {
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "requests": 1
+    },
+    {
+      "name": "anthropic-server-stderr-undefined",
+      "raw_input": "{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}",
+      "raw_result": "{\"stdout\":\"OUT\",\"stderr\":\"undefined\"}",
+      "wire": "data: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\" before \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"server\",\"name\":\"web_search\",\"input\":{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"server\",\"content\":{\"stdout\":\"OUT\",\"stderr\":\"undefined\"}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\ndata: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"text\",\"text\":\" after \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+      "emitted": [
+        {
+          "$": "Delta",
+          "kind": "tool",
+          "text": "web_search ",
+          "fresh": true
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "OUTundefined",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}"
+        },
+        {
+          "kind": "echo",
+          "text": "OUTundefined"
+        },
+        {
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "requests": 1
+    },
+    {
+      "name": "anthropic-server-stdout-nel",
+      "raw_input": "{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}",
+      "raw_result": "{\"stdout\":\"\\u0085\"}",
+      "wire": "data: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\" before \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"server\",\"name\":\"web_search\",\"input\":{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"server\",\"content\":{\"stdout\":\"\\u0085\"}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\ndata: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"text\",\"text\":\" after \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+      "emitted": [
+        {
+          "$": "Delta",
+          "kind": "tool",
+          "text": "web_search ",
+          "fresh": true
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}"
+        },
+        {
+          "kind": "echo",
+          "text": ""
+        },
+        {
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "requests": 1
+    },
+    {
+      "name": "anthropic-server-stdout-bom",
+      "raw_input": "{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}",
+      "raw_result": "{\"stdout\":\"\\ufeff\"}",
+      "wire": "data: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\" before \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"server\",\"name\":\"web_search\",\"input\":{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"server\",\"content\":{\"stdout\":\"\\ufeff\"}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\ndata: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"text\",\"text\":\" after \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+      "emitted": [
+        {
+          "$": "Delta",
+          "kind": "tool",
+          "text": "web_search ",
+          "fresh": true
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "(no output)",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}"
+        },
+        {
+          "kind": "echo",
+          "text": "(no output)"
+        },
+        {
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "requests": 1
+    },
+    {
+      "name": "anthropic-server-encrypted-undefined",
+      "raw_input": "{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}",
+      "raw_result": "{\"type\":\"encrypted_code_execution_result\",\"stderr\":\"undefined\"}",
+      "wire": "data: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\" before \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"server\",\"name\":\"web_search\",\"input\":{\"z\":1,\"2\":\"two\",\"a\":{\"q\":2,\"b\":3},\"z\":4}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"server\",\"content\":{\"type\":\"encrypted_code_execution_result\",\"stderr\":\"undefined\"}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\ndata: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"text\",\"text\":\" after \"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+      "emitted": [
+        {
+          "$": "Delta",
+          "kind": "tool",
+          "text": "web_search ",
+          "fresh": true
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "$": "Entry",
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "echo",
+          "text": "(output encrypted by the API)\nundefined",
+          "of": "server"
+        },
+        {
+          "$": "Entry",
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "stored": [
+        {
+          "kind": "unii",
+          "text": "before"
+        },
+        {
+          "kind": "tool",
+          "text": "web_search {\"2\":\"two\",\"z\":4,\"a\":{\"q\":2,\"b\":3}}"
+        },
+        {
+          "kind": "echo",
+          "text": "(output encrypted by the API)\nundefined"
+        },
+        {
+          "kind": "unii",
+          "text": "after"
+        }
+      ],
+      "requests": 1
+    }
+  ]
+}

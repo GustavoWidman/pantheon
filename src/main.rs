@@ -39,17 +39,13 @@ enum Action {
         #[arg(long)]
         device_auth: bool,
     },
-    /// Export one channel's complete memory tree as HTML (stop the service first).
+    /// Export the global memory tree as HTML (stop the service first).
     Export {
-        #[arg(long)]
-        channel: u64,
         #[arg(long)]
         output: PathBuf,
     },
-    /// Import UTF-8 history as a durable note (stop the service first).
+    /// Append a UTF-8 file as a global durable note, not a history conversion (stop the service first).
     Import {
-        #[arg(long)]
-        channel: u64,
         #[arg(long)]
         file: PathBuf,
     },
@@ -101,19 +97,13 @@ async fn main() -> Result<()> {
     // Read-only native admission precedes lock creation; revalidated under lock.
     let lock = pantheon::state_namespace::acquire(&config.state_dir)?;
     match cli.command.unwrap_or(Action::Run) {
-        Action::Export { channel, output } => {
-            let m = Memory::open(
-                config.state_dir.join("chats").join(channel.to_string()),
-                config.agent.view_bytes,
-            )?;
+        Action::Export { output } => {
+            let m = Memory::open(config.state_dir.join("memory"), config.agent.view_bytes)?;
             std::fs::write(&output, m.export_html())?;
             println!("Exported memory to {}", output.display());
         }
-        Action::Import { channel, file } => {
-            let mut m = Memory::open(
-                config.state_dir.join("chats").join(channel.to_string()),
-                config.agent.view_bytes,
-            )?;
+        Action::Import { file } => {
+            let mut m = Memory::open(config.state_dir.join("memory"), config.agent.view_bytes)?;
             let index = m.append(Kind::Note, &std::fs::read_to_string(file)?)?;
             println!("Imported note {index}");
         }
@@ -127,6 +117,7 @@ async fn main() -> Result<()> {
                     config.discord.application_id,
                     config.discord.allowed_users.clone(),
                 )?
+                .with_dm_channel(config.discord.dm_channel_id)?
                 .with_state_dir(&config.state_dir)?,
             );
             let shutdown = CancellationToken::new();

@@ -756,6 +756,43 @@ impl Memory {
         }
         Ok(out)
     }
+    /// Earliest page of the fresh raw suffix, following Memory.whole. Payload
+    /// includes author/image labels, with the final page always admitted.
+    pub fn whole(&self, from: u64) -> Result<u64> {
+        ensure!(from <= self.count, "invalid native suffix start");
+        let (mut at, mut size, mut pics) = (self.count, 0usize, 0usize);
+        while at > from {
+            let msg = self.message(at - 1)?;
+            size = size.saturating_add(msg.size);
+            pics = pics.saturating_add(msg.images.len());
+            if at < self.count && (size > VIEW_BYTES || pics > 20) {
+                return Ok(at);
+            }
+            at -= 1;
+        }
+        Ok(at)
+    }
+    pub fn source_span(&self, source: &str) -> Result<(u64, u64)> {
+        let start = self
+            .lookup_source(source)
+            .context("missing native source")?;
+        let mut end = start;
+        loop {
+            let page = self.message(end)?;
+            end += 1;
+            if !page.more {
+                return Ok((start, end));
+            }
+        }
+    }
+    pub fn settled_before(&self, end: u64) -> Result<bool> {
+        ensure!(end <= self.count, "invalid native settle frontier");
+        Ok(self.first_unbuilt() >= end)
+    }
+    pub fn render_before(&self, end: u64) -> Result<String> {
+        ensure!(end <= self.count, "invalid native render frontier");
+        Ok(render_parts(&self.view.parts, &self.nodes, end))
+    }
     pub fn render(&self) -> String {
         render_parts(&self.view.parts, &self.nodes, self.count)
     }
@@ -1013,7 +1050,7 @@ impl Memory {
         serde_json::json!({"format":"uniichat-0500bf6-v1","messages":self.count,"open_pages":self.open,"summaries":self.serial,
             "resident_nodes":self.nodes.len(),"view_lines":self.view.parts.len(),"view_bytes":part_bytes(&self.view.parts,&self.nodes),
             "view_budget_bytes":self.budget,"compactor_view_bytes":part_bytes(&self.seen.parts,&self.nodes),
-            "compactor_frontier":self.first_unbuilt(),"settled":self.is_settled(),"ready_jobs":self.ready.len(),"journal_healthy":!self.poisoned})
+            "compactor_budget_bytes":COMPACTOR_BYTES,"compactor_frontier":self.first_unbuilt(),"settled":self.is_settled(),"ready_jobs":self.ready.len(),"journal_healthy":!self.poisoned})
     }
     pub fn export_html(&self) -> String {
         // An operator export deliberately materializes its output, not live RAM.

@@ -157,20 +157,21 @@ fn provider_switch_and_visual_inputs_require_compatible_fresh_history() {
             "glm-5.3",
             "low",
             "sys",
-            &[json!({"type":"reasoning","encrypted_content":"opaque"})],
+            &[json!({"type":"reasoning","encrypted_content":"opaque"}).into()],
             &[]
         )
         .is_err()
     );
     let mut user = super::super::Provider::user("zai", "image");
-    user["content"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!({"type":"image_url","image_url":{"url":"data:image/png;base64,eA=="}}));
+    super::super::Provider::attach_user_parts(
+        &mut user,
+        vec![json!({"type":"image_url","image_url":{"url":"data:image/png;base64,eA=="}})],
+    )
+    .unwrap();
     assert!(request_body("glm-5.3", "low", "sys", &[user.clone()], &[]).is_err());
     assert!(request_body("glm-5.3-flash", "low", "sys", &[user], &[]).is_ok());
     let bad = json!({"role":"tool","tool_call_id":"ghost","content":"ok"});
-    assert!(request_body("glm-5.3", "low", "sys", &[bad], &[]).is_err());
+    assert!(request_body("glm-5.3", "low", "sys", &[bad.into()], &[]).is_err());
 }
 #[test]
 fn invalid_nonstream_call_batches_and_mcp_media_are_safe() {

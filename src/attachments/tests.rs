@@ -170,7 +170,11 @@ async fn native_parts_keep_prefix_stable_and_share_provider_allowances() {
     history.push(user);
     assert_eq!(history[..prefix.len()], prefix);
     assert_eq!(
-        remaining_budget("openai/gpt-6-luna", &history).files,
+        remaining_budget(
+            "openai/gpt-6-luna",
+            &crate::provider::projected_history(&history)
+        )
+        .files,
         50_000_000 - 9
     );
     let mut budget = remaining_budget("codex/gpt-6-luna", &[]);

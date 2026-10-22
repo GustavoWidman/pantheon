@@ -5,20 +5,46 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::time::Duration;
 
+#[path = "provider_anthropic_stream.rs"]
+mod anthropic_stream;
 #[path = "provider_cache.rs"]
 mod cache_coordination;
 #[path = "provider_codex.rs"]
 pub(crate) mod codex;
+#[path = "provider_compaction.rs"]
+mod compaction;
+#[path = "provider_completed_entries.rs"]
+mod completed_entries;
+#[path = "provider_entry_json.rs"]
+pub(crate) mod entry_json;
+#[path = "provider_tool_input.rs"]
+mod tool_input;
+pub use tool_input::ToolInput;
+#[path = "provider_native_value.rs"]
+mod native_value;
+pub use native_value::NativeValue;
+#[path = "provider_call_id.rs"]
+mod call_id;
+pub use call_id::CallId;
+pub(crate) use native_value::projected as projected_history;
+#[path = "provider_native_trace.rs"]
+mod native_trace;
+#[path = "provider_native_transport.rs"]
+mod native_transport;
 #[path = "provider_retry.rs"]
 pub(crate) mod retry;
 #[path = "provider_zai.rs"]
 pub mod zai;
+pub(crate) use compaction::{CompactionReply, patient as patient_compaction};
 pub(crate) use retry::validate as validate_request_retries;
 use retry::{HttpFailure, RequestRetries, StreamFailure};
 
 #[derive(Clone)]
 pub struct Provider {
     http: reqwest::Client,
+    native_http: reqwest::Client,
+    native_transport: bool,
+    native_trace: Option<std::sync::Arc<std::sync::Mutex<native_trace::Trace>>>,
     timeout_seconds: Option<u64>,
     codex: CodexAuth,
     catalog: std::sync::Arc<crate::models::Catalog>,
@@ -30,20 +56,86 @@ pub struct Provider {
     zai_slots: Option<std::sync::Arc<tokio::sync::Semaphore>>,
     #[cfg(test)]
     endpoint: Option<String>,
+    #[cfg(test)]
+    native_cache_probe: Option<NativeCacheProbe>,
+}
+#[cfg(test)]
+pub(crate) type NativeCacheProbe = std::sync::Arc<std::sync::Mutex<Vec<NativeCacheObservation>>>;
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct NativeCacheObservation {
+    pub model: String,
+    pub identity: uuid::Uuid,
+    pub body: Value,
+    pub keys: Vec<[u8; 32]>,
 }
 #[derive(Clone, Debug)]
 pub struct ToolCall {
-    pub id: String,
+    pub id: CallId,
     pub name: String,
-    pub arguments: Value,
+    pub arguments: ToolInput,
 }
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Response {
-    pub native: Vec<Value>,
+    pub native: Vec<NativeValue>,
     pub texts: Vec<(String, bool)>,
     pub calls: Vec<ToolCall>,
     pub usage: Value,
 }
+impl Response {
+    pub(crate) fn tool_entry(&self, call: &ToolCall, native: bool) -> String {
+        let position = self
+            .calls
+            .iter()
+            .position(|candidate| std::ptr::eq(candidate, call));
+        let block = position.and_then(|at| {
+            self.native
+                .iter()
+                .filter(|item| matches!(item["type"].as_str(), Some("function_call" | "tool_use")))
+                .nth(at)
+        });
+        if native && let Some(block) = block {
+            if block["type"] == "function_call" {
+                return format!(
+                    "{} {}",
+                    call.name,
+                    String::from_utf16_lossy(block.units("arguments"))
+                );
+            }
+            let input = block
+                .source
+                .get("input")
+                .map(entry_json::Json::stringify)
+                .unwrap_or_else(|| "undefined".into());
+            return format!("{} {input}", call.name);
+        }
+        format!("{} {}", call.name, call.arguments)
+    }
+}
+/// Inert completed-step observations. No tool here is executable; executable
+/// calls are returned only by a successful final Response.
+#[derive(Debug)]
+pub(crate) struct Observation {
+    pub response: Response,
+    pub intermediate: bool,
+    /// Complete wire-order observations, never executable Uses.
+    pub completed: Option<Vec<CompletedEntry>>,
+    pub entries: Option<Vec<(ObservationKind, String)>>,
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ObservationKind {
+    Reply,
+    Thought,
+    Tool,
+    Echo,
+}
+#[derive(Clone, Debug)]
+pub(crate) struct CompletedEntry {
+    pub kind: ObservationKind,
+    pub text: String,
+    pub of: Option<CallId>,
+}
+
 pub fn model_parts(model: &str) -> Result<(&str, &str)> {
     let (vendor, id) = model
         .split_once('/')
@@ -80,8 +172,14 @@ impl Provider {
         // the overall request timeout and runtime cancellation still bound work.
         #[cfg(target_os = "linux")]
         let http = http.tcp_user_timeout(timeout);
+        let native_http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+        #[cfg(target_os = "linux")]
+        let native_http = native_http.tcp_user_timeout(None);
         Ok(Self {
             http: http.build()?,
+            native_http: native_http.build()?,
+            native_transport: true,
+            native_trace: None,
             timeout_seconds: Some(timeout_seconds),
             codex: CodexAuth::new(AuthConfig::default()),
             catalog: std::sync::Arc::default(),
@@ -93,12 +191,17 @@ impl Provider {
             zai_slots: None,
             #[cfg(test)]
             endpoint: None,
+            #[cfg(test)]
+            native_cache_probe: None,
         })
     }
     #[cfg(test)]
     pub fn mock(endpoint: String) -> Self {
         Self {
             http: reqwest::Client::new(),
+            native_http: reqwest::Client::new(),
+            native_transport: false,
+            native_trace: None,
             timeout_seconds: None,
             codex: CodexAuth::new(AuthConfig::default()),
             catalog: std::sync::Arc::default(),
@@ -116,7 +219,28 @@ impl Provider {
             },
             zai_slots: None,
             endpoint: Some(endpoint),
+            native_cache_probe: None,
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn with_native_cache_probe(mut self, probe: NativeCacheProbe) -> Self {
+        self.native_cache_probe = Some(probe);
+        self
+    }
+    #[cfg(test)]
+    pub(crate) fn with_native_transport_for_test(mut self) -> Self {
+        self.native_transport = true;
+        self
+    }
+    #[cfg(test)]
+    pub(crate) fn with_native_trace_probe(
+        mut self,
+        probe: std::sync::Arc<tokio::sync::Notify>,
+    ) -> Self {
+        let mut trace = native_trace::Trace::default();
+        trace.probe = Some(probe);
+        self.native_trace = Some(std::sync::Arc::new(std::sync::Mutex::new(trace)));
+        self
     }
     /// Explicit opt-in; clones share one admission limit across workers and main.
     pub fn with_zai(mut self, config: zai::Config) -> Result<Self> {
@@ -403,10 +527,17 @@ impl Provider {
         }
         bail!("Provider model catalog exceeded pagination limit")
     }
-    pub fn start(vendor: &str, view: &str, text: &str) -> Vec<Value> {
+    pub fn start(vendor: &str, view: &str, text: &str) -> Vec<NativeValue> {
+        Self::start_marked(vendor, view, text, true)
+    }
+    pub(crate) fn start_compaction(vendor: &str, view: &str, text: &str) -> Vec<NativeValue> {
+        Self::start_marked(vendor, view, text, false)
+    }
+    fn start_marked(vendor: &str, view: &str, text: &str, mark: bool) -> Vec<NativeValue> {
         if vendor == "zai" {
             return vec![
-                json!({"role":"user","content":[{"type":"text","text":format!("{view}\n{text}")}]}),
+                json!({"role":"user","content":[{"type":"text","text":format!("{view}\n{text}")}]})
+                    .into(),
             ];
         }
         let pieces = cache_chunks(view);
@@ -429,39 +560,63 @@ impl Provider {
                 }
             })
             .collect();
-        blocks.push(if vendor == "openai" {
+        let mut task = if vendor == "openai" {
             json!({"type":"input_text","text":text})
         } else {
             json!({"type":"text","text":text})
-        });
-        vec![json!({"role":"user","content":blocks})]
+        };
+        if mark {
+            if vendor == "openai" {
+                task["prompt_cache_breakpoint"] = json!({"mode":"explicit"});
+            } else {
+                task["cache_control"] = json!({"type":"ephemeral"});
+            }
+        }
+        blocks.push(task);
+        vec![json!({"role":"user","content":blocks}).into()]
     }
-    pub fn user(vendor: &str, text: &str) -> Value {
-        json!({"role":"user","content":[{"type":if vendor=="openai" {"input_text"} else {"text"},"text":text}]})
+    pub fn user(vendor: &str, text: &str) -> NativeValue {
+        json!({"role":"user","content":[{"type":if vendor=="openai" {"input_text"} else {"text"},"text":text}]}).into()
     }
-    pub fn attach_user_parts(item: &mut Value, parts: Vec<Value>) -> Result<()> {
+    pub fn attach_user_parts(item: &mut NativeValue, parts: Vec<Value>) -> Result<()> {
         ensure!(
             item["role"] == "user",
             "attachments require a user content item"
         );
-        item["content"]
-            .as_array_mut()
-            .context("user content must be an array")?
-            .extend(parts);
+        ensure!(item["content"].is_array(), "user content must be an array");
+        item.edit_host(|v| v["content"].as_array_mut().unwrap().extend(parts));
         Ok(())
     }
-    pub fn result(vendor: &str, call: &ToolCall, result: &str, error: bool) -> Value {
-        if vendor == "zai" {
-            json!({"role":"tool","tool_call_id":call.id,"content":result})
+    pub fn result(vendor: &str, call: &ToolCall, result: &str, error: bool) -> NativeValue {
+        let mut value = NativeValue::from(if vendor == "zai" {
+            json!({"role":"tool","tool_call_id":null,"content":result})
         } else if vendor == "openai" {
-            json!({"type":"function_call_output","call_id":call.id,"output":result})
+            json!({"type":"function_call_output","call_id":null,"output":result})
         } else {
-            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":call.id,"content":result,"is_error":error}]})
+            json!({"role":"user","content":[]})
+        });
+        if vendor == "anthropic" {
+            let mut block = NativeValue::from(
+                json!({"type":"tool_result","tool_use_id":null,"content":result,"is_error":error}),
+            );
+            block.set("tool_use_id", call.id.native());
+            value.set("content", NativeValue::array([block]));
+        } else {
+            value.set(
+                if vendor == "zai" {
+                    "tool_call_id"
+                } else {
+                    "call_id"
+                },
+                call.id.native(),
+            );
         }
+        value
     }
+
     pub fn append_result(
         vendor: &str,
-        history: &mut Vec<Value>,
+        history: &mut Vec<NativeValue>,
         call: &ToolCall,
         result: &str,
         error: bool,
@@ -470,7 +625,7 @@ impl Provider {
     }
     pub fn append_result_with_image(
         vendor: &str,
-        history: &mut Vec<Value>,
+        history: &mut Vec<NativeValue>,
         call: &ToolCall,
         result: &str,
         error: bool,
@@ -479,15 +634,13 @@ impl Provider {
         let mut item = Self::result(vendor, call, result, error);
         if let Some(data) = image {
             if vendor == "zai" {
-                // Tool content is text-only in this protocol. Runtime routes capable
-                // screenshots as labeled user media after the complete result batch.
-                item["content"] = json!(format!(
-                    "{result}\nVisual content not attached: use read on the saved image with an explicitly vision-capable model. Text is not visual evidence."
-                ));
+                item.set("content",json!(format!("{result}\nVisual content not attached: use read on the saved image with an explicitly vision-capable model. Text is not visual evidence.")));
             } else if vendor == "openai" {
-                item["output"] = json!([{"type":"input_text","text":result},{"type":"input_image","image_url":format!("data:image/png;base64,{data}"),"detail":"auto"}]);
+                item.set("output",json!([{"type":"input_text","text":result},{"type":"input_image","image_url":format!("data:image/png;base64,{data}"),"detail":"auto"}]));
             } else {
-                item["content"][0]["content"] = json!([{"type":"text","text":result},{"type":"image","source":{"type":"base64","media_type":"image/png","data":data}}]);
+                let mut blocks = item.field("content").unwrap().elements();
+                blocks[0].set("content",json!([{"type":"text","text":result},{"type":"image","source":{"type":"base64","media_type":"image/png","data":data}}]));
+                item.set("content", NativeValue::array(blocks));
             }
         }
         if vendor == "anthropic"
@@ -497,31 +650,41 @@ impl Provider {
                 .as_array()
                 .is_some_and(|a| a.iter().all(|b| b["type"] == "tool_result"))
         {
-            last["content"]
-                .as_array_mut()
-                .unwrap()
-                .push(item["content"][0].clone());
+            let mut blocks = last.field("content").unwrap().elements();
+            blocks.extend(item.field("content").unwrap().elements());
+            last.set("content", NativeValue::array(blocks));
             return;
         }
         history.push(item);
     }
-    pub fn append_response(vendor: &str, history: &mut Vec<Value>, response: &Response) {
+
+    pub fn append_response(vendor: &str, history: &mut Vec<NativeValue>, response: &Response) {
         if vendor == "openai" || vendor == "zai" {
             history.extend(response.native.clone());
         } else {
-            history.push(json!({"role":"assistant","content":response.native}));
+            let mut item = NativeValue::from(json!({"role":"assistant"}));
+            item.set("content", NativeValue::array(response.native.clone()));
+            history.push(item);
         }
     }
     pub fn request_body(
         model: &str,
         reasoning: &str,
         system: &str,
-        history: &[Value],
+        history: &[NativeValue],
         tools: &[Value],
     ) -> Result<Value> {
+        let history = projected_history(history);
+        let history = history.as_slice();
         let (vendor, id) = model_parts(model)?;
         if vendor == "zai" {
-            return zai::request_body(id, reasoning, system, history, tools);
+            return zai::request_body(
+                id,
+                reasoning,
+                system,
+                &history.iter().cloned().map(Into::into).collect::<Vec<_>>(),
+                tools,
+            );
         }
         if model.starts_with("codex/") {
             return codex::Request::standard(id, reasoning, system, history, tools)?.value();
@@ -568,7 +731,7 @@ impl Provider {
         model: &str,
         reasoning: &str,
         system: &str,
-        history: &[Value],
+        history: &[NativeValue],
         tools: &[Value],
     ) -> Result<Response> {
         self.step_observed(model, reasoning, system, history, tools, None)
@@ -579,10 +742,229 @@ impl Provider {
         model: &str,
         reasoning: &str,
         system: &str,
-        history: &[Value],
+        history: &[NativeValue],
         tools: &[Value],
         submitted: Option<&(dyn Fn() -> Result<()> + Sync)>,
     ) -> Result<Response> {
+        self.step_observed_events(model, reasoning, system, history, tools, submitted, None)
+            .await
+    }
+    pub(crate) fn native_public(&self, model: &str) -> bool {
+        self.native_transport && (model.starts_with("openai/") || model.starts_with("anthropic/"))
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn step_observed_events(
+        &self,
+        model: &str,
+        reasoning: &str,
+        system: &str,
+        history: &[NativeValue],
+        tools: &[Value],
+        submitted: Option<&(dyn Fn() -> Result<()> + Sync)>,
+        observations: Option<tokio::sync::mpsc::UnboundedSender<Observation>>,
+    ) -> Result<Response> {
+        let mut active = self.clone();
+        let trace = std::sync::Arc::new(std::sync::Mutex::new(native_trace::Trace::default()));
+        if self.native_public(model) {
+            active.native_trace = Some(trace.clone());
+        }
+        #[cfg(test)]
+        let trace = self.native_trace.clone().unwrap_or(trace);
+        if self.native_public(model) {
+            active.native_trace = Some(trace.clone());
+        }
+        let mut guard = native_trace::Guard {
+            trace,
+            observations: observations.clone(),
+            finished: false,
+        };
+        let result = active
+            .step_observed_inner(
+                model,
+                reasoning,
+                system,
+                history,
+                tools,
+                submitted,
+                observations,
+            )
+            .await;
+        guard.finished = true;
+        if result.is_err() {
+            guard.emit("the AI service is busy or unavailable right now");
+        }
+        result
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn step_observed_inner(
+        &self,
+        model: &str,
+        reasoning: &str,
+        system: &str,
+        history: &[NativeValue],
+        tools: &[Value],
+        submitted: Option<&(dyn Fn() -> Result<()> + Sync)>,
+        observations: Option<tokio::sync::mpsc::UnboundedSender<Observation>>,
+    ) -> Result<Response> {
+        let native = self.native_public(model);
+        let mut history = history.to_vec();
+        let mut previous = Vec::new();
+        let mut usage = json!({});
+        let value = loop {
+            if let Some(trace) = &self.native_trace {
+                trace.lock().unwrap().clear();
+            }
+            let value = self
+                .step_value(model, reasoning, system, &history, tools, submitted, false)
+                .await?;
+            let mut current = if native {
+                Some(native_transport::ordinary_response(
+                    model_parts(model)?.0,
+                    &value,
+                )?)
+            } else {
+                None
+            };
+            let cut = if let Some(why) = native_trace::failure(model, &value)
+                && let Some(trace) = &self.native_trace
+            {
+                let trace = trace.lock().unwrap();
+                if let Some(current) = &mut current {
+                    current.texts = trace.cut(&why);
+                }
+                Some(trace.cut_entries(&why))
+            } else {
+                None
+            };
+            if let Some(current) = &current
+                && let Some(observations) = &observations
+            {
+                let mut response = current.clone();
+                response.calls.clear();
+                let success = if model.starts_with("anthropic/") {
+                    matches!(value["stop_reason"].as_str(), Some("end_turn" | "tool_use"))
+                } else {
+                    value["status"] == "completed" && !native_transport::refusal(&value)
+                };
+                observations
+                    .send(Observation {
+                        completed: cut.is_none().then(|| {
+                            completed_entries::read(
+                                model_parts(model).expect("validated model").0,
+                                &value,
+                                current,
+                            )
+                        }),
+                        response,
+                        intermediate: !success,
+                        entries: cut.clone(),
+                    })
+                    .map_err(|_| anyhow::anyhow!("native observation receiver closed"))?;
+            }
+            if let Some(trace) = &self.native_trace {
+                trace.lock().unwrap().clear();
+            }
+            if native && model.starts_with("anthropic/") && value["stop_reason"] == "pause_turn" {
+                let blocks = anthropic_stream::normalize_native(
+                    value
+                        .field("content")
+                        .context("missing pause content")?
+                        .elements(),
+                );
+                let mut item = NativeValue::from(json!({"role":"assistant"}));
+                item.set("content", NativeValue::array(blocks.clone()));
+                history.push(item);
+                previous.extend(blocks);
+                add_usage(&mut usage, &value["usage"]);
+                continue;
+            }
+            if native {
+                if model.starts_with("anthropic/") {
+                    ensure!(
+                        matches!(value["stop_reason"].as_str(), Some("end_turn" | "tool_use")),
+                        "ordinary model terminal failure; no tools executed"
+                    );
+                } else {
+                    ensure!(
+                        value["status"] == "completed",
+                        "ordinary model terminal failure; no tools executed"
+                    );
+                    ensure!(
+                        !value["output"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|item| item["content"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .any(|b| b["type"] == "refusal")),
+                        "ordinary model refused; no tools executed"
+                    );
+                }
+            }
+            break value;
+        };
+        if native {
+            let mut response = native_transport::ordinary_response(model_parts(model)?.0, &value)?;
+            add_usage(&mut usage, &response.usage);
+            previous.extend(response.native);
+            response.native = previous;
+            response.usage = usage;
+            return Ok(response);
+        }
+        if model.starts_with("codex/") {
+            codex::parse(value.projected())
+        } else {
+            Self::parse(model_parts(model)?.0, value)
+        }
+    }
+    /// Compactor-specific semantic boundary. General agent/tool turns continue
+    /// through their unchanged parser and never inherit source-fallback policy.
+    pub(crate) async fn step_compaction(
+        &self,
+        model: &str,
+        reasoning: &str,
+        system: &str,
+        history: &[NativeValue],
+    ) -> Result<CompactionReply> {
+        // A pause is not a completed answer and does not consume a length try.
+        // Match Agent.loop: carry every native block (including signatures),
+        // but derive the final answer from the final step only. Cancellation
+        // belongs to the caller; dropping this future drops the HTTP/cache guard.
+        let mut history = history.to_vec();
+        loop {
+            let value = match self
+                .step_value(model, reasoning, system, &history, &[], None, true)
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    // model_parts also maps Codex to Responses/OpenAI semantics.
+                    if model_parts(model)?.0 == "openai" && compaction::model_failure(&error) {
+                        return Ok(CompactionReply::ModelFailure);
+                    }
+                    return Err(error);
+                }
+            };
+            if model_parts(model)?.0 == "anthropic" && value["stop_reason"] == "pause_turn" {
+                compaction::continue_anthropic(&mut history, &value)?;
+                continue;
+            }
+            return compaction::parse(model, value);
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn step_value(
+        &self,
+        model: &str,
+        reasoning: &str,
+        system: &str,
+        history: &[NativeValue],
+        tools: &[Value],
+        submitted: Option<&(dyn Fn() -> Result<()> + Sync)>,
+        compactor: bool,
+    ) -> Result<NativeValue> {
         let (vendor, _) = model_parts(model)?;
         let effective = match self.catalog.advertised_effort(model, reasoning)? {
             Some(level) => level,
@@ -612,12 +994,16 @@ impl Provider {
         if vendor == "zai" {
             body["max_tokens"] = json!(self.zai.max_output_tokens);
         }
-        let value = self.send_body_observed(model, &body, submitted).await?;
-        if model.starts_with("codex/") {
-            codex::parse(value)
-        } else {
-            Self::parse(vendor, value)
+        if compactor {
+            compaction::request_profile(model, &mut body)?;
+        } else if self.native_transport
+            && (model.starts_with("openai/") || model.starts_with("anthropic/"))
+        {
+            compaction::ordinary_profile(model, &mut body)?;
         }
+        let owned = native_value::prepare_request(model, &body, history, compactor)?;
+        self.send_native_body_mode(model, &owned, submitted, self.native_public(model))
+            .await
     }
     fn codex_capabilities(&self, model: &str) -> codex::Capabilities {
         self.catalog
@@ -631,7 +1017,7 @@ impl Provider {
                     .unwrap_or_default()
             })
     }
-    async fn send_body(&self, model: &str, body: &Value) -> Result<Value> {
+    async fn send_body(&self, model: &str, body: &Value) -> Result<NativeValue> {
         self.send_body_observed(model, body, None).await
     }
     async fn send_body_observed(
@@ -639,7 +1025,27 @@ impl Provider {
         model: &str,
         body: &Value,
         submitted: Option<&(dyn Fn() -> Result<()> + Sync)>,
-    ) -> Result<Value> {
+    ) -> Result<NativeValue> {
+        self.send_body_mode(model, body, submitted, false).await
+    }
+    async fn send_body_mode(
+        &self,
+        model: &str,
+        body: &Value,
+        submitted: Option<&(dyn Fn() -> Result<()> + Sync)>,
+        native: bool,
+    ) -> Result<NativeValue> {
+        self.send_native_body_mode(model, &NativeValue::from(body.clone()), submitted, native)
+            .await
+    }
+    async fn send_native_body_mode(
+        &self,
+        model: &str,
+        owned: &NativeValue,
+        submitted: Option<&(dyn Fn() -> Result<()> + Sync)>,
+        native: bool,
+    ) -> Result<NativeValue> {
+        let body = &**owned;
         let (vendor, _) = model_parts(model)?;
         let is_codex = model.starts_with("codex/");
         if is_codex {
@@ -681,7 +1087,8 @@ impl Provider {
                         attempt,
                         true,
                         submitted,
-                        &body,
+                        &NativeValue::from(body.clone()),
+                        false,
                     )
                     .await;
                 match result {
@@ -748,16 +1155,28 @@ impl Provider {
         } else {
             "https://api.anthropic.com/v1/messages"
         };
-        let req = if vendor == "openai" || vendor == "zai" {
-            self.http.post(endpoint).bearer_auth(key)
+        let client = if native {
+            &self.native_http
         } else {
-            self.http
+            &self.http
+        };
+        let req = if vendor == "openai" || vendor == "zai" {
+            client.post(endpoint).bearer_auth(key)
+        } else {
+            client
                 .post(endpoint)
                 .header("x-api-key", key)
                 .header("anthropic-version", "2023-06-01")
         };
-        let request = req.json(body);
-        for attempt in 1..=self.retries.max_attempts {
+        let request = req
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(owned.canonical());
+        let attempts = if native {
+            native_transport::ATTEMPTS
+        } else {
+            self.retries.max_attempts
+        };
+        for attempt in 1..=attempts {
             let result = self
                 .receive_model_response(
                     request
@@ -765,15 +1184,26 @@ impl Provider {
                         .context("provider request cannot be replayed")?,
                     model,
                     attempt,
-                    vendor == "zai",
+                    vendor == "zai" || native,
                     submitted,
-                    body,
+                    owned,
+                    native,
                 )
                 .await;
             match result {
                 Ok(value) => return Ok(value),
                 Err(error) => {
-                    if !self.retry_request(model, &error, attempt).await {
+                    if native {
+                        if let Some(delay) = native_transport::delay(&error, attempt) {
+                            if let Some(trace) = &self.native_trace {
+                                trace.lock().unwrap().clear();
+                            }
+                            tracing::warn!(attempt, "native provider request retry scheduled");
+                            tokio::time::sleep(delay).await;
+                        } else {
+                            return Err(error);
+                        }
+                    } else if !self.retry_request(model, &error, attempt).await {
                         return Err(error);
                     }
                 }
@@ -799,6 +1229,7 @@ impl Provider {
         tokio::time::sleep(delay).await;
         true
     }
+    #[allow(clippy::too_many_arguments)]
     async fn receive_model_response(
         &self,
         request: reqwest::RequestBuilder,
@@ -806,32 +1237,62 @@ impl Provider {
         attempt: usize,
         streaming: bool,
         submitted: Option<&(dyn Fn() -> Result<()> + Sync)>,
-        body: &Value,
-    ) -> Result<Value> {
+        body: &NativeValue,
+        native: bool,
+    ) -> Result<NativeValue> {
         // Join only after credentials/admission are ready, immediately before
         // sending. All provider clones share the cache-writer coordinator.
         // Dropping this future drops its leader guard and releases any waiters.
-        let flight =
-            if let Some((keys, ttl)) = cache_coordination::keys(model, body, self.cache_affinity) {
-                self.cache_coordination.wait(&keys, ttl).await
-            } else {
-                None
-            };
-        let mut diagnostic = crate::transport::Exchange::new(model, attempt, self.timeout_seconds);
+        #[cfg(test)]
+        if native && let Some(probe) = &self.native_cache_probe {
+            let keys = cache_coordination::native_keys(model, body, self.cache_affinity)
+                .map(|(keys, _)| keys)
+                .unwrap_or_default();
+            probe.lock().unwrap().push(NativeCacheObservation {
+                model: model.to_owned(),
+                identity: self.cache_affinity,
+                body: body.projected(),
+                keys,
+            });
+        }
+        let flight = if let Some((keys, ttl)) =
+            cache_coordination::native_keys(model, body, self.cache_affinity)
+        {
+            self.cache_coordination.wait(&keys, ttl).await
+        } else {
+            None
+        };
+        let mut diagnostic = crate::transport::Exchange::new(
+            model,
+            attempt,
+            if native { None } else { self.timeout_seconds },
+        );
         diagnostic.request_shape(body);
         diagnostic.error_capture(self.error_capture.clone());
         let result = async {
+            let idle = native.then(|| native_transport::idle(model));
+            let deadline = idle.map(|idle| tokio::time::Instant::now() + idle);
             let pending = request.send();
             if let Some(submitted) = submitted {
-                submitted()?;
+                submitted().context(native_transport::LocalBoundary)?;
             }
-            let response = pending
-                .await
-                .map_err(reqwest::Error::without_url)
-                .context("provider transport failure")?;
+            let response = if let Some(deadline) = deadline {
+                tokio::time::timeout_at(deadline, pending)
+                    .await
+                    .context("native provider idle before headers")?
+            } else {
+                pending.await
+            }
+            .map_err(reqwest::Error::without_url)
+            .context("provider transport failure")?;
             diagnostic.headers(&response);
             // Do not expose provider error bodies: they can echo prompts or credentials.
             if !response.status().is_success() {
+                if native {
+                    return Err(
+                        native_transport::Http::new(response.status(), response.headers()).into(),
+                    );
+                }
                 return Err(HttpFailure {
                     status: response.status(),
                     provider: if model.starts_with("codex/") {
@@ -847,16 +1308,27 @@ impl Provider {
                 }
                 .into());
             }
-            if model.starts_with("zai/") {
-                zai::read_response(response, &mut diagnostic).await
+            let after = native.then(|| native_transport::After::new(response.headers()));
+            let result = if model.starts_with("zai/") {
+                zai::read_response(response, &mut diagnostic)
+                    .await
+                    .map(Into::into)
             } else {
-                read_response_coordinated(
+                read_response_lifecycle(
                     response,
                     streaming,
                     Some(&mut diagnostic),
                     flight.as_ref(),
+                    idle.zip(deadline)
+                        .map(|(idle, deadline)| (idle, deadline, model.starts_with("anthropic/"))),
+                    self.native_trace.clone(),
                 )
                 .await
+            };
+            if let Some(after) = after {
+                result.context(after)
+            } else {
+                result
             }
         }
         .await;
@@ -958,7 +1430,8 @@ impl Provider {
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .cloned(),
+                    .cloned()
+                    .map(Into::into),
             );
             if vendor == "anthropic" && value["stop_reason"] == "pause_turn" {
                 ensure!(
@@ -1040,9 +1513,10 @@ impl Provider {
         }
         Ok(result)
     }
-    pub fn parse(vendor: &str, value: Value) -> Result<Response> {
+    pub fn parse(vendor: &str, value: impl Into<NativeValue>) -> Result<Response> {
+        let value = value.into();
         if vendor == "zai" {
-            return zai::parse(value);
+            return zai::parse(value.projected());
         }
         if vendor == "openai" {
             ensure!(
@@ -1100,14 +1574,14 @@ impl Provider {
                     calls.push(ToolCall {
                         id: item[id].as_str().context("missing call id")?.into(),
                         name: item["name"].as_str().context("missing tool name")?.into(),
-                        arguments,
+                        arguments: arguments.into(),
                     });
                 }
                 _ => {}
             }
         }
         Ok(Response {
-            native,
+            native: native.into_iter().map(Into::into).collect(),
             texts,
             calls,
             usage: value["usage"].clone(),
@@ -1198,22 +1672,32 @@ fn add_usage(total: &mut Value, next: &Value) {
         }
     }
 }
-async fn read_response(response: reqwest::Response, streaming: bool) -> Result<Value> {
+async fn read_response(response: reqwest::Response, streaming: bool) -> Result<NativeValue> {
     read_response_observed(response, streaming, None).await
 }
 async fn read_response_observed(
     response: reqwest::Response,
     streaming: bool,
     diagnostic: Option<&mut crate::transport::Exchange>,
-) -> Result<Value> {
+) -> Result<NativeValue> {
     read_response_coordinated(response, streaming, diagnostic, None).await
 }
 async fn read_response_coordinated(
     response: reqwest::Response,
     streaming: bool,
+    diagnostic: Option<&mut crate::transport::Exchange>,
+    flight: Option<&cache_coordination::Flight>,
+) -> Result<NativeValue> {
+    read_response_lifecycle(response, streaming, diagnostic, flight, None, None).await
+}
+async fn read_response_lifecycle(
+    response: reqwest::Response,
+    streaming: bool,
     mut diagnostic: Option<&mut crate::transport::Exchange>,
     flight: Option<&cache_coordination::Flight>,
-) -> Result<Value> {
+    idle: Option<(Duration, tokio::time::Instant, bool)>,
+    trace: Option<std::sync::Arc<std::sync::Mutex<native_trace::Trace>>>,
+) -> Result<NativeValue> {
     use futures_util::StreamExt;
     const MAX: usize = 32 * 1024 * 1024;
     let sse = streaming
@@ -1225,6 +1709,9 @@ async fn read_response_coordinated(
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
     let mut decoder = SseDecoder {
+        trace,
+        native: idle.is_some(),
+        anthropic_wire: idle.is_some_and(|(_, _, anthropic)| anthropic),
         capture_errors: diagnostic.as_ref().is_some_and(|d| d.capture_enabled()),
         ..Default::default()
     };
@@ -1232,7 +1719,18 @@ async fn read_response_coordinated(
     if let Some(d) = diagnostic.as_deref_mut() {
         d.streaming(sse);
     }
-    while let Some(chunk) = stream.next().await {
+    let mut deadline = idle.map(|(_, deadline, _)| deadline);
+    loop {
+        let next = if let Some(at) = deadline {
+            tokio::time::timeout_at(at, stream.next())
+                .await
+                .context("native provider parsed-event idle timeout")?
+        } else {
+            stream.next().await
+        };
+        let Some(chunk) = next else {
+            break;
+        };
         let chunk = chunk.map_err(reqwest::Error::without_url).context(
             "provider response stream interrupted; no tools from this response executed",
         )?;
@@ -1241,12 +1739,22 @@ async fn read_response_coordinated(
             d.stage = "size_limit";
         }
         received += chunk.len();
+        if received > MAX && idle.is_some() {
+            return Err(native_transport::LocalBoundary)
+                .context("native response safety size limit exceeded");
+        }
         ensure!(
             received <= MAX,
             "provider response exceeded size limit; no tools from this response executed"
         );
         if sse {
+            let before = decoder.events;
             let decoded = decoder.feed(&chunk);
+            if decoder.events > before
+                && let Some((period, _, _)) = idle
+            {
+                deadline = Some(tokio::time::Instant::now() + period);
+            }
             if decoder.cache_begun
                 && let Some(flight) = flight
             {
@@ -1279,7 +1787,11 @@ async fn read_response_coordinated(
     if let Some(d) = diagnostic {
         d.stage = "json_decode";
     }
-    let value = serde_json::from_slice(&bytes).context("invalid provider JSON")?;
+    let value = if idle.is_some() {
+        NativeValue::parse(std::str::from_utf8(&bytes).context("invalid provider JSON UTF8")?)?
+    } else {
+        NativeValue::from(serde_json::from_slice::<Value>(&bytes).context("invalid provider JSON")?)
+    };
     // JSON transports have no observable message_start/output_item event.
     // A complete valid response is a conservative writer-ready boundary.
     if let Some(flight) = flight {
@@ -1289,18 +1801,26 @@ async fn read_response_coordinated(
 }
 #[derive(Default)]
 struct SseDecoder {
+    trace: Option<std::sync::Arc<std::sync::Mutex<native_trace::Trace>>>,
+    native: bool,
+    anthropic_wire: bool,
     pending: Vec<u8>,
     data: Vec<String>,
     cache_begun: bool,
     capture_errors: bool,
     server_tools: Vec<Value>,
-    completed_items: std::collections::BTreeMap<u64, Value>,
+    completed_items: std::collections::BTreeMap<u64, NativeValue>,
     events: usize,
     last_event: Option<&'static str>,
+    anthropic: anthropic_stream::Decoder,
 }
 impl SseDecoder {
-    fn feed(&mut self, bytes: &[u8]) -> Result<Option<Value>> {
+    fn feed(&mut self, bytes: &[u8]) -> Result<Option<NativeValue>> {
         self.pending.extend_from_slice(bytes);
+        if self.native && self.pending.len() > 16 * 1024 * 1024 {
+            return Err(native_transport::LocalBoundary)
+                .context("native event safety size limit exceeded");
+        }
         ensure!(
             self.pending.len() <= 16 * 1024 * 1024,
             "oversized provider SSE event"
@@ -1310,7 +1830,20 @@ impl SseDecoder {
             let line = std::str::from_utf8(&line)
                 .context("invalid provider stream UTF-8")?
                 .trim_end_matches(['\r', '\n']);
-            if line.is_empty() {
+            let line = if self.native {
+                crate::memory::summary_trim(line)
+            } else {
+                line
+            };
+            if self.native
+                && let Some(data) = line.strip_prefix("data:")
+            {
+                if data.trim() == "[DONE]" {
+                    continue;
+                }
+                self.data.push(data.to_owned());
+            }
+            if line.is_empty() || (self.native && line.starts_with("data:")) {
                 if self.data.is_empty() {
                     continue;
                 }
@@ -1318,9 +1851,18 @@ impl SseDecoder {
                 if payload == "[DONE]" {
                     continue;
                 }
-                let event: Value =
-                    serde_json::from_str(&payload).context("invalid provider SSE JSON")?;
+                let event = if self.native {
+                    NativeValue::parse(&payload)?
+                } else {
+                    NativeValue::from(
+                        serde_json::from_str::<Value>(&payload)
+                            .context("invalid provider SSE JSON")?,
+                    )
+                };
                 self.events += 1;
+                if let Some(trace) = &self.trace {
+                    trace.lock().unwrap().read(&event);
+                }
                 // Match upstream OpenAI.begun / Anthropic.begun, not HTTP
                 // headers, keepalive bytes or response.created.
                 if matches!(
@@ -1350,10 +1892,21 @@ impl SseDecoder {
                     _ => "other",
                 });
                 match event["type"].as_str() {
+                    Some(
+                        "message_start"
+                        | "content_block_start"
+                        | "content_block_delta"
+                        | "content_block_stop"
+                        | "message_delta"
+                        | "message_stop",
+                    ) => {
+                        if let Some(message) = self.anthropic.read_raw(&event, Some(&payload))? {
+                            return Ok(Some(message));
+                        }
+                    }
                     Some("response.completed" | "response.done") => {
                         let mut response = event
-                            .get("response")
-                            .cloned()
+                            .field("response")
                             .context("missing completed provider response")?;
                         if response["output"].as_array().is_none_or(Vec::is_empty)
                             && !self.completed_items.is_empty()
@@ -1365,8 +1918,29 @@ impl SseDecoder {
                                     .eq(0..self.completed_items.len() as u64),
                                 "provider stream has incomplete output indices; no tools from this response executed"
                             );
-                            response["output"] =
-                                json!(self.completed_items.values().collect::<Vec<_>>());
+                            response.set(
+                                "output",
+                                NativeValue::array(self.completed_items.values().cloned()),
+                            );
+                        }
+                        if self.native
+                            && matches!(response["status"].as_str(), Some("failed" | "incomplete"))
+                        {
+                            let failed = response["status"] == "failed";
+                            let mut details = retry::event_details_captured(
+                                &json!({"type":if failed {"response.failed"} else {"response.incomplete"},"response":response.projected()}),
+                                self.capture_errors,
+                            );
+                            details.retryable = failed && details.code == Some("server_error");
+                            if !details.retryable {
+                                return Ok(Some(response));
+                            }
+                            return Err(if details.retryable {
+                                StreamFailure::Transient(details)
+                            } else {
+                                StreamFailure::Terminal(details)
+                            }
+                            .into());
                         }
                         let missing_tools = self
                             .server_tools
@@ -1381,8 +1955,8 @@ impl SseDecoder {
                                 )
                             })
                             .collect::<Vec<_>>();
-                        if !missing_tools.is_empty() {
-                            response["_pantheon_server_tools"] = json!(missing_tools);
+                        if !self.native && !missing_tools.is_empty() {
+                            response.set("_pantheon_server_tools", json!(missing_tools));
                         }
                         return Ok(Some(response));
                     }
@@ -1391,16 +1965,47 @@ impl SseDecoder {
                             .as_u64()
                             .context("missing completed output index")?;
                         let item = event
-                            .get("item")
-                            .cloned()
+                            .field("item")
                             .context("missing completed output item")?;
                         if item["type"] == "web_search_call" {
-                            self.server_tools.push(item.clone());
+                            self.server_tools.push(item.projected());
                         }
                         self.completed_items.insert(index, item);
                     }
                     Some("error" | "response.failed" | "response.incomplete") => {
-                        let details = retry::event_details_captured(&event, self.capture_errors);
+                        let mut details =
+                            retry::event_details_captured(&event, self.capture_errors);
+                        if self.native {
+                            // Pinned OpenAI.step: only server_error is busy;
+                            // Anthropic error events are always busy.
+                            details.retryable = if self.anthropic_wire {
+                                true
+                            } else if event["type"] == "error" {
+                                event["code"] == "server_error"
+                            } else {
+                                event["type"] == "response.failed"
+                                    && event["response"]["error"]["code"] == "server_error"
+                            };
+                        }
+                        if self.native
+                            && !self.anthropic_wire
+                            && !details.retryable
+                            && event["type"] == "error"
+                        {
+                            // Pinned OpenAI.read(error) records st.error;
+                            // OpenAI.step synthesizes this answered failure.
+                            // Keep the semantic response ephemeral: ordinary
+                            // fail(seen) sanitizes its reason, diagnostics still
+                            // never log arbitrary provider text. Generic and
+                            // subscription transports retain typed failures.
+                            let mut failed =
+                                NativeValue::from(json!({"status":"failed","output":[]}));
+                            failed.set("error", event);
+                            return Ok(Some(failed));
+                        }
+                        if self.native && !details.retryable && event["response"].is_object() {
+                            return Ok(event.field("response"));
+                        }
                         return Err(if details.retryable {
                             StreamFailure::Transient(details)
                         } else {
@@ -1422,6 +2027,13 @@ impl SseDecoder {
 mod tests {
     use super::*;
     include!("provider_retry_tests.rs");
+    include!("provider_native_transport_tests.rs");
+    mod owned {
+        include!("provider_owned_tests.rs");
+    }
+    mod http_lifecycle {
+        include!("provider_http_lifecycle_tests.rs");
+    }
     #[test]
     fn private_search_affinity_is_stable_and_separate_from_its_parent() {
         let parent = uuid::Uuid::new_v4();
@@ -1567,13 +2179,21 @@ mod tests {
             assert_eq!(sent["store"], false);
             assert!(sent.get("previous_response_id").is_none());
         }
-        let projected = |history: &[Value]| {
+        let projected = |history: &[NativeValue]| {
             history
                 .iter()
                 .map(|item| {
-                    let mut item = item.clone();
+                    let mut item = item.projected();
                     if item.get("type").is_none() {
                         item["type"] = json!("message");
+                    }
+                    if let Some(blocks) = item["content"].as_array_mut() {
+                        for block in blocks {
+                            block
+                                .as_object_mut()
+                                .unwrap()
+                                .remove("prompt_cache_breakpoint");
+                        }
                     }
                     item
                 })
@@ -1705,7 +2325,7 @@ mod tests {
                 "openai/test",
                 "none",
                 "private-system-prompt",
-                &[json!({"role":"user","content":"private-user-message"})],
+                &[json!({"role":"user","content":"private-user-message"}).into()],
                 &[],
             )
             .with_subscriber(capture(&log))
@@ -1912,6 +2532,9 @@ mod tests {
                 .unwrap()
                 .with_request_retries(1, 2)
                 .unwrap();
+            // This regression is for the generic configurable transport. Native
+            // idle semantics have their own event-refresh regression suite.
+            provider.native_transport = false;
             provider.endpoint = Some(endpoint);
             let log = DiagnosticLog::default();
             let started = std::time::Instant::now();
@@ -2118,15 +2741,21 @@ mod tests {
     }
     #[test]
     fn codex_preserves_transcript_but_uses_subscription_wire_contract() {
-        let history = vec![
+        let history = [
             json!({"type":"reasoning","encrypted_content":"opaque"}),
-            Provider::user("openai", "go"),
+            Provider::user("openai", "go").projected(),
         ];
         let tools = vec![
             json!({"name":"web_search","description":"search","input_schema":{"type":"object"}}),
         ];
-        let body =
-            Provider::request_body("codex/gpt-5.6", "high", "fixed", &history, &tools).unwrap();
+        let body = Provider::request_body(
+            "codex/gpt-5.6",
+            "high",
+            "fixed",
+            &history.iter().cloned().map(Into::into).collect::<Vec<_>>(),
+            &tools,
+        )
+        .unwrap();
         assert_eq!(model_parts("codex/gpt-5.6").unwrap(), ("openai", "gpt-5.6"));
         assert!(body.get("instructions").is_none());
         assert_eq!(body["input"][0]["role"], "developer");
@@ -2379,7 +3008,7 @@ mod tests {
         let call = ToolCall {
             id: "c".into(),
             name: "browser".into(),
-            arguments: json!({}),
+            arguments: json!({}).into(),
         };
         let mut h = vec![];
         Provider::append_result_with_image(
@@ -2425,7 +3054,14 @@ mod tests {
                 .iter()
                 .filter(|b| !b["prompt_cache_breakpoint"].is_null())
                 .count(),
-            1
+            2
+        );
+        assert!(
+            blocks
+                .last()
+                .unwrap()
+                .get("prompt_cache_breakpoint")
+                .is_some()
         );
         assert!(
             unsupported["input"][1]["content"]
@@ -2488,7 +3124,9 @@ mod tests {
                 diagnostic.error_capture(enabled.then(|| path.clone()));
                 diagnostic.headers(&response);
                 let result = if zai {
-                    super::zai::read_response(response, &mut diagnostic).await
+                    super::zai::read_response(response, &mut diagnostic)
+                        .await
+                        .map(NativeValue::from)
                 } else {
                     read_response_observed(response, true, Some(&mut diagnostic)).await
                 };
@@ -2575,7 +3213,9 @@ mod tests {
                 let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
                 let response = reqwest::get(format!("http://{address}/")).await.unwrap();
                 let result = if zai {
-                    super::zai::read_response(response, &mut diagnostic).await
+                    super::zai::read_response(response, &mut diagnostic)
+                        .await
+                        .map(NativeValue::from)
                 } else {
                     read_response_observed(response, true, Some(&mut diagnostic)).await
                 };

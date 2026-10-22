@@ -69,3 +69,16 @@ fresh memory.
 See [optmem-parity.md](optmem-parity.md) for exact mechanism limits and fake-only
 validation. Actual inference/cache usage needs a separately authorized live
 pilot; no paid requests are required by normal tests.
+
+## Owned native prefix values
+
+Public native request preparation retains full ECMAScript JSON values instead
+of hashing a lossy Rust Value projection as native authority. The original
+coordination keys remain byte-identical for unaffected host-created prefixes.
+If an owned value inside the included marked prefix differs despite a colliding
+host projection (for example two distinct lone UTF16 values), the scoped prefix
+key splits. Differences only in the excluded final task or subsequent turns do
+not split. Invocation/attempt ownership is ephemeral and never key material.
+These fake endpoint assertions are not provider KV-cache acceptance or a hit-rate
+measurement; durable routing identities and restart-prefix invariants are
+unchanged.

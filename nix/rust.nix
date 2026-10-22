@@ -18,8 +18,9 @@ rustPlatform.buildRustPackage {
       ../Cargo.toml
       ../Cargo.lock
       ../src
+      ../vendor
       ../skills
-      ../tests/fixtures/uniichat-0500bf6.json
+      ../tests/fixtures
       ../LICENSE
       ../THIRD_PARTY_NOTICES.md
       ../licenses
@@ -44,6 +45,7 @@ rustPlatform.buildRustPackage {
   postInstall = ''
     mkdir -p "$out/share/licenses/pantheon"
     cp LICENSE THIRD_PARTY_NOTICES.md licenses/uniichat-Apache-2.0.txt "$out/share/licenses/pantheon/"
+    cp vendor/rmcp/LICENSE "$out/share/licenses/pantheon/rmcp-Apache-2.0.txt"
   '';
   meta = {
     description = "Unwrapped Pantheon executable";

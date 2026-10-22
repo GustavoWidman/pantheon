@@ -41,17 +41,17 @@ async fn native_compactor_retries_are_bounded_original_input_only_for_each_trans
                     .as_array()
                     .unwrap()
                     .iter()
-                    .filter(|m| m["role"] != "system")
+                    .filter(|m| m["role"] != "system" && m["role"] != "developer")
                     .collect::<Vec<_>>()
             } else {
                 r["messages"]
                     .as_array()
                     .unwrap()
                     .iter()
-                    .filter(|m| m["role"] != "system")
+                    .filter(|m| m["role"] != "system" && m["role"] != "developer")
                     .collect::<Vec<_>>()
             };
-            assert_eq!(messages.len(), if i == 0 { 1 } else { 2 });
+            assert_eq!(messages.len(), 1);
             assert!(messages.iter().all(|m| m["role"] == "user"));
             for j in 0..answers.len() {
                 assert_eq!(
@@ -65,7 +65,7 @@ async fn native_compactor_retries_are_bounded_original_input_only_for_each_trans
                 usize::from(i > 0)
             );
             let sys = if vendor == "openai" {
-                r["input"][0]["content"].as_str().unwrap().to_owned()
+                r["input"][0]["content"][0]["text"].as_str().unwrap().to_owned()
             } else if vendor == "anthropic" {
                 r["system"][0]["text"].as_str().unwrap().to_owned()
             } else {
@@ -140,14 +140,14 @@ async fn native_zoom_utf16_cursor_reaches_actual_root_tool_executor() {
     let call = ToolCall {
         id: "native-zoom".into(),
         name: "zoom".into(),
-        arguments: json!({"id":id,"n":1,"at":2}),
+        arguments: json!({"id":id,"n":1,"at":2}).into(),
     };
     assert_eq!(
         h.execute_tool(&mut run, &call).await.unwrap(),
         format!("{id}+0|user: Z")
     );
     let invalid = ToolCall {
-        arguments: json!({"id":id,"n":1,"at":1}),
+        arguments: json!({"id":id,"n":1,"at":1}).into(),
         ..call
     };
     assert!(h.execute_tool(&mut run, &invalid).await.is_err());

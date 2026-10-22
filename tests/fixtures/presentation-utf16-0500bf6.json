@@ -1,0 +1,94 @@
+{
+  "upstream": "0500bf6a8ea4bf0ce047488562022b1b6532cc30",
+  "scope": "six measured pinned reference presentation cases only; candidate source risk, NOT native acceptance",
+  "network": "fetch forbidden",
+  "records": [
+    {
+      "name": "citation-title-high",
+      "raw": "{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\",\"annotations\":[{\"type\":\"url_citation\",\"title\":\"\\ud800\",\"url\":\"https://example.test\"}]}]}",
+      "entries": [
+        {
+          "kind": "unii",
+          "text": "ok"
+        },
+        {
+          "kind": "echo",
+          "text": "sources:\n\ud800 https://example.test"
+        }
+      ],
+      "wellformed": [
+        {
+          "kind": "unii",
+          "text": "ok"
+        },
+        {
+          "kind": "echo",
+          "text": "sources:\n� https://example.test"
+        }
+      ]
+    },
+    {
+      "name": "citation-url-low",
+      "raw": "{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\",\"annotations\":[{\"type\":\"url_citation\",\"title\":\"a\",\"url\":\"\\udfff\"}]}]}",
+      "entries": [
+        {
+          "kind": "unii",
+          "text": "ok"
+        },
+        {
+          "kind": "echo",
+          "text": "sources:\na \udfff"
+        }
+      ],
+      "wellformed": [
+        {
+          "kind": "unii",
+          "text": "ok"
+        },
+        {
+          "kind": "echo",
+          "text": "sources:\na �"
+        }
+      ]
+    },
+    {
+      "name": "citation-dedup-before-wellformed",
+      "raw": "{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\",\"annotations\":[{\"type\":\"url_citation\",\"title\":\"\\ud800\",\"url\":\"u\"},{\"type\":\"url_citation\",\"title\":\"\\udfff\",\"url\":\"u\"}]}]}",
+      "entries": [
+        {
+          "kind": "unii",
+          "text": "ok"
+        },
+        {
+          "kind": "echo",
+          "text": "sources:\n\ud800 u\n\udfff u"
+        }
+      ],
+      "wellformed": [
+        {
+          "kind": "unii",
+          "text": "ok"
+        },
+        {
+          "kind": "echo",
+          "text": "sources:\n� u\n� u"
+        }
+      ]
+    },
+    {
+      "name": "refusal-high",
+      "why": "refused: \ud800",
+      "stop": "fail"
+    },
+    {
+      "name": "incomplete-low",
+      "why": "incomplete: \udfff",
+      "stop": "fail"
+    },
+    {
+      "name": "anthropic-explanation-high",
+      "why": "stopped: max_tokens (\ud800)",
+      "stop": "fail"
+    }
+  ]
+}

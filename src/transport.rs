@@ -217,7 +217,7 @@ impl Exchange {
             "since_last_byte_ms":self.last_byte.map(|t|milliseconds(t.elapsed())),
             "sse_events":self.events,"last_sse_event":self.last_event,
             "completed_output_items":self.completed_items,
-            "is_timeout":transport.map(reqwest::Error::is_timeout),
+            "is_timeout":if error.downcast_ref::<tokio::time::error::Elapsed>().is_some(){Some(true)}else{transport.map(reqwest::Error::is_timeout)},
             "is_connect":transport.map(reqwest::Error::is_connect),
             "is_body":transport.map(reqwest::Error::is_body),
             "is_decode":transport.map(reqwest::Error::is_decode),

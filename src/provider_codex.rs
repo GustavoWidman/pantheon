@@ -183,7 +183,8 @@ fn lite_tools(tools: Vec<Value>) -> Vec<Value> {
     }
     converted
 }
-pub(crate) fn parse(value: Value) -> Result<Response> {
+pub(crate) fn parse(value: impl Into<super::NativeValue>) -> Result<Response> {
+    let value = value.into().projected();
     // A separate namespace is part of tool identity, not a dotted name to strip blindly.
     for item in value["output"].as_array().into_iter().flatten() {
         // The shared parser accepts Anthropic tool_use too; Codex never advertises it.

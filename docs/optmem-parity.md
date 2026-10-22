@@ -15,6 +15,17 @@ Reference: VictorTaelin/uniichat
 `prompt.txt`, `Anthropic.ts`, and `AskAI.ts`. Attribution and license are in
 `THIRD_PARTY_NOTICES.md`.
 
+## Parity scope (corrected after provider-boundary review)
+
+This checklist describes tested native memory mechanisms, not blanket end-to-end
+provider parity. The earlier review missed refusal/outcome and block joining at
+the provider-to-compactor boundary; engine fixtures did not exercise Memory.build
+through a real adapter. The separately implemented importer also incorrectly
+enforced 512 bytes as a hard output cap. That gap was outside the earlier engine
+review and invalidated the blanket parity assurance. See [compactor-adapter.md](compactor-adapter.md) for the
+focused correction and explicit remaining constraints. No recall, cache-rate,
+subscription-quota, legacy migration or exact model-output equivalence follows.
+
 ## Native mechanism contract
 
 - Every original page is a leaf. Text pages count **30,000 UTF-16 code units**,
@@ -64,8 +75,30 @@ Reference: VictorTaelin/uniichat
   answered attempts see the original context/task plus at most the latest size
   correction: never previous answers, reasoning or accumulated corrections.
   Persist the shortest answer, even if still >512 bytes (upstream behavior).
-  An answered empty/refusal clips the source; transport failure retries rather
-  than inventing a summary. **512 bytes is a target, not a hard cap.**
+  Supported explicit model failure/refusal/incomplete and completed-empty retain
+  the prior shortest answer; with no prior candidate they clip flat source.
+  Typed terminal SSE Responses semantics apply to public OpenAI AND Codex:
+  `model_parts` maps Codex to OpenAI. The prior claim of a separate generic
+  Codex path was an audit error; authenticated fake Codex wire tests exercise
+  this actual path, with no speculative transport change. Refusal prose is never
+  a summary candidate. Reply-entry normalization matches pinned upstream.
+  Each answered length retry appends one latest unmarked correction block to
+  the original User item; no previous model output is replayed.
+  Generic transport/setup errors retry the same frozen correction after an
+  abortable 60 seconds, without consuming an answered attempt, publishing best
+  prematurely, or releasing the native reservation. Inner host transport retry
+  cadence is native Agent-style for public OpenAI/Anthropic; configured generic
+  search/Codex/Z.ai transports remain named separate domains. **512 bytes is a target, not a hard cap.**
+  Anthropic `pause_turn` carries all native blocks/signatures into continuation;
+  adjacent same-role items merge on the wire. Only final-step reply entries
+  determine the answer. Continuation count is not artificially capped; caller
+  cancellation owns every request. Messages SSE assembles incremental blocks,
+  replacing signature deltas per pinned upstream, with cache release at
+  `message_start`. Supported compactor wire profiles are compared against actual
+  upstream request builders. The task/correction is unmarked, so Anthropic's
+  top-level automatic-end cache mark is absent for compaction.
+  See [behavioral-parity-matrix.md](behavioral-parity-matrix.md) and the adapter
+  outcome table for exact shared-domain evidence and remaining differences.
 - Views form opening block, four-line blocks, and incomplete tail plus closing
   wrapper. Mark only the last whole block, or opening block when none exists.
   The wire concatenation preserves every view byte.
@@ -133,7 +166,8 @@ completed nodes; interrupted not-yet-durable jobs become ordinary pending work.
    cloud billing, UI or server act format. Native image references/pages follow
    the reference placement and rendering rules.
 6. Cache blocks are implemented in the adapters, but provider capabilities
-   differ. Anthropic gets system and near-tail block marks plus automatic end;
+   differ. Anthropic gets system and near-tail memory marks; automatic end is
+   absent for an unmarked compactor task, retained for ordinary host turns;
    supported public OpenAI models get the explicit near-tail mark. Moving a
    lone OpenAI breakpoint can reduce reuse; these tests make no cache-hit claim.
    Codex strips unsupported marks and retains its existing durable affinity.
@@ -154,9 +188,31 @@ completed nodes; interrupted not-yet-durable jobs become ordinary pending work.
    residency for Codex/Z.ai or unmarked public models. These transport/scope
    differences remain explicit; coordination is a cache-write hint, not proof
    that a provider wrote or read KV state. No paid cache benchmark was run.
-7. Provider outages use the existing bounded-delay retry loop; shutdown cancels
-   owned tasks. Completed answers survive a later failed attempt. No inference
-   request or historical tool operation is performed by memory recovery.
+7. Native public OpenAI/Anthropic turns use the pinned eight-attempt
+   exponential/header/event-idle lifecycle. Codex/Z.ai/search retain their named
+   generic host policy. Native calls without `yields` do not wait on upstream
+   busy-model rooms; no import scheduling is added to the legacy-blind engine.
+   Above inner transport retries, the compactor owns the reference patient
+   60-second same-call retry loop. Shutdown cancels owned tasks. Publication admission linearizes at a
+   shutdown-token check while holding the native memory lock, immediately before
+   synchronous `Memory.finish` (no intervening await). If cancellation is observed
+   there, no summary journal entry or node/view update starts. A write/fsync already
+   admitted before cancellation may finish and remains durable on restart; shutdown
+   is not rollback or an interrupt of synchronous storage. The lock-wait race and
+   completed-before-cancel ordering are tested through the actual daemon compactor
+   and native reopen.
+   Direct compactor cancellation can retain an already answered shortest result;
+   no candidate means cancellation error, not fabricated source fallback.
+   Pending native compactions may be scheduled on a subsequent fresh process;
+   completed nodes and historical tools are never replayed by memory recovery.
+8. Fresh text-turn admission now journals queued originals before selecting the
+   Memory.whole raw suffix (128k/20 image references, last page always), settles
+   only before that boundary and recomputes it for new same-activity inputs.
+   Complete native originals remain available even when only a suffix is sent
+   raw. Pantheon UI activity grouping, attachment resolution and system notices
+   remain product integrations, not a clone of Unii Server/Tools/cloud objects.
+   Native image-reference policy is tested; attachment resolution still occurs
+   through Pantheon's separate ownership/budget service.
 
 ## Validation
 
@@ -191,3 +247,26 @@ is used by these tests.
 Phase two is an independent offline data transformation tool. Its requirements
 are recorded outside the engine; native span/paging invariants are not relaxed
 to accommodate an input dataset. It is not implemented here.
+
+## Current finite parity boundary
+
+The [finite behavioral matrix](behavioral-parity-matrix.md) is the current
+checklist. The V13b parent has scoped memory/route evidence. The local successor
+implements the previously known F2 input/continuation representation gap using
+invocation-owned ECMAScript JSON values through public provider decode, Uses,
+history and actual HTTP/stdio transport. Implementation and development test
+results do not establish frozen independent acceptance or package clearance.
+
+A/B/C assertions distinguish pre-RPC classification, actual RPC bytes/headers
+and the actual next provider HTTP body. Native-reader reopen compares ordered
+original kinds and bodies, not only text counts. All 23 saved server cases are
+required to match; a decoding error is not an equivalent trace. Private Sessions
+exercise their actual A/C adapter, not nonexistent remote MCP tools.
+
+Per-record fsync, private affinity, inert restart, bounded decoder resources,
+object-only tool roots and bounded secret-sanitized cutoff reasons remain named
+adaptations. Modern MCP annotated scalar lone-UTF16 headers have a separately
+named open interoperability disposition; ordinary nested/unannotated/stdio
+remote UTF16 bodies must remain lossless. No broad remote-UTF16 exclusion is
+accepted. No source-only test or reviewed package authorizes replay, paid calls,
+migration, service changes or cutover.

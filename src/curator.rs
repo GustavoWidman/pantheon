@@ -225,7 +225,7 @@ impl Session<'_> {
     async fn step(
         &self,
         system: &str,
-        history: &[Value],
+        history: &[crate::provider::NativeValue],
         tools: &[Value],
     ) -> Result<crate::provider::Response> {
         ensure!(!self.env.cancel.is_cancelled(), "curation cancelled");
@@ -233,7 +233,7 @@ impl Session<'_> {
             system.chars().count()
                 + history
                     .iter()
-                    .map(crate::attachments::text_chars)
+                    .map(crate::attachments::text_chars_native)
                     .sum::<usize>()
                 + serde_json::to_string(tools)?.chars().count()
                 <= self.env.config.max_input_chars,
@@ -614,7 +614,9 @@ pub async fn run(
                         .read(
                             call,
                             &snapshot,
-                            crate::attachments::budget_with_media(env.model, &history, &media),
+                            crate::attachments::budget_with_native_media(
+                                env.model, &history, &media,
+                            ),
                         )
                         .await
                 };
@@ -673,7 +675,7 @@ pub async fn run(
                     if response.calls.is_empty(){history.push(Provider::user(vendor,"Return your verdict using decide."));continue;}
                     let mut verdict=None;let mut media=vec![];
                     for call in &response.calls {
-                        let result=if call.name=="decide"{decision(&call.arguments).map(|approved|{verdict=Some((approved,call.arguments.clone()));json!({"recorded":true})})}else{session.read(call,&snapshot,crate::attachments::budget_with_media(env.model,&history,&media)).await};
+                        let result=if call.name=="decide"{decision(&call.arguments).map(|approved|{verdict=Some((approved,(*call.arguments).clone()));json!({"recorded":true})})}else{session.read(call,&snapshot,crate::attachments::budget_with_native_media(env.model, &history,&media)).await};
                         let(v,error)=match result{Ok(v)=>(v,false),Err(e)=>(json!({"error":e.to_string()}),true)};media.extend(append_research_result(vendor,&mut history,call,v,error));
                     }
                     append_research_media(vendor,&mut history,media)?;
@@ -740,7 +742,7 @@ pub async fn run(
 
 fn append_research_result(
     vendor: &str,
-    history: &mut Vec<Value>,
+    history: &mut Vec<crate::provider::NativeValue>,
     call: &crate::provider::ToolCall,
     mut value: Value,
     error: bool,
@@ -766,7 +768,11 @@ fn append_research_result(
     Provider::append_result(vendor, history, call, &value.to_string(), error);
     parts
 }
-fn append_research_media(vendor: &str, history: &mut Vec<Value>, parts: Vec<Value>) -> Result<()> {
+fn append_research_media(
+    vendor: &str,
+    history: &mut Vec<crate::provider::NativeValue>,
+    parts: Vec<Value>,
+) -> Result<()> {
     if !parts.is_empty() {
         let mut user = Provider::user(
             vendor,
