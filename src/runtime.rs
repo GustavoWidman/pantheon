@@ -36,21 +36,46 @@ pub struct Harness {
     curator_instructions: String,
     mcp: crate::mcp::Mcp,
     channels: Mutex<HashMap<u64, Arc<Channel>>>,
+    shared: Arc<SharedMemory>,
+    coordinator_turn: Mutex<()>,
+    run_started: std::sync::atomic::AtomicBool,
+    compactor_settings: Mutex<()>,
     children: Mutex<HashMap<String, Child>>,
     capacity: Arc<Semaphore>,
     shell_capacity: Arc<Semaphore>,
     claude_capacity: Arc<Semaphore>,
     shell_jobs: Mutex<HashMap<String, (u64, CancellationToken)>>,
     shutdown: CancellationToken,
+    #[cfg(test)]
+    native_before_use: Option<(usize, Arc<Notify>, Arc<Notify>)>,
+    #[cfg(test)]
+    native_batch_paused: Option<(Arc<Notify>, Arc<Notify>)>,
     master_system: String,
     child_system: String,
 }
-struct Channel {
-    settings_lock: Mutex<()>,
+// Memory belongs to the bot installation, never to a reply channel.
+// One mutex linearizes journal IDs/publication; one scheduler owns compactions.
+struct SharedMemory {
     memory: Mutex<Memory>,
     changed: Notify,
+    #[cfg(test)]
+    compaction_selected: Notify,
+}
+struct Channel {
+    shared: Arc<SharedMemory>,
+    settings_lock: Mutex<()>,
     incoming: Notify,
     cancel: Mutex<Option<CancellationToken>>,
+}
+impl std::ops::Deref for Channel {
+    type Target = SharedMemory;
+    fn deref(&self) -> &SharedMemory { &self.shared }
+}
+// Discord snowflakes are nonzero. Operational compactor settings use this
+// reserved instance-global scope; it is never a message delivery destination.
+const GLOBAL_COMPACTOR: u64 = 0;
+fn attributed_input(input: &Input) -> String {
+    format!("[channel:{} user:{}]\n{}", input.channel, input.user, input.text)
 }
 struct Child {
     channel: u64,
@@ -76,7 +101,7 @@ struct Run {
     memory: Arc<Channel>,
     cancel: CancellationToken,
     settings: (String, String),
-    history: Vec<Value>,
+    history: Vec<crate::provider::NativeValue>,
     inputs: Vec<String>,
     trace: Option<Memory>,
     steering: Vec<String>,
@@ -166,21 +191,25 @@ impl Harness {
         std::fs::create_dir_all(&config.workspace)?;
         let store = Store::open(&config.state_dir.join("runtime.sqlite"))?;
         store.recover()?;
+        let mut memory = Memory::open(config.state_dir.join("memory"), config.agent.view_bytes)?;
+        // Recovery is instance-wide, not dependent on which channel is opened
+        // first. Append-before-ack with source IDs makes this crash-idempotent.
+        for input in store.unlogged_global()? {
+            memory.append_with_id(Kind::User, &attributed_input(&input), &input.id)?;
+            store.mark_logged(&input.id)?;
+        }
+        let shared = Arc::new(SharedMemory {
+            memory: Mutex::new(memory), changed: Notify::new(),
+            #[cfg(test)] compaction_selected: Notify::new(),
+        });
         discord.models.initialize(&config);
         for (channel, model) in store.chat_models()? {
             discord.models.set_chat_model(channel, &model);
         }
+        discord.models.set_kind_model(GLOBAL_COMPACTOR, "compact",
+            Some(&store.compactor_model(GLOBAL_COMPACTOR, &config.agent.compactor_model)?))?;
         for channel in store.model_override_channels()? {
-            discord.models.set_kind_model(
-                channel,
-                "compact",
-                Some(&store.compactor_model(channel, &config.agent.compactor_model)?),
-            )?;
-            discord.models.set_kind_model(
-                channel,
-                "curator",
-                store.curator_model(channel)?.as_deref(),
-            )?;
+            discord.models.set_kind_model(channel, "curator", store.curator_model(channel)?.as_deref())?;
         }
         let instructions = config.instructions()?;
         let skills = crate::skill_library::SkillLibrary::open(&config.skills, &config.state_dir)?;
@@ -226,6 +255,10 @@ impl Harness {
             shell_capacity: Arc::new(Semaphore::new(config.agent.max_shell_jobs)),
             claude_capacity: Arc::new(Semaphore::new(config.claude.max_jobs)),
             shell_jobs: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            native_before_use: None,
+            #[cfg(test)]
+            native_batch_paused: None,
             master_system: system_prompt_with_claude(
                 false,
                 config.agent.coordinator_root,
@@ -248,6 +281,10 @@ impl Harness {
             store,
             discord,
             channels: Mutex::new(HashMap::new()),
+            shared,
+            coordinator_turn: Mutex::new(()),
+            run_started: std::sync::atomic::AtomicBool::new(false),
+            compactor_settings: Mutex::new(()),
             children: Mutex::new(HashMap::new()),
             shutdown,
         };
@@ -259,45 +296,17 @@ impl Harness {
             return Ok(c.clone());
         }
         let c = Arc::new(Channel {
+            shared: self.shared.clone(),
             settings_lock: Mutex::new(()),
-            memory: Mutex::new(Memory::open(
-                self.config.state_dir.join("chats").join(id.to_string()),
-                self.config.agent.view_bytes,
-            )?),
-            changed: Notify::new(),
             incoming: Notify::new(),
             cancel: Mutex::new(None),
         });
-        for input in self.store.unlogged(id)? {
-            c.memory
-                .lock()
-                .await
-                .append_with_id(Kind::User, &input.text, &input.id)?;
-            self.store.mark_logged(&input.id)?;
-        }
-        self.discord.models.set_kind_model(
-            id,
-            "compact",
-            Some(
-                &self
-                    .store
-                    .compactor_model(id, &self.config.agent.compactor_model)?,
-            ),
-        )?;
         self.discord.models.set_kind_model(
             id,
             "curator",
             self.store.curator_model(id)?.as_deref(),
         )?;
         channels.insert(id, c.clone());
-        let h = self.clone();
-        let cc = c.clone();
-        tokio::spawn(async move {
-            if let Err(e) = h.clone().compactor(id, cc).await {
-                tracing::error!(channel=id,error=%e,"compactor stopped");
-                h.shutdown.cancel();
-            }
-        });
         let h = self.clone();
         let cc = c.clone();
         tokio::spawn(async move {
@@ -309,6 +318,16 @@ impl Harness {
         Ok(c)
     }
     pub async fn run(self: Arc<Self>, mut inbound: mpsc::Receiver<Inbound>) -> Result<()> {
+        ensure!(!self.run_started.swap(true, std::sync::atomic::Ordering::AcqRel), "Harness runtime already started; do not create a second global scheduler");
+        // Start even with no queued channel: an idle reopen may have unfinished
+        // native summaries. Never hold the coordinator permit in this scheduler.
+        let h = self.clone();
+        let compact = tokio::spawn(async move {
+            if let Err(e) = h.clone().compactor(GLOBAL_COMPACTOR, h.shared.clone()).await {
+                tracing::error!(error=%e,"global compactor stopped");
+                h.shutdown.cancel();
+            }
+        });
         let h = self.clone();
         let discovery = tokio::spawn(async move {
             loop {
@@ -395,6 +414,7 @@ impl Harness {
         }
         self.browser.shutdown().await;
         let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            let _ = compact.await;
             let _ = out.await;
             let _ = jobs.await;
             let _ = progress.await;
@@ -414,7 +434,7 @@ impl Harness {
         c.memory
             .lock()
             .await
-            .append_with_id(Kind::User, &input.text, &input.id)?;
+            .append_with_id(Kind::User, &attributed_input(input), &input.id)?;
         c.changed.notify_waiters();
         Ok(())
     }
@@ -430,6 +450,67 @@ impl Harness {
                 }
             }
             tokio::select! {_=changed=>{},_=cancel.cancelled()=>bail!("turn cancelled while waiting for summaries"),_=self.shutdown.cancelled()=>bail!("shutdown")}
+        }
+    }
+    /// Fresh-turn admission mirrors Chat.from/Memory.whole: originals are
+    /// journaled before selecting the raw suffix; wait only for summaries before
+    /// that suffix, and recompute it when more same-activity inputs arrive.
+    async fn prepare_native_turn(
+        &self,
+        channel: u64,
+        c: &Channel,
+        cancel: &CancellationToken,
+        context: &crate::ui::ReplyContext,
+        queued: &mut Vec<Input>,
+    ) -> Result<(String, Vec<String>)> {
+        let mut logged = HashSet::new();
+        loop {
+            ensure!(
+                !cancel.is_cancelled() && !self.shutdown.is_cancelled(),
+                "turn cancelled while preparing context"
+            );
+            let changed = c.changed.notified();
+            let incoming = c.incoming.notified();
+            tokio::pin!(changed, incoming);
+            changed.as_mut().enable();
+            incoming.as_mut().enable();
+            for input in self.store.queued(channel)? {
+                if !queued.iter().any(|q| q.id == input.id)
+                    && self.store.reply_context(&input.id)?.activity == context.activity
+                {
+                    queued.push(input);
+                }
+            }
+            for input in queued.iter() {
+                if logged.insert(input.id.clone()) {
+                    Self::append_input(c, input).await?;
+                    self.store.mark_logged(&input.id)?;
+                }
+            }
+            {
+                let memory = c.memory.lock().await;
+                let first = memory
+                    .lookup_source(&queued[0].id)
+                    .context("missing admitted native source")?;
+                let from = memory.whole(first)?;
+                if memory.settled_before(from)? {
+                    let mut texts = Vec::new();
+                    for input in queued.iter() {
+                        let (start, end) = memory.source_span(&input.id)?;
+                        if end > from {
+                            texts.push(memory.say(start.max(from), end)?);
+                        }
+                    }
+                    return Ok((memory.render_before(from)?, texts));
+                }
+            }
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => bail!("turn cancelled while waiting for summaries"),
+                _ = self.shutdown.cancelled() => bail!("shutdown"),
+                _ = changed => {},
+                _ = incoming => {},
+            }
         }
     }
     fn admit_prompt(&self, input: &Input) -> Result<bool> {
@@ -651,8 +732,30 @@ impl Harness {
             if queued.is_empty() {
                 tokio::select! {_=notified=>continue,_=self.shutdown.cancelled()=>break};
             }
+            let cancel = self.shutdown.child_token();
+            *c.cancel.lock().await = Some(cancel.clone());
+            let _turn = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    if !self.shutdown.is_cancelled() {
+                        // A stopped channel waiting behind another coordinator
+                        // must not answer its batch on the next loop. Preserve
+                        // accepted inputs in the global journal before ack.
+                        for input in self.store.queued(channel)? {
+                            self.store.input_state(&input.id, "cancelled")?;
+                            Self::append_input(&c, &input).await?;
+                            self.store.mark_logged(&input.id)?;
+                        }
+                    }
+                    *c.cancel.lock().await = None; continue;
+                },
+                guard = self.coordinator_turn.lock() => guard,
+            };
+            // Another channel may have held the permit for a full turn.
+            let queued = self.store.queued(channel)?;
+            if queued.is_empty() { *c.cancel.lock().await = None; continue; }
             let context = self.store.reply_context(&queued[0].id)?;
-            let queued = queued
+            let mut queued = queued
                 .into_iter()
                 .filter(|input| {
                     self.store
@@ -677,10 +780,10 @@ impl Harness {
             self.store
                 .present_agent(&owner, channel, &context, "Coordinator", &settings.0)?;
             self.store.agent_phase(&owner, true, "Preparing context")?;
-            let cancel = self.shutdown.child_token();
-            *c.cancel.lock().await = Some(cancel.clone());
-            let view = self.settle(&c, &cancel).await;
-            if let Err(e) = view {
+            let prepared = self
+                .prepare_native_turn(channel, &c, &cancel, &context, &mut queued)
+                .await;
+            if let Err(e) = prepared {
                 // Preserve cancelled admission in the immutable log without answering it.
                 for input in &queued {
                     self.store.input_state(&input.id, "cancelled")?;
@@ -697,7 +800,7 @@ impl Harness {
                 *c.cancel.lock().await = None;
                 continue;
             }
-            let view = view.unwrap();
+            let (view, texts) = prepared.unwrap();
             let refresh = self.skills.catalogue_refresh_due(
                 &channel.to_string(),
                 self.config.curator.idle_seconds,
@@ -719,13 +822,9 @@ impl Harness {
             );
             let note = self.skill_notifications(channel, &c).await?;
             let mut ids = vec![];
-            let mut texts = vec![];
             for input in &queued {
                 self.store.input_state(&input.id, "running")?;
-                Self::append_input(&c, input).await?;
-                self.store.mark_logged(&input.id)?;
                 ids.push(input.id.clone());
-                texts.push(input.text.clone());
             }
             let settings = self.store.settings(
                 channel,
@@ -779,7 +878,7 @@ impl Harness {
                     channel,
                     &run.inputs,
                     &run.settings.0,
-                    crate::attachments::remaining_budget(&run.settings.0, &run.history),
+                    crate::attachments::remaining_budget_native(&run.settings.0, &run.history),
                 )
                 .await?;
             Provider::attach_user_parts(run.history.last_mut().unwrap(), parts)?;
@@ -859,6 +958,10 @@ impl Harness {
             outcome
         })
     }
+    // Completed calls are observed before execution, but Chat.on publishes them
+    // with the matching echo; Chat.unanswered flushes those left at turn exit.
+    // Owned cancellation runs this wrapper. Hard task abort/process death cannot
+    // execute asynchronous cleanup; it does not replay tools on restart.
     async fn run_steps(
         self: &Arc<Self>,
         run: &mut Run,
@@ -866,6 +969,54 @@ impl Harness {
         defs: &[Value],
         system: &str,
         run_id: &str,
+    ) -> Result<String> {
+        let mut pending = Vec::new();
+        let outcome = self
+            .run_steps_inner(run, vendor, defs, system, run_id, &mut pending)
+            .await;
+        let flushed = self.flush_native_calls(run, &mut pending).await;
+        match outcome {
+            Err(error) => {
+                // Never replace the original failure or bypass a poisoned writer.
+                if let Err(flush_error) = flushed {
+                    tracing::warn!(%flush_error, "unanswered native calls could not be stored");
+                }
+                Err(error)
+            }
+            Ok(text) => {
+                flushed?;
+                Ok(text)
+            }
+        }
+    }
+    async fn flush_native_calls(
+        &self,
+        run: &mut Run,
+        pending: &mut Vec<(crate::provider::CallId, String)>,
+    ) -> Result<()> {
+        // Object.values enumerates canonical array-index IDs before other keys.
+        pending.sort_by_key(|(id, _)| {
+            id.parse::<u32>()
+                .ok()
+                .filter(|n| *n != u32::MAX && *id == n.to_string())
+                .map(|n| (0, n))
+                .unwrap_or((1, 0))
+        });
+        let entries = std::mem::take(pending)
+            .into_iter()
+            .map(|(_, text)| (Kind::Tool, text))
+            .collect::<Vec<_>>();
+        self.log_run_batch(run, &entries).await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn run_steps_inner(
+        self: &Arc<Self>,
+        run: &mut Run,
+        vendor: &str,
+        defs: &[Value],
+        system: &str,
+        run_id: &str,
+        pending: &mut Vec<(crate::provider::CallId, String)>,
     ) -> Result<String> {
         let mut transcript = String::new();
         let provider = self
@@ -900,24 +1051,52 @@ impl Harness {
             self.store.agent_phase(&run.owner, true, "Thinking")?;
             let submitted_inputs = run.inputs.clone();
             let submitted = || self.store.submitted_inputs(&submitted_inputs);
-            let response = tokio::select! {
-                r=provider.step_observed(&run.settings.0,&run.settings.1,system,&run.history,defs,Some(&submitted))
-                    .instrument(tracing::info_span!("provider_step", channel=run.channel, owner=%run.owner, run_id=%run_id, step))=>r?,
-                _=run.cancel.cancelled()=>bail!("cancelled"),
+            let native_events = provider.native_public(&run.settings.0);
+            let request_history = run.history.clone();
+            let settings = run.settings.clone();
+            let (observations, mut observed) = tokio::sync::mpsc::unbounded_channel();
+            let mut request=Box::pin(provider.step_observed_events(&settings.0,&settings.1,system,&request_history,defs,Some(&submitted),Some(observations))
+                .instrument(tracing::info_span!("provider_step", channel=run.channel, owner=%run.owner, run_id=%run_id, step)));
+            let mut observation_index = 0;
+            let usage_phase = if step == 0 {
+                "fresh_turn"
+            } else if steered {
+                "steered_step"
+            } else {
+                "tool_step"
             };
+            let response = loop {
+                tokio::select! {
+                    biased;
+                    Some(observation)=observed.recv()=> {
+                        self.observe_native_step(run,&observation,&mut transcript,run_id,step,observation_index,usage_phase,pending).await?;
+                        observation_index+=1;
+                    }
+                    result=&mut request=> {
+                        while let Ok(observation)=observed.try_recv() {
+                            self.observe_native_step(run,&observation,&mut transcript,run_id,step,observation_index,usage_phase,pending).await?;
+                            observation_index+=1;
+                        }
+                        break result?;
+                    }
+                    _=run.cancel.cancelled()=> {
+                        drop(request); // sends the active stream's stopped trace
+                        while let Ok(observation)=observed.try_recv() {
+                            self.observe_native_step(run,&observation,&mut transcript,run_id,step,observation_index,usage_phase,pending).await?;
+                            observation_index+=1;
+                        }
+                        bail!("cancelled");
+                    }
+                }
+            };
+            drop(request);
             run.steps += 1;
-            if !run.child {
+            if !run.child && !native_events {
                 self.store.observed_usage(
                     run.channel,
                     &run.settings.0,
                     &response.usage,
-                    if step == 0 {
-                        "fresh_turn"
-                    } else if steered {
-                        "steered_step"
-                    } else {
-                        "tool_step"
-                    },
+                    usage_phase,
                 )?;
             }
             Provider::append_response(vendor, &mut run.history, &response);
@@ -926,7 +1105,7 @@ impl Harness {
             } else {
                 false
             };
-            for (text, thought) in &response.texts {
+            for (text, thought) in response.texts.iter().filter(|_| !native_events) {
                 if text.trim().is_empty() {
                     continue;
                 }
@@ -950,7 +1129,14 @@ impl Harness {
                 let text = response
                     .texts
                     .iter()
-                    .filter(|(text, thought)| !*thought && !text.trim().is_empty())
+                    .filter(|(text, thought)| {
+                        !*thought
+                            && if native_events {
+                                !crate::memory::summary_trim(text).is_empty()
+                            } else {
+                                !text.trim().is_empty()
+                            }
+                    })
                     .map(|(t, _)| t.as_str())
                     .collect::<Vec<_>>()
                     .join("\n\n");
@@ -1009,7 +1195,14 @@ impl Harness {
                     response
                         .texts
                         .iter()
-                        .filter(|(text, thought)| !*thought && !text.trim().is_empty())
+                        .filter(|(text, thought)| {
+                            !*thought
+                                && if native_events {
+                                    !crate::memory::summary_trim(text).is_empty()
+                                } else {
+                                    !text.trim().is_empty()
+                                }
+                        })
                         .map(|(text, _)| text.as_str())
                         .collect::<Vec<_>>()
                         .join("\n\n")
@@ -1020,15 +1213,21 @@ impl Harness {
             for (index, call) in response.calls.iter().enumerate() {
                 // Finish the model's requested batch before delivering queued steering.
                 // Provider transcripts require a result for every requested call.
+                #[cfg(test)]
+                if native_events
+                    && let Some((at, arrived, release)) = &self.native_before_use
+                    && index == *at
+                {
+                    arrived.notify_one();
+                    release.notified().await;
+                }
                 if run.cancel.is_cancelled() {
                     bail!("cancelled");
                 }
-                self.log_run(
-                    run,
-                    Kind::Tool,
-                    &format!("{} {}", call.name, call.arguments),
-                )
-                .await?;
+                if !native_events {
+                    self.log_run(run, Kind::Tool, &response.tool_entry(call, false))
+                        .await?;
+                }
                 let tool_id = format!("{run_id}:{step}:tool:{index}");
                 self.store.tool_start(&tool_id, run.channel, &call.name)?;
                 let start = Instant::now();
@@ -1044,7 +1243,23 @@ impl Harness {
                         call,
                     )?;
                 }
-                let result = self.execute_tool_tracked(run, call, Some(&tool_id)).await;
+                let result = if !tools::definitions_with_claude(
+                    run.child,
+                    self.config.agent.coordinator_root,
+                    self.config.claude.enabled,
+                )
+                .iter()
+                .any(|tool| tool["name"] == call.name)
+                {
+                    Err(anyhow::anyhow!(
+                        "tool {} is unavailable to this agent",
+                        call.name
+                    ))
+                } else if !call.arguments.is_object() {
+                    Err(anyhow::anyhow!("The input is not a JSON object."))
+                } else {
+                    self.execute_tool_tracked(run, call, Some(&tool_id)).await
+                };
                 let mut error = result.is_err();
                 let output = match result {
                     Ok(v) => v,
@@ -1063,7 +1278,14 @@ impl Harness {
                 } else {
                     crate::memory::cap_tool_result(&output)
                 };
-                self.log_run(run, Kind::Echo, &output).await?;
+                let mut entries = Vec::new();
+                if native_events && let Some(at) = pending.iter().position(|(id, _)| id == &call.id)
+                {
+                    let (_, text) = pending.remove(at);
+                    entries.push((Kind::Tool, text));
+                }
+                entries.push((Kind::Echo, output.clone()));
+                self.log_run_batch(run, &entries).await?;
                 let image =
                     if call.name == "browser" && call.arguments["action"] == "screenshot" && !error
                     {
@@ -1076,7 +1298,7 @@ impl Harness {
                                     std::path::Path::new(path),
                                     &run.settings.0,
                                     None,
-                                    crate::attachments::budget_with_media(
+                                    crate::attachments::budget_with_native_media(
                                         &run.settings.0,
                                         &run.history,
                                         &run.media,
@@ -1108,6 +1330,13 @@ impl Harness {
                     error,
                     image.as_deref(),
                 );
+                if native_events
+                    && vendor == "openai"
+                    && let Some(last) = run.history.last_mut()
+                    && let Some(text) = last["output"].as_str()
+                {
+                    last.set("output", json!([{"type":"input_text","text":text}]));
+                }
                 self.store.tool_done(&tool_id)?;
                 let background = !error
                     && serde_json::from_str::<Value>(&output)
@@ -1133,11 +1362,168 @@ impl Harness {
             }
         }
     }
+    #[allow(clippy::too_many_arguments)]
+    async fn observe_native_step(
+        &self,
+        run: &mut Run,
+        observation: &crate::provider::Observation,
+        transcript: &mut String,
+        run_id: &str,
+        step: usize,
+        index: usize,
+        usage_phase: &str,
+        pending: &mut Vec<(crate::provider::CallId, String)>,
+    ) -> Result<()> {
+        if !run.child {
+            self.store.observed_usage(
+                run.channel,
+                &run.settings.0,
+                &observation.response.usage,
+                usage_phase,
+            )?;
+        }
+        let completed = observation.completed.clone();
+        let entries = observation.entries.clone().unwrap_or_else(|| {
+            observation
+                .response
+                .texts
+                .iter()
+                .map(|(text, thought)| {
+                    (
+                        if *thought {
+                            crate::provider::ObservationKind::Thought
+                        } else {
+                            crate::provider::ObservationKind::Reply
+                        },
+                        text.clone(),
+                    )
+                })
+                .collect()
+        });
+        let entries = completed.unwrap_or_else(|| {
+            entries
+                .into_iter()
+                .map(|(kind, text)| crate::provider::CompletedEntry {
+                    kind,
+                    text,
+                    of: None,
+                })
+                .collect()
+        });
+        for entry in &entries {
+            let (kind, text) = (&entry.kind, &entry.text);
+            if matches!(kind, crate::provider::ObservationKind::Tool)
+                && let Some(id) = &entry.of
+            {
+                if let Some((_, prior)) = pending.iter_mut().find(|(key, _)| key == id) {
+                    *prior = text.clone();
+                } else {
+                    pending.push((id.clone(), text.clone()));
+                }
+                continue;
+            }
+            let mut paired = Vec::new();
+            if let Some(id) = &entry.of
+                && let Some(at) = pending.iter().position(|(key, _)| key == id)
+            {
+                let (_, tool) = pending.remove(at);
+                paired.push((Kind::Tool, tool));
+            }
+            if matches!(kind, crate::provider::ObservationKind::Echo) {
+                paired.push((Kind::Echo, text.clone()));
+                self.log_run_batch(run, &paired).await?;
+                continue;
+            }
+            // Non-Echo matching Entries are unusual, but the upstream callback
+            // publishes their buffered call in the same synchronous hold too.
+            if !paired.is_empty() {
+                let kind = match kind {
+                    crate::provider::ObservationKind::Tool => Kind::Tool,
+                    _ => Kind::Talk,
+                };
+                paired.push((kind, text.clone()));
+                self.log_run_batch(run, &paired).await?;
+                if kind == Kind::Talk {
+                    transcript.push_str(text);
+                    transcript.push('\n');
+                }
+                continue;
+            }
+
+            // Completed public Entries already use ECMAScript trimming.
+            // Rust whitespace additionally removes NEL, which is real reply text.
+            if crate::memory::summary_trim(text).is_empty() {
+                continue;
+            }
+            if matches!(kind, crate::provider::ObservationKind::Tool) {
+                self.log_run(run, Kind::Tool, text).await?;
+                continue;
+            }
+            if matches!(kind, crate::provider::ObservationKind::Thought) {
+                if self.config.agent.show_reasoning && !run.child {
+                    self.store.break_activity(run.channel)?;
+                    for chunk in split_message(text, None) {
+                        let _ = self
+                            .discord
+                            .send(run.channel, &chunk, None, &uuid::Uuid::new_v4().to_string())
+                            .await;
+                    }
+                }
+            } else {
+                self.log_run(run, Kind::Talk, text).await?;
+                transcript.push_str(text);
+                transcript.push('\n');
+            }
+        }
+        if observation.intermediate && !run.child {
+            let text = observation
+                .response
+                .texts
+                .iter()
+                .filter(|(_, thought)| !*thought)
+                .map(|(text, _)| text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if !text.is_empty() {
+                self.notice(
+                    &format!("{run_id}:{step}:native:{index}"),
+                    run.channel,
+                    None,
+                    &text,
+                )?;
+            }
+        }
+        Ok(())
+    }
     async fn log_run(&self, run: &mut Run, kind: Kind, text: &str) -> Result<()> {
+        self.log_run_batch(run, &[(kind, text.to_owned())]).await
+    }
+    // Match Chat.hold's synchronous publication boundary: no root arrival or
+    // compactor may observe the middle of a completed call/result or unanswered
+    // batch. Each append still fsyncs and fails closed. This is mutex isolation,
+    // not a multi-record crash transaction: a disk failure can retain a prefix.
+    async fn log_run_batch(&self, run: &mut Run, entries: &[(Kind, String)]) -> Result<()> {
         if let Some(trace) = run.trace.as_mut() {
-            trace.append(kind, text)?;
+            for (kind, text) in entries {
+                trace.append(*kind, text)?;
+            }
         } else {
-            Self::append(&run.memory, kind, text).await?;
+            let mut memory = run.memory.memory.lock().await;
+            // The position is used only by the deterministic test-only contention seam.
+            #[allow(clippy::unused_enumerate_index)]
+            for (_index, (kind, text)) in entries.iter().enumerate() {
+                memory.append(*kind, text)?;
+                #[cfg(test)]
+                if _index == 0
+                    && entries.len() > 1
+                    && let Some((arrived, release)) = &self.native_batch_paused
+                {
+                    arrived.notify_one();
+                    release.notified().await;
+                }
+            }
+            drop(memory);
+            run.memory.changed.notify_waiters();
         }
         Ok(())
     }
@@ -1185,7 +1571,7 @@ impl Harness {
                         run.channel,
                         std::slice::from_ref(&input.id),
                         &run.settings.0,
-                        crate::attachments::budget_with_media(
+                        crate::attachments::budget_with_native_media(
                             &run.settings.0,
                             &run.history,
                             &run.media,
@@ -1229,7 +1615,17 @@ impl Harness {
             "tool {} is unavailable to this agent",
             call.name
         );
-        let a = &call.arguments;
+        let schema = tools::definitions_with_claude(
+            run.child,
+            self.config.agent.coordinator_root,
+            self.config.claude.enabled,
+        )
+        .into_iter()
+        .find(|tool| tool["name"] == call.name)
+        .expect("tool validated");
+        call.arguments
+            .validate_builtin(&schema["input_schema"], call.name == "mcp")?;
+        let a: &Value = &call.arguments;
         let value = match call.name.as_str() {
             "models" => self.discord.models.report(
                 a["provider"].as_str(),
@@ -1258,11 +1654,11 @@ impl Harness {
             "mcp" => {
                 let mut value = self
                     .mcp
-                    .execute(
+                    .execute_input(
                         run.channel,
                         run.child,
                         self.config.agent.coordinator_root,
-                        a,
+                        &call.arguments,
                         &run.cancel,
                     )
                     .await?;
@@ -1291,7 +1687,7 @@ impl Harness {
                         &p,
                         &run.settings.0,
                         a["page"].as_u64(),
-                        crate::attachments::budget_with_media(
+                        crate::attachments::budget_with_native_media(
                             &run.settings.0,
                             &run.history,
                             &run.media,
@@ -1334,7 +1730,7 @@ impl Harness {
                                 &path,
                                 &run.settings.0,
                                 a["page"].as_u64(),
-                                crate::attachments::budget_with_media(
+                                crate::attachments::budget_with_native_media(
                                     &run.settings.0,
                                     &run.history,
                                     &run.media,
@@ -1367,7 +1763,7 @@ impl Harness {
                 let id = format!(
                     "file-{}",
                     hex::encode(sha2::Sha256::digest(
-                        format!("{}:{}", run.invocation_scope, call.id).as_bytes()
+                        call.id.scoped_preimage(&run.invocation_scope)
                     ))
                 );
                 ensure!(!run.cancel.is_cancelled(), "file snapshot cancelled");
@@ -2009,7 +2405,7 @@ impl Harness {
         let args = Value::Object(args);
         let c = self.channel(channel).await?;
         let _settings_guard = if matches!(name, "model" | "reasoning") {
-            Some(c.settings_lock.lock().await)
+            Some(if args["kind"] == "compact" { self.compactor_settings.lock().await } else { c.settings_lock.lock().await })
         } else {
             None
         };
@@ -2277,11 +2673,11 @@ impl Harness {
                     let effort = self.reasoning_for_model(&target, &effort)?;
                     if kind == "compact" {
                         self.store.set_compactor_model(
-                            channel,
+                            GLOBAL_COMPACTOR,
                             if id == "default" { None } else { Some(&target) },
                         )?;
                         self.discord.models.set_kind_model(
-                            channel,
+                            GLOBAL_COMPACTOR,
                             "compact",
                             if id == "default" { None } else { Some(&target) },
                         )?;
@@ -2297,10 +2693,10 @@ impl Harness {
                 }
                 let compact = self
                     .store
-                    .compactor_model(channel, &self.config.agent.compactor_model)?;
+                    .compactor_model(GLOBAL_COMPACTOR, &self.config.agent.compactor_model)?;
                 return Ok(crate::ui::card(
                     "Model",
-                    "Overrides apply only to this chat and survive restart. Chat changes apply next turn; compactor changes apply to newly started jobs. Use model:default to return to config defaults.",
+                    "Chat overrides apply only to this channel; compaction overrides apply instance-wide. Both survive restart. Changes affect newly started turns/jobs. Use model:default to return to config defaults.",
                     vec![
                         ("Selected kind", format!("`{kind}`"), true),
                         ("Chat model", format!("`{model}`"), false),
@@ -2316,10 +2712,11 @@ impl Harness {
                     ["chat", "compact", "curator"].contains(&kind),
                     "Reasoning kind must be chat, compact or curator"
                 );
+                let scope = if kind == "compact" { GLOBAL_COMPACTOR } else { channel };
                 let target = match kind {
                     "compact" => self
                         .store
-                        .compactor_model(channel, &self.config.agent.compactor_model)?,
+                        .compactor_model(GLOBAL_COMPACTOR, &self.config.agent.compactor_model)?,
                     "curator" => crate::curator::effective_model(
                         &model,
                         &self.config.agent.model,
@@ -2332,7 +2729,7 @@ impl Harness {
                     if level == "inherit" {
                         ensure!(kind == "curator", "inherit is available for the curator");
                         self.store
-                            .set_reasoning_override(channel, kind, Some("inherit"))?;
+                            .set_reasoning_override(scope, kind, Some("inherit"))?;
                     } else if level == "default" {
                         if kind == "chat" {
                             reasoning = self
@@ -2341,7 +2738,7 @@ impl Harness {
                                 .reasoning(&model, &self.config.agent.reasoning);
                             self.store.set_settings(channel, &model, &reasoning)?;
                         } else {
-                            self.store.set_reasoning_override(channel, kind, None)?;
+                            self.store.set_reasoning_override(scope, kind, None)?;
                         }
                     } else {
                         self.discord.models.validate_effort(&target, level)?;
@@ -2351,7 +2748,7 @@ impl Harness {
                             self.store.set_settings(channel, &model, &reasoning)?;
                         } else {
                             self.store
-                                .set_reasoning_override(channel, kind, Some(&level))?;
+                                .set_reasoning_override(scope, kind, Some(&level))?;
                         }
                     }
                 }
@@ -2359,13 +2756,13 @@ impl Harness {
                     "curator" => self.curator_settings(channel).await?.1,
                     "compact" => self
                         .store
-                        .reasoning_override(channel, "compact")?
+                        .reasoning_override(GLOBAL_COMPACTOR, "compact")?
                         .unwrap_or_else(|| self.discord.models.reasoning(&target, "medium")),
                     _ => reasoning,
                 };
                 return Ok(crate::ui::card(
                     "Reasoning effort",
-                    "Changes apply to new turns or jobs; running jobs keep their model and effort.",
+                    "Compaction effort is instance-global; chat/curator effort is channel-owned. Changes apply to new turns/jobs; running jobs keep their settings.",
                     vec![
                         ("Kind", kind.into(), true),
                         ("Model", target, false),
@@ -2376,7 +2773,8 @@ impl Harness {
             }
             "cache" => return self.store.cache_card(channel),
             "context" => {
-                let stats = c.memory.lock().await.stats();
+                let mut stats = c.memory.lock().await.stats();
+                stats["scope"] = json!("instance-global");
                 let operational = self.store.stats(channel)?;
                 return Ok(crate::ui::context_card(
                     &self.config,
@@ -2937,7 +3335,7 @@ impl Harness {
         workers.abort_all();
         Ok(())
     }
-    async fn compactor(self: Arc<Self>, channel: u64, c: Arc<Channel>) -> Result<()> {
+    async fn compactor(self: Arc<Self>, channel: u64, c: Arc<SharedMemory>) -> Result<()> {
         let mut workers = tokio::task::JoinSet::new();
         let mut busy = HashSet::new();
         let mut retry: HashMap<NodeKey, Instant> = HashMap::new();
@@ -2987,7 +3385,19 @@ impl Harness {
             tokio::select! {
                 Some(done)=workers.join_next(),if !workers.is_empty()=>{
                     match done {
-                        Ok((key,Ok(text)))=>{busy.remove(&key);retry.remove(&key);c.memory.lock().await.finish(key,&text)?;c.changed.notify_waiters();}
+                        Ok((key,Ok(text)))=>{
+                            busy.remove(&key);retry.remove(&key);
+                            #[cfg(test)]
+                            c.compaction_selected.notify_one();
+                            let mut memory=c.memory.lock().await;
+                            // Publication admission linearizes at this check under
+                            // the memory lock, with no await before synchronous finish.
+                            // An already-started journal/fsync may finish during cancel.
+                            if self.shutdown.is_cancelled() { break; }
+                            memory.finish(key,&text)?;
+                            drop(memory);
+                            c.changed.notify_waiters();
+                        }
                         Ok((key,Err(e)))=>{busy.remove(&key);retry.insert(key,Instant::now()+Duration::from_secs(10));if reported.insert(key){tracing::warn!(error=%e,level=key.level,index=key.index,"summary failed; retrying every 10s");}}
                         Err(e)=>bail!("compactor worker panic: {e}"),
                     }
@@ -3041,7 +3451,7 @@ impl Harness {
             &self.curator_instructions,
         );
         let step = crate::memory::compaction_task(key, source);
-        let original = Provider::start(vendor, context, &step);
+        let original = Provider::start_compaction(vendor, context, &step);
         let mut note: Option<String> = None;
         let mut best: Option<String> = None;
         let provider = self
@@ -3053,27 +3463,29 @@ impl Harness {
         for _ in 0..5 {
             let mut history = original.clone();
             if let Some(note) = &note {
-                history.push(Provider::user(vendor, note));
+                // Unii appends one correction BLOCK to the original User item,
+                // not another message/turn. No previous model output is replayed.
+                let block = Provider::user(vendor, note)["content"][0].clone();
+                history
+                    .last_mut()
+                    .unwrap()
+                    .edit_host(|v| v["content"].as_array_mut().unwrap().push(block));
             }
-            let response = match provider
-                .step(model, reasoning, &system, &history, &[])
-                .await
+            // AskAI's patient owner retries setup/down failures on the same
+            // frozen correction after 60s. Outages are not answered length tries,
+            // never release the native reservation, and never publish best early.
+            let response = match crate::provider::patient_compaction(&self.shutdown, || {
+                provider.step_compaction(model, reasoning, &system, &history)
+            })
+            .await
             {
                 Ok(response) => response,
-                Err(error) => {
-                    if let Some(best) = best {
-                        return Ok(best);
-                    }
-                    return Err(error);
-                }
+                Err(error) => return best.ok_or(error),
             };
-            let line = response
-                .texts
-                .iter()
-                .filter(|(_, thought)| !*thought)
-                .map(|(t, _)| t.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
+            let line = match response {
+                crate::provider::CompactionReply::Answer(line) => line,
+                crate::provider::CompactionReply::ModelFailure => break,
+            };
             let line = crate::memory::summary_trim(&line).to_owned();
             if line.is_empty() {
                 break;
@@ -3086,8 +3498,10 @@ impl Harness {
             }
             note = Some(crate::memory::compaction_over(&line));
         }
-        // An answered refusal/empty line is its input's doing: retain a clipped
-        // source, just like UniiChat. Transport failures remain patient retries.
+        // Explicit model failure/refusal/incomplete and completed-empty are
+        // semantic ends, never refusal prose as a summary. Keep prior shortest,
+        // otherwise upstream flat-source fallback. Generic errors are retried
+        // by the patient owner above; cancellation never fabricates a summary.
         Ok(best.unwrap_or_else(|| crate::memory::compaction_fallback(source)))
     }
 }
@@ -3109,6 +3523,7 @@ mod tests {
     ) -> axum::response::Response {
         use axum::response::IntoResponse;
         let streaming = body["stream"] == true;
+        let anthropic = body.get("messages").is_some() && body.get("input").is_none();
         let zai = body["model"]
             .as_str()
             .is_some_and(|id| id.starts_with("glm-"));
@@ -3137,11 +3552,42 @@ mod tests {
                 }
             }
             ([(axum::http::header::CONTENT_TYPE,"text/event-stream")],format!("data: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"index":0,"delta":delta,"finish_reason":choice["finish_reason"]}],"usage":response["usage"]}))).into_response()
+        } else if streaming && anthropic {
+            let mut events = vec![
+                json!({"type":"message_start","message":{"role":"assistant","content":[],"usage":response["usage"]}}),
+            ];
+            for (index, block) in response["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                events.push(
+                    json!({"type":"content_block_start","index":index,"content_block":block}),
+                );
+                events.push(json!({"type":"content_block_stop","index":index}));
+            }
+            events.push(
+                json!({"type":"message_delta","delta":{"stop_reason":response["stop_reason"]}}),
+            );
+            events.push(json!({"type":"message_stop"}));
+            (
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                events
+                    .into_iter()
+                    .map(|e| format!("data: {e}\n\n"))
+                    .collect::<String>(),
+            )
+                .into_response()
         } else if streaming {
-            axum::response::Response::new(axum::body::Body::from(format!(
-                "data: {}\n\n",
-                json!({"type":"response.completed","response":response})
-            )))
+            (
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                format!(
+                    "data: {}\n\n",
+                    json!({"type":"response.completed","response":response})
+                ),
+            )
+                .into_response()
         } else {
             Json(response).into_response()
         }
@@ -3189,9 +3635,8 @@ mod tests {
         let mut h = Harness::new(config, discord, CancellationToken::new()).unwrap();
         Arc::get_mut(&mut h).unwrap().provider = Provider::mock(format!("http://{address}/"));
         let c = Arc::new(Channel {
+            shared: h.shared.clone(),
             settings_lock: Mutex::new(()),
-            memory: Mutex::new(Memory::open(directory.path().join("memory"), 128000).unwrap()),
-            changed: Notify::new(),
             incoming: Notify::new(),
             cancel: Mutex::new(None),
         });
@@ -3602,7 +4047,7 @@ mod tests {
             fixture("openai", vec![final_response("openai", "")]).await;
         let output: Value = serde_json::from_str(&h.execute_tool(&mut run, &ToolCall {
             id: "spawn-silent".into(), name: "spawn".into(),
-            arguments: json!({"tasks":[{"name":"Silent worker","task":"Finish without a visible reply"}]}),
+            arguments: json!({"tasks":[{"name":"Silent worker","task":"Finish without a visible reply"}]}).into(),
         }).await.unwrap()).unwrap();
         let id = output["ids"][0].as_str().unwrap();
         mock.started.notified().await;
@@ -3711,7 +4156,7 @@ mod tests {
         let call = ToolCall {
             id: "named".into(),
             name: "spawn".into(),
-            arguments: json!({"tasks":[{"name":"Docs Scout","task":"Research documentation","model":"anthropic/test","reasoning":"low"}]}),
+            arguments: json!({"tasks":[{"name":"Docs Scout","task":"Research documentation","model":"anthropic/test","reasoning":"low"}]}).into(),
         };
         let result =
             tokio::time::timeout(Duration::from_millis(500), h.execute_tool(&mut run, &call))
@@ -3749,7 +4194,7 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
-    async fn model_overrides_and_efforts_are_chat_local_and_survive_restart() {
+    async fn model_overrides_keep_chat_local_and_compactor_global_across_restart() {
         let (dir, h, _run, _mock, server) = fixture("openai", vec![]).await;
         let mut alpha = crate::models::Model::plain("alpha");
         alpha.efforts = vec!["low".into(), "high".into()];
@@ -3781,7 +4226,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            h.store.compactor_model(1, "fallback").unwrap(),
+            h.store.compactor_model(GLOBAL_COMPACTOR, "fallback").unwrap(),
             "openai/beta"
         );
         assert_eq!(
@@ -3796,7 +4241,7 @@ mod tests {
         );
         let reopened = Store::open(&dir.path().join("state/runtime.sqlite")).unwrap();
         assert_eq!(
-            reopened.compactor_model(1, "fallback").unwrap(),
+            reopened.compactor_model(GLOBAL_COMPACTOR, "fallback").unwrap(),
             "openai/beta"
         );
         assert_eq!(
@@ -3849,7 +4294,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            h.store.compactor_model(1, "new-config-default").unwrap(),
+            h.store.compactor_model(GLOBAL_COMPACTOR, "new-config-default").unwrap(),
             "new-config-default"
         );
         assert_eq!(h.config.agent.model, "openai/test");
@@ -3857,7 +4302,7 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
-    async fn compactor_pins_running_jobs_and_picks_up_channel_overrides_for_new_jobs() {
+    async fn compactor_pins_running_jobs_and_picks_up_global_overrides_for_new_jobs() {
         let (_dir, h, run, mock, server) = fixture(
             "openai",
             vec![
@@ -3867,7 +4312,7 @@ mod tests {
         )
         .await;
         h.store
-            .set_compactor_model(1, Some("openai/first"))
+            .set_compactor_model(GLOBAL_COMPACTOR, Some("openai/first"))
             .unwrap();
         run.memory
             .memory
@@ -3875,11 +4320,11 @@ mod tests {
             .await
             .append(Kind::Talk, &"long source ".repeat(100))
             .unwrap();
-        let worker = tokio::spawn(h.clone().compactor(1, run.memory.clone()));
+        let worker = tokio::spawn(h.clone().compactor(GLOBAL_COMPACTOR, run.memory.shared.clone()));
         mock.started.notified().await;
         assert_eq!(mock.requests.lock().await[0]["model"], "first");
         h.store
-            .set_compactor_model(1, Some("openai/second"))
+            .set_compactor_model(GLOBAL_COMPACTOR, Some("openai/second"))
             .unwrap();
         run.memory.changed.notify_one();
         mock.release.notify_one();
@@ -3972,7 +4417,7 @@ mod tests {
             &ToolCall {
                 id: "s".into(),
                 name: "web_search".into(),
-                arguments: json!({"query":"official docs"}),
+                arguments: json!({"query":"official docs"}).into(),
             },
         )
         .await
@@ -4054,7 +4499,7 @@ mod tests {
         let add = ToolCall {
             id: "job".into(),
             name: "wakeup".into(),
-            arguments: json!({"action":"add","schedule":"in 5s","prompt":"check"}),
+            arguments: json!({"action":"add","schedule":"in 5s","prompt":"check"}).into(),
         };
         let reply: Value =
             serde_json::from_str(&h.execute_tool(&mut run, &add).await.unwrap()).unwrap();
@@ -4062,7 +4507,7 @@ mod tests {
         let cancel = ToolCall {
             id: "cancel".into(),
             name: "wakeup".into(),
-            arguments: json!({"action":"cancel","id":reply["id"]}),
+            arguments: json!({"action":"cancel","id":reply["id"]}).into(),
         };
         run.child = false;
         run.owner = "channel:1".into();
@@ -4100,7 +4545,7 @@ mod tests {
                 &ToolCall {
                     id: "claude".into(),
                     name: "claude".into(),
-                    arguments: json!({"name":"review","task":"inspect this"}),
+                    arguments: json!({"name":"review","task":"inspect this"}).into(),
                 },
             )
             .await
@@ -4138,10 +4583,10 @@ mod tests {
     #[tokio::test]
     async fn claude_invalid_requests_disabled_and_strict_root_create_no_jobs() {
         let (_directory, mut h, mut run, _mock, server) = fixture("openai", vec![]).await;
-        let call = |arguments| ToolCall {
+        let call = |arguments: Value| ToolCall {
             id: "claude-invalid".into(),
             name: "claude".into(),
-            arguments,
+            arguments: arguments.into(),
         };
         assert!(
             h.execute_tool(&mut run, &call(json!({"task":"x"})))
@@ -4196,7 +4641,7 @@ mod tests {
             let call = ToolCall {
                 id: "bounded-job".into(),
                 name: "claude".into(),
-                arguments: json!({"task":"x"}),
+                arguments: json!({"task":"x"}).into(),
             };
             let result: Value =
                 serde_json::from_str(&h.execute_tool(&mut run, &call).await.unwrap()).unwrap();
@@ -4261,7 +4706,7 @@ mod tests {
             &ToolCall {
                 id: "failed-job".into(),
                 name: "claude".into(),
-                arguments: json!({"task":"x"}),
+                arguments: json!({"task":"x"}).into(),
             },
         )
         .await
@@ -4310,7 +4755,8 @@ mod tests {
                         "task":"Reply with exactly CLAUDE_RUNTIME_SMOKE_OK. Do not use tools.",
                         "model":"opus",
                         "effort":"low"
-                    }),
+                    })
+                    .into(),
                 },
             )
             .await
@@ -4391,7 +4837,7 @@ mod tests {
         let spawn = ToolCall {
             id: "spawn".into(),
             name: "spawn".into(),
-            arguments: json!({"tasks":["handle background work"]}),
+            arguments: json!({"tasks":["handle background work"]}).into(),
         };
         let response: Value =
             serde_json::from_str(&h.execute_tool(&mut run, &spawn).await.unwrap()).unwrap();
@@ -4418,7 +4864,7 @@ mod tests {
             &ToolCall {
                 id: "tell".into(),
                 name: "tell".into(),
-                arguments: json!({"id":id,"message":"[shell job] completed successfully"}),
+                arguments: json!({"id":id,"message":"[shell job] completed successfully"}).into(),
             },
         )
         .await
@@ -4605,7 +5051,7 @@ mod tests {
         let call = ToolCall {
             id: "shell-call".into(),
             name: "shell".into(),
-            arguments: json!({"command":"sleep 0.1; printf done"}),
+            arguments: json!({"command":"sleep 0.1; printf done"}).into(),
         };
         h.store
             .start_tool_activity(&run.owner, &run.context, 1, "public-call", &call)
@@ -4686,7 +5132,7 @@ mod tests {
         let call = ToolCall {
             id: "spawn-call".into(),
             name: "spawn".into(),
-            arguments: json!({"tasks":["independent task one","independent task two"]}),
+            arguments: json!({"tasks":["independent task one","independent task two"]}).into(),
         };
         let response =
             tokio::time::timeout(Duration::from_secs(1), h.execute_tool(&mut run, &call))
@@ -4807,12 +5253,12 @@ mod tests {
             ToolCall {
                 id: "find".into(),
                 name: "list_agents".into(),
-                arguments: json!({"kind":"coordinators"}),
+                arguments: json!({"kind":"coordinators"}).into(),
             },
             ToolCall {
                 id: "tell".into(),
                 name: "tell".into(),
-                arguments: json!({"id":"channel:3","message":"forbidden"}),
+                arguments: json!({"id":"channel:3","message":"forbidden"}).into(),
             },
         ] {
             assert!(h.execute_tool(&mut run, &call).await.is_err());
@@ -4824,7 +5270,7 @@ mod tests {
             &ToolCall {
                 id: "tell".into(),
                 name: "tell".into(),
-                arguments: json!({"id":"channel:3","message":"please share findings"}),
+                arguments: json!({"id":"channel:3","message":"please share findings"}).into(),
             },
         )
         .await
@@ -4913,7 +5359,8 @@ mod tests {
         let spawn = ToolCall {
             id: "spawn".into(),
             name: "spawn".into(),
-            arguments: json!({"tasks":[{"name":"Delayed Greeter","task":"Wait, then say hi"}]}),
+            arguments: json!({"tasks":[{"name":"Delayed Greeter","task":"Wait, then say hi"}]})
+                .into(),
         };
         let response: Value =
             serde_json::from_str(&h.execute_tool(&mut run, &spawn).await.unwrap()).unwrap();
@@ -5066,7 +5513,7 @@ mod tests {
         let call = ToolCall {
             id: "load".into(),
             name: "skill".into(),
-            arguments: json!({"action":"load","id":"research"}),
+            arguments: json!({"action":"load","id":"research"}).into(),
         };
         let pinned: Value =
             serde_json::from_str(&h.execute_tool(&mut run, &call).await.unwrap()).unwrap();
@@ -5165,7 +5612,10 @@ for line in sys.stdin:
     include!("runtime_attachment_tests.rs");
     include!("runtime_curator_tests.rs");
     include!("runtime_optmem_tests.rs");
+    include!("runtime_compaction_parity_tests.rs");
     include!("runtime_request_retry_tests.rs");
+    include!("runtime_native_parity_tests.rs");
+    include!("runtime_route_parity_tests.rs");
     #[tokio::test]
     async fn zai_tool_loop_preserves_native_reasoning_but_never_publishes_or_logs_it() {
         let calls = json!({"choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","content":"Working","reasoning_content":"private-glm-native-reasoning","tool_calls":[{"id":"a","type":"function","function":{"name":"read","arguments":"{\"path\":\"picture.png\"}"}},{"id":"b","type":"function","function":{"name":"write","arguments":"{\"path\":\"result.txt\",\"text\":\"verified\"}"}}]}}],"usage":{"prompt_tokens":20,"completion_tokens":10}});
@@ -5246,4 +5696,5 @@ for line in sys.stdin:
         );
         server.abort();
     }
+    include!("runtime_global_memory_tests.rs");
 }

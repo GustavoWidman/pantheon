@@ -18,9 +18,10 @@ Normal diagnostics exclude request bodies, response bodies, tool arguments, reas
 
 Tools are still dispatched only after a complete provider response. “No tools from this response executed” refers to that failed response; earlier steps can already have completed tool effects.
 
-## Bounded request retries
+## Generic configurable request retries
 
-All inference and hosted-search requests share the service's provider policy:
+Codex/Z.ai inference and hosted-search requests use this configurable policy.
+Native public OpenAI/Anthropic turns use the separate policy below:
 
 ```toml
 [agent]
@@ -60,13 +61,35 @@ Successful usage accounting covers the completed response; failed generations ca
 consume provider work whose usage was not returned. Request counts, existing
 deadlines and curator bounds remain the limits on that additional work.
 
-This policy applies to chat, workers, compaction, curation and hosted search.
-Discord REST delivery, model/price discovery and the compactor's outer ten-second
-job retry retain their separate policies.
+This generic policy applies to the named transports, not native public turns.
+Discord REST and model/price discovery remain separate. The native compactor's
+outer patient owner waits60 seconds on outage, retaining the frozen corrected
+call/reservation; it does not consume an answered length attempt.
+
+## Native public memory-turn lifecycle
+
+Native public OpenAI/Anthropic root, worker, curator and compactor calls follow
+pinned UniiChat Agent transport: at most8 requests, literal x-should-retry header
+overrides,408/409/429 or5xx busy statuses,2/4/8/16/32/64/128-second exponential
+backoff. Positive JavaScript-number Retry-After replaces that wait; HTTP dates
+are not interpreted, Infinity/overflow timers normalize to1ms as in Bun.
+OpenAI server_error is busy; answered semantic failures are not outages.
+Anthropic error events are busy. Malformed/EOF/network/idle errors retry, while
+local submission/admission and size-safety failures stop without redispatch.
+
+Native HTTP has no absolute request timeout. Parsed JSON data lines refresh a
+1200-second OpenAI or300-second Anthropic idle deadline, starting before headers.
+Comments and partial byte chunks do not refresh it. Native Linux sockets disable
+the unrelated30-second TCP_USER_TIMEOUT. Generic configuration fields still
+control Codex/Z.ai/search and are not silently treated as native idle settings.
+Cancellation drops requests/cache guards/sleeps. A native partial stream can
+produce inert stopped/cutoff history; it never executes incomplete ToolCalls.
+Thoughts remain UI-only; request diagnostics never contain those text bodies.
+See compactor-adapter.md for ordinary observations and scope/safety differences.
 
 ## Linux TCP timeout policy and local reproduction
 
-The provider client aligns Linux `TCP_USER_TIMEOUT` with
+The generic provider client aligns Linux `TCP_USER_TIMEOUT` with
 `agent.request_timeout_seconds`, instead of inheriting reqwest 0.12's independent
 30-second default. Reqwest's overall request deadline still bounds the entire
 request (including streaming), and `/stop` still cancels it immediately. TCP

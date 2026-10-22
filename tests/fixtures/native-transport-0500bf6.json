@@ -1,0 +1,188 @@
+{
+  "upstream": "0500bf6a8ea4bf0ce047488562022b1b6532cc30",
+  "network": "synthetic Response only; no sockets",
+  "path": "actual Agent.step/request/send/stream/events; custom wire; fake nap/clock",
+  "records": [
+    {
+      "name": "busy-exhaustion-eight",
+      "calls": 8,
+      "naps": [
+        2000,
+        4000,
+        8000,
+        16000,
+        32000,
+        64000,
+        128000
+      ],
+      "stop": "down",
+      "roomReleased": true
+    },
+    {
+      "name": "eighth-answer",
+      "calls": 8,
+      "naps": [
+        2000,
+        4000,
+        8000,
+        16000,
+        32000,
+        64000,
+        128000
+      ],
+      "stop": "done",
+      "roomReleased": true
+    },
+    {
+      "name": "status-400-override-true",
+      "calls": 2,
+      "naps": [
+        2000
+      ],
+      "stop": "done",
+      "roomReleased": true
+    },
+    {
+      "name": "status-503-override-false",
+      "calls": 1,
+      "naps": [],
+      "stop": "down",
+      "roomReleased": true
+    },
+    {
+      "name": "status-429-override-false",
+      "calls": 1,
+      "naps": [],
+      "stop": "down",
+      "roomReleased": true
+    },
+    {
+      "name": "status-409-override-null",
+      "calls": 2,
+      "naps": [
+        2000
+      ],
+      "stop": "done",
+      "roomReleased": true
+    },
+    {
+      "name": "status-408-override-null",
+      "calls": 2,
+      "naps": [
+        2000
+      ],
+      "stop": "done",
+      "roomReleased": true
+    },
+    {
+      "name": "status-401-override-null",
+      "calls": 1,
+      "naps": [],
+      "stop": "down",
+      "roomReleased": true
+    },
+    {
+      "name": "retry-after-0",
+      "calls": 2,
+      "naps": [
+        2000
+      ],
+      "stop": "done",
+      "roomReleased": true
+    },
+    {
+      "name": "retry-after--1",
+      "calls": 2,
+      "naps": [
+        2000
+      ],
+      "stop": "done",
+      "roomReleased": true
+    },
+    {
+      "name": "retry-after-0.25",
+      "calls": 2,
+      "naps": [
+        250
+      ],
+      "stop": "done",
+      "roomReleased": true
+    },
+    {
+      "name": "retry-after-NaN",
+      "calls": 2,
+      "naps": [
+        2000
+      ],
+      "stop": "done",
+      "roomReleased": true
+    },
+    {
+      "name": "retry-after-Tue, 20 Oct 2026 16:00:00 GMT",
+      "calls": 2,
+      "naps": [
+        2000
+      ],
+      "stop": "done",
+      "roomReleased": true
+    },
+    {
+      "name": "retry-after-0x10",
+      "calls": 2,
+      "naps": [
+        16000
+      ],
+      "stop": "done",
+      "roomReleased": true
+    },
+    {
+      "name": "retry-after-2e-1",
+      "calls": 2,
+      "naps": [
+        200
+      ],
+      "stop": "done",
+      "roomReleased": true
+    },
+    {
+      "name": "retry-after-Infinity",
+      "calls": 2,
+      "naps": [
+        null
+      ],
+      "stop": "done",
+      "roomReleased": true
+    },
+    {
+      "name": "network-error-inner-retry",
+      "calls": 2,
+      "naps": [
+        2000
+      ],
+      "stop": "done",
+      "roomReleased": true
+    },
+    {
+      "name": "cancel-during-nap",
+      "calls": 1,
+      "naps": [
+        2000
+      ],
+      "stop": "lost",
+      "roomReleased": true
+    },
+    {
+      "name": "parsed-event-idle-refresh-not-bytes",
+      "initialIdle": 100,
+      "eventTimes": [
+        150,
+        250,
+        250
+      ],
+      "totalStreamTime": 250,
+      "finalDeadline": 350,
+      "cleared": true,
+      "note": "three parsed JSON data lines refresh; comment and partial byte chunks do not independently refresh. Queued reads may advance synthetic clock before refresh; no actual timer-triggered abort tested"
+    }
+  ]
+}

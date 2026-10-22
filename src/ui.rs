@@ -891,7 +891,22 @@ pub fn context_card(
     }
     let view = memory["view_bytes"].as_u64().unwrap_or(0);
     let budget = memory["view_budget_bytes"].as_u64().unwrap_or(1).max(1);
-    fields.push(("Memory view",format!("{}\n🟩 **{:.1} / {:.1} KiB · {:.1}%**\nCompacted view for the next fresh turn · byte budget",squares(&[(view,"🟩")],budget,20),view as f64 / 1024.0,budget as f64 / 1024.0,view as f64 / budget as f64 * 100.0),false));
+    fields.push((
+        "Coordinator memory view",
+        format!("{}\n🟩 **{} / {} bytes · {:.2} / {:.2} KiB · {:.1}%**\nBudgeted node-text bytes; next fresh turn. Scope: {}. Not the model token window.",
+            squares(&[(view,"🟩")],budget,20), number(view), number(budget),
+            view as f64 / 1024.0,budget as f64 / 1024.0,view as f64 / budget as f64 * 100.0,
+            memory["scope"].as_str().unwrap_or("caller-owned")), false,
+    ));
+    let compact_used = memory["compactor_view_bytes"].as_u64().unwrap_or(0);
+    let compact_budget = memory["compactor_budget_bytes"].as_u64()
+        .unwrap_or(crate::memory::COMPACTOR_BYTES as u64);
+    fields.push((
+        "Compactor memory view",
+        format!("**{} / {} bytes · {:.2} / {:.2} KiB**\nBudgeted rolling node-text bytes; not a cap on the coordinator. Rendering wrappers, system/tool prompts and current input are additional request content.",
+            number(compact_used), number(compact_budget), compact_used as f64 / 1024.0,
+            compact_budget as f64 / 1024.0), false,
+    ));
     fields.push((
         "Durable history",
         format!(
@@ -974,7 +989,7 @@ mod tests {
         crate::provider::ToolCall {
             id: "native-call".into(),
             name: "shell".into(),
-            arguments: json!({"command":"sleep 20"}),
+            arguments: json!({"command":"sleep 20"}).into(),
         }
     }
     #[test]
@@ -1018,7 +1033,7 @@ mod tests {
                 &crate::provider::ToolCall {
                     id: "later".into(),
                     name: "read".into(),
-                    arguments: json!({"path":"notes.txt"}),
+                    arguments: json!({"path":"notes.txt"}).into(),
                 },
             )
             .unwrap();
@@ -1186,9 +1201,11 @@ mod tests {
         let c = ReplyContext::request("100");
         for i in 0..25 {
             let call = crate::provider::ToolCall {
-                id: i.to_string(),
+                id: i.to_string().into(),
                 name: "shell".into(),
-                arguments: json!({"command":"cargo test --locked --all-targets 🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀"}),
+                arguments:
+                    json!({"command":"cargo test --locked --all-targets 🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀"})
+                        .into(),
             };
             let id = i.to_string();
             s.start_tool_activity("channel:1", &c, 1, &id, &call)
@@ -1256,7 +1273,7 @@ mod tests {
         assert_eq!(window.matches("⬛").count(), 60);
         assert!(field(&card, "Request breakdown").contains("Remaining  **600**"));
         assert!(field(&card, "Recorded request model").contains("anthropic/old"));
-        assert!(field(&card, "Memory view").contains("25.0%"));
+        assert!(field(&card, "Coordinator memory view").contains("25.0%"));
     }
     #[test]
     fn context_metadata_fallback_and_legacy_usage_do_not_invent_occupancy() {
@@ -1872,4 +1889,21 @@ mod tests {
         assert_eq!(out.reply_to, Some(100));
         assert_eq!(out.user, Some(2));
     }
+    #[test]
+    fn context_global_reports_independent_actual_payload_budgets_not_token_caps() {
+        let card = context_card(&crate::config::Config::default(), "openai/test", "low", &json!({
+            "scope":"instance-global", "view_bytes":64001, "view_budget_bytes":96000,
+            "compactor_view_bytes":17000,"compactor_budget_bytes":32000,"settled":false
+        }), &Value::Null);
+        let main = field(&card, "Coordinator memory view");
+        assert!(main.contains("64,001 / 96,000 bytes"));
+        assert!(main.contains("62.50 / 93.75 KiB"));
+        assert!(main.contains("instance-global"));
+        assert!(!main.contains("128,000"));
+        let compact = field(&card, "Compactor memory view");
+        assert!(compact.contains("17,000 / 32,000 bytes"));
+        assert!(compact.contains("16.60 / 31.25 KiB"));
+        assert!(compact.contains("additional request content"));
+    }
+
 }

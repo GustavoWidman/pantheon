@@ -7,7 +7,7 @@ fixture regeneration instructions are in [optmem-parity.md](optmem-parity.md).
 
 The engine accepts empty destinations or its own explicit native schema only.
 Daemon startup also requires an empty state namespace or the native root marker,
-and preflights every chat/subagent bank before opening operational databases or
+and preflights the global and every private subagent bank before opening operational databases or
 starting workers. This is a fresh-state break, not an in-place conversion; see
 [service.md](service.md#0210-native-state-boundary).
 Original pages and summary nodes are immutable fsynced daily JSONL records.
@@ -39,3 +39,14 @@ demand instead of cloning its contents.
 
 No active replay, import mode, alias resolver, compatibility reader or migration
 logic is part of this runtime. An offline tool is a separate work phase.
+
+## Instance-global scope
+
+Coordinator history is `state/memory`, shared across all admitted channels of one
+installation. Separate bots/state directories and private worker traces are not
+merged. Channel queues, replies, cancellation, tools and schedules retain their
+original ownership. The outer `pantheon-global-state-v2` marker rejects old
+channel-partitioned state read-only; there is no automatic merge or import.
+See [global-memory.md](global-memory.md) for ordering, provenance, settings and
+explicit offline transition requirements. `/context` reports main and compactor
+node-text occupancy independently, not total serialized request bytes.

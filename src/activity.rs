@@ -384,7 +384,7 @@ mod tests {
         let p = Presentation::call(&ToolCall {
             id: "c".into(),
             name: "shell".into(),
-            arguments: json!({"command":"curl -H 'Authorization: Bearer private-key' https://example.com\nPASSWORD=private-password"}),
+            arguments: json!({"command":"curl -H 'Authorization: Bearer private-key' https://example.com\nPASSWORD=private-password"}).into(),
         });
         assert!(!p.preview.contains("private-key"));
         assert!(!safe("TOKEN='secret value' ```\nhello", 64).contains("secret value"));

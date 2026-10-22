@@ -178,6 +178,54 @@ pub(super) fn keys(
     Some((out, ttl))
 }
 
+/// Preserve old keys byte-for-byte unless an included authoritative native
+/// prefix differs from the typed projection. Excluded task/turns never split.
+pub(super) fn native_keys(
+    model: &str,
+    body: &super::NativeValue,
+    identity: uuid::Uuid,
+) -> Option<(Vec<Key>, Duration)> {
+    use super::{NativeValue, entry_json::Json};
+    let (mut keys, ttl) = keys(model, body, identity)?;
+    let field = if model.starts_with("anthropic/") {
+        "messages"
+    } else {
+        "input"
+    };
+    let messages = body.field(field)?.elements();
+    let at = messages.iter().position(|v| v["role"] == "user")?;
+    let blocks = messages[at].field("content")?.elements();
+    let mut included = Vec::new();
+    let mut changed = false;
+    // Prefix context before the marked user block is included as upstream.
+    for m in &messages[..at] {
+        changed |= m.canonical() != NativeValue::from(m.projected()).canonical();
+        included.push(m.canonical());
+    }
+    for (key, block) in keys.iter_mut().zip(blocks) {
+        let mut block = block;
+        block.remove("cache_control");
+        block.remove("prompt_cache_breakpoint");
+        let canonical = block.canonical();
+        changed |= canonical
+            != Json::parse(&block.projected().to_string())
+                .ok()?
+                .stringify();
+        included.push(canonical);
+        if changed {
+            let mut hash = Sha256::new();
+            hash.update(b"pantheon-native-included-prefix-v1\0");
+            hash.update(*key);
+            for part in &included {
+                hash.update((part.len() as u64).to_le_bytes());
+                hash.update(part.as_bytes());
+            }
+            *key = hash.finalize().into();
+        }
+    }
+    Some((keys, ttl))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,6 +484,103 @@ mod tests {
             "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{}}}\n\n"
                 .to_owned();
         first.send(complete.clone()).unwrap();
+        second.send(complete).unwrap();
+        a.await.unwrap().unwrap();
+        b.await.unwrap().unwrap();
+        server.abort();
+    }
+    #[tokio::test]
+    async fn actual_compactor_anthropic_waiter_released_on_message_start_before_end() {
+        use axum::{
+            Router,
+            body::{Body, Bytes},
+            response::Response,
+            routing::post,
+        };
+        use futures_util::stream::unfold;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (seen, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        let app = Router::new().route(
+            "/",
+            post(move || {
+                let seen = seen.clone();
+                async move {
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                    seen.send(tx).unwrap();
+                    let stream = unfold(rx, |mut rx| async move {
+                        rx.recv()
+                            .await
+                            .map(|s| (Ok::<_, std::io::Error>(Bytes::from(s)), rx))
+                    });
+                    Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p = Provider::mock(format!("http://{}/", socket.local_addr().unwrap()));
+        let server = tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let history = Provider::start("anthropic", "<chat>\n0|same\n</chat>", "task");
+        let spawn = || {
+            let (p, admitted, history) = (p.clone(), admitted.clone(), history.clone());
+            tokio::spawn(async move {
+                let answer = p
+                    .step_compaction("anthropic/test", "high", "system", &history)
+                    .await;
+                admitted.fetch_add(1, Ordering::SeqCst);
+                answer
+            })
+        };
+        let a = spawn();
+        let first = observed.recv().await.unwrap();
+        let b = spawn();
+        // Observe subscription, not a timing assumption about the socket.
+        for _ in 0..1000 {
+            if p.cache_coordination
+                .entries
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, e)| e.writing.as_ref().is_some_and(|w| w.receiver_count() == 1))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(admitted.load(Ordering::SeqCst), 0);
+        assert!(
+            p.cache_coordination
+                .entries
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, e)| e.writing.as_ref().is_some_and(|w| w.receiver_count() == 1))
+        );
+        first.send("data: {\"type\":\"ping\"}\n\n".into()).unwrap();
+        // Ping is not Anthropic's reference ready event.
+        assert_eq!(admitted.load(Ordering::SeqCst), 0);
+        first
+            .send("data: {\"type\":\"message_start\",\"message\":{\"content\":[]}}\n\n".into())
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(3), observed.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(admitted.load(Ordering::SeqCst), 0);
+        assert!(
+            !a.is_finished(),
+            "waiter must release before leader response ends"
+        );
+        let complete =
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n"
+                .to_owned();
+        first.send(complete.clone()).unwrap();
+        second
+            .send("data: {\"type\":\"message_start\",\"message\":{\"content\":[]}}\n\n".into())
+            .unwrap();
         second.send(complete).unwrap();
         a.await.unwrap().unwrap();
         b.await.unwrap().unwrap();

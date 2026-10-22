@@ -67,9 +67,6 @@ async fn cli_and_direct_harness_refuse_incompatible_namespaces_before_writes() {
                 .arg("--config")
                 .arg(&config)
                 .arg(action);
-            if action == "export" || action == "import" {
-                command.args(["--channel", "1"]);
-            }
             if action == "export" {
                 command.arg("--output").arg(temp.path().join("out.html"));
             }

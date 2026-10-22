@@ -281,7 +281,8 @@ impl Catalog {
     pub fn set_chat_model(&self, channel: u64, model: &str) {
         self.chats.write().unwrap().1.insert(channel, model.into());
     }
-    /// Mirror durable channel model selections for deadline-safe autocomplete.
+    /// Mirror durable model selections for deadline-safe autocomplete.
+    /// Compact selection is installation-global (reserved scope zero).
     /// None removes an override: compact uses configuration; curator inherits
     /// its configured fallback, or the current non-GLM main model when unconfigured.
     /// Implicit GLM inheritance keeps the configured non-GLM main route or fails.
@@ -290,6 +291,7 @@ impl Catalog {
             ["chat", "compact", "curator"].contains(&kind),
             "invalid model kind"
         );
+        let channel = if kind == "compact" { 0 } else { channel };
         if kind == "chat" {
             let mut chats = self.chats.write().unwrap();
             if let Some(model) = model {
@@ -330,6 +332,7 @@ impl Catalog {
             )
             .ok();
         }
+        let channel = if kind == "compact" { 0 } else { channel };
         match kinds.overrides.get(&(channel, kind.into())) {
             Some(model) => Some(model.clone()),
             None => Some(kinds.defaults.get(kind).cloned().unwrap_or(main)),

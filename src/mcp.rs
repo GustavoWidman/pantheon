@@ -182,6 +182,31 @@ impl Mcp {
         args: &Value,
         cancel: &CancellationToken,
     ) -> Result<Value> {
+        self.execute_inner(channel, child, coordinator, args, None, cancel)
+            .await
+    }
+    /// Native arguments remain owned by the caller for the complete request;
+    /// authorization and transport/session ownership are shared with normal MCP.
+    pub(crate) async fn execute_input(
+        &self,
+        channel: u64,
+        child: bool,
+        coordinator: bool,
+        args: &crate::provider::ToolInput,
+        cancel: &CancellationToken,
+    ) -> Result<Value> {
+        self.execute_inner(channel, child, coordinator, args, Some(args), cancel)
+            .await
+    }
+    async fn execute_inner(
+        &self,
+        channel: u64,
+        child: bool,
+        coordinator: bool,
+        args: &Value,
+        native: Option<&crate::provider::ToolInput>,
+        cancel: &CancellationToken,
+    ) -> Result<Value> {
         let action = crate::tools::string(args, "action")?;
         if action == "servers" {
             return Ok(self.servers(channel, child));
@@ -252,7 +277,7 @@ impl Mcp {
             *client = Some(connected);
         }
         let result = tokio::select! {
-            r=invoke(client.as_ref().unwrap(),action,args)=>r,
+            r=invoke(client.as_ref().unwrap(),action,args,native)=>r,
             _=cancel.cancelled()=>Err(anyhow::anyhow!("MCP request cancelled; inspect effects before retrying")),
             _=tokio::time::sleep_until(deadline)=>Err(anyhow::anyhow!("MCP request timed out; inspect effects before retrying")),
         };
@@ -398,7 +423,12 @@ fn authorized(s: &ServerConfig, channel: u64, child: bool) -> bool {
     (!child || s.workers)
         && (s.allowed_channels.is_empty() || s.allowed_channels.contains(&channel))
 }
-async fn invoke(client: &Client, action: &str, args: &Value) -> Result<Value> {
+async fn invoke(
+    client: &Client,
+    action: &str,
+    args: &Value,
+    native: Option<&crate::provider::ToolInput>,
+) -> Result<Value> {
     let cursor = args
         .get("cursor")
         .and_then(Value::as_str)
@@ -420,17 +450,24 @@ async fn invoke(client: &Client, action: &str, args: &Value) -> Result<Value> {
                 })
                 .transpose()?
                 .unwrap_or_default();
-            response!(
-                client.call_tool(
-                    CallToolRequestParams::new(crate::tools::string(args, "tool")?.to_owned())
-                        .with_arguments(arguments)
-                )
-            )
+            let mut request =
+                CallToolRequestParams::new(crate::tools::string(args, "tool")?.to_owned())
+                    .with_arguments(arguments.clone());
+            if let Some(raw) = native.and_then(|input| input.member_canonical("arguments")) {
+                // Do not rebuild this from the lossy Rust view: escaped UTF16,
+                // number rounding and property enumeration are wire contracts.
+                ensure!(raw.starts_with('{'), "MCP arguments must be an object");
+                request = request.with_raw_arguments(rmcp::model::RawToolArguments::new(raw)?);
+            }
+            response!(client.call_tool(request))
         }
         "read_resource" => response!(client.read_resource(ReadResourceRequestParams::new(
             crate::tools::string(args, "uri")?.to_owned()
         ))),
         "get_prompt" => {
+            if let Some(native) = native {
+                native.validate_prompt_arguments()?;
+            }
             let mut request =
                 GetPromptRequestParams::new(crate::tools::string(args, "prompt")?.to_owned());
             if let Some(arguments) = args.get("arguments") {
@@ -444,5 +481,96 @@ async fn invoke(client: &Client, action: &str, args: &Value) -> Result<Value> {
             response!(client.get_prompt(request))
         }
         _ => bail!("unknown MCP action"),
+    }
+}
+
+#[cfg(test)]
+mod owned_lifecycle_tests {
+    use super::*;
+    #[tokio::test]
+    async fn native_stdio_owned_raw_call_close_and_cancel_kill_reap() {
+        use tokio::io::AsyncReadExt;
+        for cancel in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let script = format!(
+                r#"import sys,json,os,socket,time
+for line in sys.stdin:
+ with open('owned-rpc','ab') as f:f.write(line.encode())
+ r=json.loads(line)
+ if 'id' not in r:continue
+ if r['method']=='initialize':v={{'protocolVersion':'2025-11-25','capabilities':{{'tools':{{}}}},'serverInfo':{{'name':str(os.getpid()),'version':'1'}}}}
+ else:
+  if {cancel}:
+   s=socket.create_connection(('{host}',{port}));s.sendall(b'issued');time.sleep(300)
+  v={{'content':[{{'type':'text','text':'ok'}}]}}
+ print(json.dumps({{'jsonrpc':'2.0','id':r['id'],'result':v}}),flush=True)
+"#,
+                cancel = if cancel { "True" } else { "False" },
+                host = address.ip(),
+                port = address.port()
+            );
+            let cfg = ServerConfig {
+                command: Some("python3".into()),
+                args: vec!["-u".into(), "-c".into(), script],
+                ..Default::default()
+            };
+            let manager = Mcp::new(&McpConfig::default(), dir.path(), dir.path()).unwrap();
+            let mut client = manager.connect(&cfg).await.unwrap();
+            let pid = client
+                .peer()
+                .peer_info()
+                .unwrap()
+                .server_info
+                .as_ref()
+                .unwrap()
+                .name
+                .parse::<i32>()
+                .unwrap();
+            let input = crate::provider::ToolInput::agent_parse(
+                r#"{"action":"call","tool":"echo","arguments":{"z":"\ud800","a":1e400}}"#,
+            );
+            let token = client.cancellation_token();
+            let mut call = Box::pin(invoke(&client, "call", &input, Some(&input)));
+            if cancel {
+                tokio::select! {result=&mut call=>panic!("call finished before cancel {result:?}"), accepted=listener.accept()=>{
+                    let(mut socket,_)=accepted.unwrap();let mut bytes=[0u8;6];socket.read_exact(&mut bytes).await.unwrap();assert_eq!(&bytes,b"issued");
+                }}
+                token.cancel();
+                assert!(call.await.is_err());
+            } else {
+                assert_eq!(call.await.unwrap()["content"][0]["text"], "ok");
+            }
+            tokio::time::timeout(Duration::from_secs(6), client.close())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(client.is_closed());
+            #[cfg(unix)]
+            {
+                assert_eq!(
+                    unsafe { libc::kill(pid, 0) },
+                    -1,
+                    "child is still alive/zombie after awaited cleanup"
+                );
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ESRCH)
+                );
+            }
+            let captured = std::fs::read_to_string(dir.path().join("owned-rpc")).unwrap();
+            assert_eq!(captured.matches("tools/call").count(), 1);
+            assert!(captured.contains(r#""arguments":{"z":"\ud800","a":null}"#));
+            assert!(invoke(&client, "call", &input, Some(&input)).await.is_err());
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("owned-rpc")).unwrap(),
+                captured,
+                "closed handle never writes again"
+            );
+            eprintln!(
+                "MEASURED native stdio cancel={cancel} exact-RPC close/kill/reap one issue no detached writer"
+            );
+        }
     }
 }

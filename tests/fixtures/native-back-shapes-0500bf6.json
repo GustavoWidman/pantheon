@@ -1,0 +1,450 @@
+{
+  "upstream": "0500bf6a8ea4bf0ce047488562022b1b6532cc30",
+  "network": "disabled",
+  "cases": 16,
+  "records": [
+    {
+      "name": "empty",
+      "input": {
+        "$": "Back",
+        "backs": [
+          {
+            "id": "call-empty",
+            "out": {
+              "text": "",
+              "fail": false,
+              "imgs": []
+            }
+          }
+        ]
+      },
+      "openai": [
+        {
+          "type": "function_call_output",
+          "call_id": "call-empty",
+          "output": [
+            {
+              "type": "input_text",
+              "text": ""
+            }
+          ]
+        }
+      ],
+      "anthropic": {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "call-empty",
+            "content": [],
+            "is_error": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "ordinary",
+      "input": {
+        "$": "Back",
+        "backs": [
+          {
+            "id": "call-ordinary",
+            "out": {
+              "text": "old page\n🧪",
+              "fail": false,
+              "imgs": []
+            }
+          }
+        ]
+      },
+      "openai": [
+        {
+          "type": "function_call_output",
+          "call_id": "call-ordinary",
+          "output": [
+            {
+              "type": "input_text",
+              "text": "old page\n🧪"
+            }
+          ]
+        }
+      ],
+      "anthropic": {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "call-ordinary",
+            "content": [
+              {
+                "type": "text",
+                "text": "old page\n🧪"
+              }
+            ],
+            "is_error": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "error",
+      "input": {
+        "$": "Back",
+        "backs": [
+          {
+            "id": "call-error",
+            "out": {
+              "text": "{\"error\":\"No line 2+1.\"}",
+              "fail": true,
+              "imgs": []
+            }
+          }
+        ]
+      },
+      "openai": [
+        {
+          "type": "function_call_output",
+          "call_id": "call-error",
+          "output": [
+            {
+              "type": "input_text",
+              "text": "{\"error\":\"No line 2+1.\"}"
+            }
+          ]
+        }
+      ],
+      "anthropic": {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "call-error",
+            "content": [
+              {
+                "type": "text",
+                "text": "{\"error\":\"No line 2+1.\"}"
+              }
+            ],
+            "is_error": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "error-like-success",
+      "input": {
+        "$": "Back",
+        "backs": [
+          {
+            "id": "call-error-like-success",
+            "out": {
+              "text": "Error: literal payload",
+              "fail": false,
+              "imgs": []
+            }
+          }
+        ]
+      },
+      "openai": [
+        {
+          "type": "function_call_output",
+          "call_id": "call-error-like-success",
+          "output": [
+            {
+              "type": "input_text",
+              "text": "Error: literal payload"
+            }
+          ]
+        }
+      ],
+      "anthropic": {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "call-error-like-success",
+            "content": [
+              {
+                "type": "text",
+                "text": "Error: literal payload"
+              }
+            ],
+            "is_error": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "empty-image",
+      "input": {
+        "$": "Back",
+        "backs": [
+          {
+            "id": "call-empty-image",
+            "out": {
+              "text": "",
+              "fail": false,
+              "imgs": [
+                {
+                  "type": "image/png",
+                  "data": "SYNTHETIC_NOT_AN_IMAGE"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "openai": [
+        {
+          "type": "function_call_output",
+          "call_id": "call-empty-image",
+          "output": [
+            {
+              "type": "input_text",
+              "text": ""
+            },
+            {
+              "type": "input_image",
+              "image_url": "data:image/png;base64,SYNTHETIC_NOT_AN_IMAGE"
+            }
+          ]
+        }
+      ],
+      "anthropic": {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "call-empty-image",
+            "content": [
+              {
+                "type": "image",
+                "source": {
+                  "type": "base64",
+                  "media_type": "image/png",
+                  "data": "SYNTHETIC_NOT_AN_IMAGE"
+                }
+              }
+            ],
+            "is_error": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "ordinary-image",
+      "input": {
+        "$": "Back",
+        "backs": [
+          {
+            "id": "call-ordinary-image",
+            "out": {
+              "text": "caption",
+              "fail": false,
+              "imgs": [
+                {
+                  "type": "image/png",
+                  "data": "SYNTHETIC_NOT_AN_IMAGE"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "openai": [
+        {
+          "type": "function_call_output",
+          "call_id": "call-ordinary-image",
+          "output": [
+            {
+              "type": "input_text",
+              "text": "caption"
+            },
+            {
+              "type": "input_image",
+              "image_url": "data:image/png;base64,SYNTHETIC_NOT_AN_IMAGE"
+            }
+          ]
+        }
+      ],
+      "anthropic": {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "call-ordinary-image",
+            "content": [
+              {
+                "type": "text",
+                "text": "caption"
+              },
+              {
+                "type": "image",
+                "source": {
+                  "type": "base64",
+                  "media_type": "image/png",
+                  "data": "SYNTHETIC_NOT_AN_IMAGE"
+                }
+              }
+            ],
+            "is_error": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "error-image",
+      "input": {
+        "$": "Back",
+        "backs": [
+          {
+            "id": "call-error-image",
+            "out": {
+              "text": "failed caption",
+              "fail": true,
+              "imgs": [
+                {
+                  "type": "image/png",
+                  "data": "SYNTHETIC_NOT_AN_IMAGE"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "openai": [
+        {
+          "type": "function_call_output",
+          "call_id": "call-error-image",
+          "output": [
+            {
+              "type": "input_text",
+              "text": "failed caption"
+            },
+            {
+              "type": "input_image",
+              "image_url": "data:image/png;base64,SYNTHETIC_NOT_AN_IMAGE"
+            }
+          ]
+        }
+      ],
+      "anthropic": {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "call-error-image",
+            "content": [
+              {
+                "type": "text",
+                "text": "failed caption"
+              },
+              {
+                "type": "image",
+                "source": {
+                  "type": "base64",
+                  "media_type": "image/png",
+                  "data": "SYNTHETIC_NOT_AN_IMAGE"
+                }
+              }
+            ],
+            "is_error": true
+          }
+        ]
+      }
+    }
+  ],
+  "multi": {
+    "input": {
+      "$": "Back",
+      "backs": [
+        {
+          "id": "call-empty",
+          "out": {
+            "text": "",
+            "fail": false
+          }
+        },
+        {
+          "id": "call-ordinary",
+          "out": {
+            "text": "old page\n🧪",
+            "fail": false
+          }
+        },
+        {
+          "id": "call-error",
+          "out": {
+            "text": "{\"error\":\"No line 2+1.\"}",
+            "fail": true
+          }
+        }
+      ]
+    },
+    "openai": [
+      {
+        "type": "function_call_output",
+        "call_id": "call-empty",
+        "output": [
+          {
+            "type": "input_text",
+            "text": ""
+          }
+        ]
+      },
+      {
+        "type": "function_call_output",
+        "call_id": "call-ordinary",
+        "output": [
+          {
+            "type": "input_text",
+            "text": "old page\n🧪"
+          }
+        ]
+      },
+      {
+        "type": "function_call_output",
+        "call_id": "call-error",
+        "output": [
+          {
+            "type": "input_text",
+            "text": "{\"error\":\"No line 2+1.\"}"
+          }
+        ]
+      }
+    ],
+    "anthropic": {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "call-empty",
+          "content": [],
+          "is_error": false
+        },
+        {
+          "type": "tool_result",
+          "tool_use_id": "call-ordinary",
+          "content": [
+            {
+              "type": "text",
+              "text": "old page\n🧪"
+            }
+          ],
+          "is_error": false
+        },
+        {
+          "type": "tool_result",
+          "tool_use_id": "call-error",
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"error\":\"No line 2+1.\"}"
+            }
+          ],
+          "is_error": true
+        }
+      ]
+    }
+  }
+}

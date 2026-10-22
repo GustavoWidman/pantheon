@@ -116,17 +116,17 @@ impl Fixture {
 }
 fn call(name: &str, id: &str, body: &str) -> ToolCall {
     ToolCall {
-        id: format!("{name}-{id}-{}", CALL_ID.fetch_add(1, Ordering::Relaxed)),
+        id: format!("{name}-{id}-{}", CALL_ID.fetch_add(1, Ordering::Relaxed)).into(),
         name: name.into(),
         arguments: json!({"id":id,"name":id,"description":"Verify a deployment through observable running state","body":body,
-        "summary":"Added explicit running-state verification","purpose":"Use when checking a service deployment"}),
+        "summary":"Added explicit running-state verification","purpose":"Use when checking a service deployment"}).into(),
     }
 }
 fn verdict(approve: bool) -> ToolCall {
     ToolCall {
-        id: format!("verdict-{approve}"),
+        id: format!("verdict-{approve}").into(),
         name: "decide".into(),
-        arguments: json!({"approve":approve,"reason":"The recorded task supports concrete deployment checks","scope_fit":if approve {"transferable"}else{"unsupported"},"evidence":"The settled task records process, health and gateway observations"}),
+        arguments: json!({"approve":approve,"reason":"The recorded task supports concrete deployment checks","scope_fit":if approve {"transferable"}else{"unsupported"},"evidence":"The settled task records process, health and gateway observations"}).into(),
     }
 }
 fn response(calls: Vec<ToolCall>, input_tokens: u64) -> Value {
@@ -415,8 +415,10 @@ async fn staged_changes_accumulate_until_settle_then_parallel_review_publishes_a
         "engineering",
         "Check running process and health.",
     );
-    first_edit.arguments["files"] =
+    let mut edited = (*first_edit.arguments).clone();
+    edited["files"] =
         json!({"new-check.txt":"A newly staged supporting check survives later edits"});
+    first_edit.arguments = edited.into();
     let server = Mock::new(
         vec![
             response(
@@ -607,7 +609,7 @@ async fn unsupported_write_spawn_and_unknown_tools_return_errors_without_effects
         .map(|name| ToolCall {
             id: name.into(),
             name: name.into(),
-            arguments: json!({"path":"must-not-exist","text":"unexpected"}),
+            arguments: json!({"path":"must-not-exist","text":"unexpected"}).into(),
         })
         .to_vec();
     let server = Mock::new(vec![response(calls, 100), response(vec![], 100)], vec![], 0).await;
@@ -666,7 +668,7 @@ async fn frozen_read_only_memory_and_workspace_reads_do_not_follow_main_writes()
             &ToolCall {
                 id: "zoom".into(),
                 name: "zoom".into(),
-                arguments: json!({"id":0,"n":1}),
+                arguments: json!({"id":0,"n":1}).into(),
             },
             &skills,
             crate::attachments::remaining_budget(env.model, &[]),
@@ -680,7 +682,7 @@ async fn frozen_read_only_memory_and_workspace_reads_do_not_follow_main_writes()
             &ToolCall {
                 id: "date".into(),
                 name: "date".into(),
-                arguments: json!({"id":0}),
+                arguments: json!({"id":0}).into(),
             },
             &skills,
             crate::attachments::remaining_budget(env.model, &[]),
@@ -693,7 +695,7 @@ async fn frozen_read_only_memory_and_workspace_reads_do_not_follow_main_writes()
             &ToolCall {
                 id: "read".into(),
                 name: "read".into(),
-                arguments: json!({"path":"evidence.txt"}),
+                arguments: json!({"path":"evidence.txt"}).into(),
             },
             &skills,
             crate::attachments::remaining_budget(env.model, &[]),
@@ -861,7 +863,7 @@ async fn repeated_large_cached_context_finishes_review_and_records_usage_without
         let f = Fixture::new();
         let job = f.job();
         let mut research = call("read", "evidence", "");
-        research.arguments = json!({"path":"evidence.txt"});
+        research.arguments = json!({"path":"evidence.txt"}).into();
         let cached = |calls| {
             let mut value = response(calls, 30_000);
             value["usage"]["input_tokens_details"] = json!({"cached_tokens":29_900});
@@ -972,12 +974,12 @@ async fn native_research_finishes_the_tool_batch_without_changing_memory_or_cach
         ToolCall {
             id: "file-evidence".into(),
             name: "read".into(),
-            arguments: json!({"path":"document.pdf"}),
+            arguments: json!({"path":"document.pdf"}).into(),
         },
         ToolCall {
             id: "text-evidence".into(),
             name: "read".into(),
-            arguments: json!({"path":"evidence.txt"}),
+            arguments: json!({"path":"evidence.txt"}).into(),
         },
     ];
     let server = Mock::new(vec![response(calls, 100), response(vec![], 100)], vec![], 0).await;
@@ -1068,7 +1070,7 @@ async fn curator_search_uses_pinned_route_and_unpinned_glm_fails_before_network(
     let call = ToolCall {
         id: "research".into(),
         name: "web_search".into(),
-        arguments: json!({"query":"safe synthetic query"}),
+        arguments: json!({"query":"safe synthetic query"}).into(),
     };
     {
         let mut env = f.environment(&server, &config, &cancel);
@@ -1159,7 +1161,7 @@ fn step_caps_default_to_unlimited_and_accept_independent_positive_limits() {
 
 fn evidence_read() -> Value {
     let mut research = call("read", "evidence", "");
-    research.arguments = json!({"path":"evidence.txt"});
+    research.arguments = json!({"path":"evidence.txt"}).into();
     response(vec![research], 100)
 }
 
@@ -1315,7 +1317,7 @@ fn native_full_zoom_page_survives_private_research_tool_delivery() {
         let call = ToolCall {
             id: "private-full-page".into(),
             name: "zoom".into(),
-            arguments: json!({"id":0,"n":1}),
+            arguments: json!({"id":0,"n":1}).into(),
         };
         for vendor in ["openai", "anthropic", "zai"] {
             let native_call = match vendor {
@@ -1329,7 +1331,7 @@ fn native_full_zoom_page_survives_private_research_tool_delivery() {
                     json!({"role":"assistant","content":null,"tool_calls":[{"id":call.id,"type":"function","function":{"name":"zoom","arguments":call.arguments.to_string()}}]})
                 }
             };
-            let mut history = vec![native_call];
+            let mut history: Vec<crate::provider::NativeValue> = vec![native_call.into()];
             append_research_result(vendor, &mut history, &call, json!({"text":text}), false);
             // Inspect the actual final provider envelope, including JSON escaping.
             let encoded = match vendor {
@@ -1379,5 +1381,388 @@ fn native_full_zoom_page_survives_private_research_tool_delivery() {
             };
             assert_eq!(serde_json::from_str::<Value>(value).unwrap()["text"], text);
         }
+    }
+}
+
+#[tokio::test]
+async fn native_owned_private_sessions_duplicate_ids_js_inputs_and_next_http() {
+    use axum::{
+        body::{Body, Bytes},
+        response::IntoResponse,
+    };
+    for vendor in ["openai", "anthropic"] {
+        for review in [false, true] {
+            for utf16_ids in [false, true] {
+                let f = Fixture::new();
+                let config = CuratorConfig::default();
+                let cancel = CancellationToken::new();
+                let captures = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+                let seen = captures.clone();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}/", listener.local_addr().unwrap());
+                let initial = r#"{"id":0,"n":1,"unused":{"x":"\ud800","n":1e400}}"#;
+                let second = r#"{"id":1,"unused":{"x":"\udfff"}}"#;
+                let id_first = if utf16_ids {
+                    r#""\ud800""#
+                } else {
+                    r#""same""#
+                };
+                let id_second = if utf16_ids {
+                    r#""\udfff""#
+                } else {
+                    r#""same""#
+                };
+                let first = if vendor == "openai" {
+                    format!(
+                        r#"data: {{"type":"response.completed","response":{{"status":"completed","output":[{{"type":"function_call","call_id":{id_first},"name":"zoom","arguments":{}}},{{"type":"function_call","call_id":{id_second},"name":"date","arguments":{}}}],"usage":{{}}}}}}
+
+"#,
+                        serde_json::to_string(initial).unwrap(),
+                        serde_json::to_string(second).unwrap()
+                    )
+                } else {
+                    format!(
+                        r#"data: {{"type":"message_start","message":{{"usage":{{}}}}}}
+
+data: {{"type":"content_block_start","index":0,"content_block":{{"type":"thinking","thinking":"private","signature":"opaque"}}}}
+
+data: {{"type":"content_block_start","index":1,"content_block":{{"type":"tool_use","id":{id_first},"name":"zoom","input":{initial}}}}}
+
+data: {{"type":"content_block_start","index":2,"content_block":{{"type":"tool_use","id":{id_second},"name":"date","input":{second}}}}}
+
+data: {{"type":"message_delta","delta":{{"stop_reason":"tool_use"}}}}
+
+data: {{"type":"message_stop"}}
+
+"#
+                    )
+                };
+                let final_wire=if vendor=="openai"{"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{}}}\n\n"}else{"data: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n"}.to_owned();
+                let replies = Arc::new(Mutex::new(VecDeque::from([first, final_wire])));
+                let server = tokio::spawn(async move {
+                    axum::serve(
+                        listener,
+                        Router::new().route(
+                            "/",
+                            post(move |bytes: Bytes| {
+                                let seen = seen.clone();
+                                let replies = replies.clone();
+                                async move {
+                                    seen.lock().unwrap().push(bytes.to_vec());
+                                    let reply = replies.lock().unwrap().pop_front().unwrap();
+                                    ([("content-type", "text/event-stream")], Body::from(reply))
+                                        .into_response()
+                                }
+                            }),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                });
+                let model = if vendor == "openai" {
+                    "openai/gpt-6-fixture".into()
+                } else {
+                    "anthropic/test".to_owned()
+                };
+                let state_path = f._root.path().join("native-store.sqlite");
+                let state = crate::store::Store::open(&state_path).unwrap();
+                let scope = if review {
+                    "curator-reviewer:42:0"
+                } else {
+                    "curator:42"
+                };
+                let identity = state.cache_affinity(scope).unwrap();
+                assert_ne!(state.cache_affinity("channel:42").unwrap(), identity);
+                assert_ne!(
+                    state
+                        .cache_affinity(if review {
+                            "curator:42"
+                        } else {
+                            "curator-reviewer:42:0"
+                        })
+                        .unwrap(),
+                    identity
+                );
+                let probe: crate::provider::NativeCacheProbe = Arc::default();
+                let provider = Provider::mock(url)
+                    .with_native_transport_for_test()
+                    .with_cache_affinity(identity)
+                    .with_native_cache_probe(probe.clone());
+                let environment = Environment {
+                    attachments: None,
+                    provider: provider.clone(),
+                    reviewer_providers: vec![provider.clone()],
+                    library: &f.library,
+                    web: &f.web,
+                    workspace: &f.workspace,
+                    config: &config,
+                    instructions: "synthetic",
+                    model: &model,
+                    reasoning: "none",
+                    cancel: &cancel,
+                };
+                let session = Session {
+                    env: &environment,
+                    provider,
+                    memory: f.frozen.clone(),
+                    budget: Arc::default(),
+                };
+                let mut history = Provider::start(
+                    vendor,
+                    &f.frozen.render(),
+                    if review { "reviewer" } else { "draft" },
+                );
+                let tools = if review {
+                    review_tools()
+                } else {
+                    draft_tools()
+                };
+                let response = session
+                    .step("synthetic private", &history, &tools)
+                    .await
+                    .unwrap();
+                assert_eq!(response.calls.len(), 2);
+                assert_eq!(response.calls[0].id == response.calls[1].id, !utf16_ids);
+                if utf16_ids {
+                    assert_eq!(
+                        response.calls[0].id.as_str(),
+                        response.calls[1].id.as_str(),
+                        "distinct raw private IDs collide in display only"
+                    );
+                }
+                assert_eq!(response.calls[0].arguments["id"], 0);
+                assert_eq!(response.calls[1].arguments["id"], 1);
+                assert!(
+                    response.calls[0]
+                        .arguments
+                        .to_string()
+                        .contains(r#""unused":{"x":"\ud800","n":null}"#)
+                );
+                assert!(
+                    response.calls[1]
+                        .arguments
+                        .to_string()
+                        .contains(r#""x":"\udfff""#)
+                );
+                Provider::append_response(vendor, &mut history, &response);
+                for call in &response.calls {
+                    let value = session
+                        .read(
+                            call,
+                            &f.library.snapshot().unwrap(),
+                            crate::attachments::remaining_budget(&model, &[]),
+                        )
+                        .await
+                        .unwrap();
+                    append_research_result(vendor, &mut history, call, value, false);
+                }
+                session
+                    .step("synthetic private", &history, &tools)
+                    .await
+                    .unwrap();
+                let requests = captures.lock().unwrap();
+                assert_eq!(requests.len(), 2);
+                let next = std::str::from_utf8(&requests[1]).unwrap();
+                if vendor == "anthropic" {
+                    assert!(next.contains(r#""unused":{"x":"\ud800","n":null}"#));
+                    assert!(next.contains(r#""signature":"opaque""#));
+                } else {
+                    assert!(next.contains(&serde_json::to_string(initial).unwrap()));
+                    assert!(next.contains(&serde_json::to_string(second).unwrap()));
+                }
+                assert!(!next.contains("_pantheon_"));
+                let native = crate::provider::NativeValue::parse(next).unwrap();
+                let backs = if vendor == "openai" {
+                    native
+                        .field("input")
+                        .unwrap()
+                        .elements()
+                        .into_iter()
+                        .filter(|i| i["type"] == "function_call_output")
+                        .collect::<Vec<_>>()
+                } else {
+                    native
+                        .field("messages")
+                        .unwrap()
+                        .elements()
+                        .into_iter()
+                        .flat_map(|m| m.field("content").map(|v| v.elements()).unwrap_or_default())
+                        .filter(|b| b["type"] == "tool_result")
+                        .collect::<Vec<_>>()
+                };
+                let field = if vendor == "openai" {
+                    "call_id"
+                } else {
+                    "tool_use_id"
+                };
+                assert_eq!(
+                    backs
+                        .iter()
+                        .map(|b| b.field(field).unwrap().canonical())
+                        .collect::<Vec<_>>(),
+                    vec![
+                        crate::provider::NativeValue::parse(id_first)
+                            .unwrap()
+                            .canonical(),
+                        crate::provider::NativeValue::parse(id_second)
+                            .unwrap()
+                            .canonical()
+                    ],
+                    "private C raw ID association/order"
+                );
+                let results = backs
+                    .iter()
+                    .map(|b| {
+                        serde_json::from_str::<Value>(
+                            b[if vendor == "openai" {
+                                "output"
+                            } else {
+                                "content"
+                            }][0]["text"]
+                                .as_str()
+                                .unwrap(),
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    results,
+                    vec![
+                        json!({"text":f.frozen.zoom(0,1).unwrap()}),
+                        json!({"timestamp":f.frozen.date(1).unwrap()})
+                    ],
+                    "private result association/order with duplicate IDs"
+                );
+                let observations = probe.lock().unwrap();
+                assert_eq!(observations.len(), 2);
+                assert!(
+                    observations
+                        .iter()
+                        .all(|r| r.identity == identity && !r.keys.is_empty())
+                );
+                assert_eq!(
+                    observations[0].keys, observations[1].keys,
+                    "native AST outside included prefix does not change private affinity"
+                );
+                drop(observations);
+                drop(state);
+                assert_eq!(
+                    crate::store::Store::open(&state_path)
+                        .unwrap()
+                        .cache_affinity(scope)
+                        .unwrap(),
+                    identity,
+                    "private routing ID survives native store reopen"
+                );
+                let root = f.memory.say(0, 2).unwrap();
+                drop(requests);
+                drop(session);
+                drop(environment);
+                drop(f.memory);
+                let reopened = Memory::open(f._root.path().join("memory"), 64000).unwrap();
+                assert_eq!(
+                    reopened.say(0, 2).unwrap(),
+                    root,
+                    "private native history never persists executable state"
+                );
+                eprintln!(
+                    "MEASURED private-Session vendor={vendor} review={review} utf16_ids={utf16_ids} A=owned C=actual-http duplicate IDs separate, root/reopen unchanged; B not advertised"
+                );
+                server.abort();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_owned_private_budget_guards_opaque_string_before_second_dispatch() {
+    use axum::{
+        body::{Body, Bytes},
+        response::IntoResponse,
+    };
+    for key_case in [false, true] {
+        let f = Fixture::new();
+        let config = CuratorConfig {
+            max_input_chars: 16000,
+            ..Default::default()
+        };
+        let cancel = CancellationToken::new();
+        let capture = Arc::new(AtomicUsize::new(0));
+        let seen = capture.clone();
+        let opaque = if key_case {
+            format!(
+                r#""unused":{{"\ud800":{{"tree":[{{"payload":"{}"}}]}}}}"#,
+                "x".repeat(20000)
+            )
+        } else {
+            format!(r#""text":"{}\ud800""#, "x".repeat(20000))
+        };
+        let raw = if key_case {
+            format!(r#"{{"type":"text","text":"ordinary",{opaque}}}"#)
+        } else {
+            format!(r#"{{"type":"text",{opaque}}}"#)
+        };
+        let reply = format!(
+            "data: {{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\",\"output\":[{{\"type\":\"message\",\"content\":[{raw}]}}],\"usage\":{{}}}}}}\n\n"
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/",
+                    post(move |_: Bytes| {
+                        let seen = seen.clone();
+                        let reply = reply.clone();
+                        async move {
+                            assert_eq!(
+                                seen.fetch_add(1, Ordering::SeqCst),
+                                0,
+                                "opaque budget bypass sent another provider request"
+                            );
+                            ([("content-type", "text/event-stream")], Body::from(reply))
+                                .into_response()
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let provider = Provider::mock(url).with_native_transport_for_test();
+        let env = Environment {
+            attachments: None,
+            provider: provider.clone(),
+            reviewer_providers: vec![],
+            library: &f.library,
+            web: &f.web,
+            workspace: &f.workspace,
+            config: &config,
+            instructions: "synthetic",
+            model: "openai/test",
+            reasoning: "none",
+            cancel: &cancel,
+        };
+        let session = Session {
+            env: &env,
+            provider,
+            memory: f.frozen.clone(),
+            budget: Arc::default(),
+        };
+        let mut history = Provider::start("openai", "<chat></chat>", "task");
+        let response = session.step("system", &history, &[]).await.unwrap();
+        Provider::append_response("openai", &mut history, &response);
+        let error = session.step("system", &history, &[]).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("curation input budget exhausted")
+        );
+        assert_eq!(capture.load(Ordering::SeqCst), 1);
+        eprintln!(
+            "MEASURED private budget key_subtree={key_case} native-source counted, second HTTP blocked"
+        );
+        server.abort();
     }
 }
