@@ -360,8 +360,8 @@ async fn native_production_root_actor_profiles_actual_wire_and_owned_stop() {
         assert_eq!(
             persisted,
             vec![
-                json!({"kind":"user","text":"do work"}),
-                json!({"kind":"user","text":"ROOT_ROUTE_INPUT"}),
+                json!({"kind":"user","text":"[channel:1 user:2]\ndo work"}),
+                json!({"kind":"user","text":"[channel:1 user:2]\nROOT_ROUTE_INPUT"}),
                 json!({"kind":"unii","text":"Turn stopped: cancelled. Tool effects already completed may remain."})
             ],
             "root stop entire trace {vendor}"
@@ -369,7 +369,7 @@ async fn native_production_root_actor_profiles_actual_wire_and_owned_stop() {
         drop(c);
         drop(run);
         drop(h);
-        let reopened = Memory::open(dir.path().join("memory"), 128000).unwrap();
+        let reopened = Memory::open(dir.path().join("state/memory"), 128000).unwrap();
         assert_eq!(native_trace_entries(&reopened, 0), persisted);
         eprintln!("MEASURED root-owned-stop vendor={vendor} requests=1 exact_trace_reopen=true");
     }
@@ -550,7 +550,7 @@ async fn native_production_curator_and_reviewer_use_private_snapshot_read_routes
         drop(run);
         drop(h);
         server.abort();
-        let reopened = Memory::open(dir.path().join("memory"), 128000).unwrap();
+        let reopened = Memory::open(dir.path().join("state/memory"), 128000).unwrap();
         assert_eq!(native_trace_entries(&reopened, 0), root_after);
     }
 }
@@ -622,7 +622,7 @@ async fn native_production_worker_owned_cancel_delivers_once_without_root_write(
         drop(run);
         drop(h);
         server.abort();
-        let reopened = Memory::open(dir.path().join("memory"), 128000).unwrap();
+        let reopened = Memory::open(dir.path().join("state/memory"), 128000).unwrap();
         assert_eq!(native_trace_entries(&reopened, 0), before);
         eprintln!(
             "MEASURED worker-owned-cancel vendor={vendor} requests=1 root_writes=0 reports=1"
@@ -679,7 +679,7 @@ async fn native_production_curator_owned_cancel_keeps_root_and_pending_proposal_
         drop(run);
         drop(h);
         server.abort();
-        let reopened = Memory::open(dir.path().join("memory"), 128000).unwrap();
+        let reopened = Memory::open(dir.path().join("state/memory"), 128000).unwrap();
         assert_eq!(native_trace_entries(&reopened, 0), before);
         eprintln!(
             "MEASURED curator-owned-cancel vendor={vendor} requests=1 root_writes=0 notifications=0"
@@ -806,7 +806,7 @@ async fn native_production_curator_cancel_during_actual_reviewer_never_installs_
         drop(run);
         drop(h);
         server.abort();
-        let reopened = Memory::open(dir.path().join("memory"), 128000).unwrap();
+        let reopened = Memory::open(dir.path().join("state/memory"), 128000).unwrap();
         assert_eq!(native_trace_entries(&reopened, 0), before);
         eprintln!(
             "MEASURED reviewer-owned-cancel vendor={vendor} requests=3 root_writes=0 skill_installs=0"

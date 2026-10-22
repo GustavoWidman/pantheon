@@ -1,3 +1,17 @@
+// Translate the explicit provenance integration delta from the pinned untagged
+// oracle, without editing it. Newline-preferred Clip paging makes the 19-unit
+// provenance its own page, followed by 30000/30000/30000/10000 payload units.
+// The 128000-unit whole-input suffix therefore retains A's last 10000 a's
+// unchanged and the full attributed B, not an extra 19 a's from A.
+fn attributed_large_batch_suffix(contract: &Value) -> Vec<String> {
+    let raw = contract["suffixes"][0]["raw"].as_array().unwrap();
+    let prefix = "[channel:1 user:2]\n";
+    assert_eq!(prefix.encode_utf16().count(), 19);
+    assert_eq!(raw[0].as_str().unwrap(), "a".repeat(10000));
+    vec![raw[0].as_str().unwrap().to_owned(),
+         format!("{prefix}{}", raw[1].as_str().unwrap())]
+}
+
 // Actual Harness -> Provider -> loopback HTTP -> compactor policy, no model calls.
 async fn compaction_parity_fixture(vendor:&str,responses:Vec<Value>)->(Result<String>,Vec<Value>) {
     let (_d,h,_run,mock,server)=fixture(vendor,responses).await;
@@ -142,12 +156,17 @@ async fn native_turn_oversized_batch_matches_upstream_raw_suffix_not_full_inputs
     run.memory.changed.notify_waiters();
     let (view,texts)=future.await.unwrap();
     let contract:Value=serde_json::from_str(include_str!("../tests/fixtures/compactor-contract-0500bf6.json")).unwrap();
-    assert_eq!(json!(texts),contract["suffixes"][0]["raw"]);
+    assert_eq!(texts, attributed_large_batch_suffix(&contract));
     assert!(view.contains("older selected page"));
     assert!(!view.contains(&"b".repeat(50)));
     let memory=run.memory.memory.lock().await;
     assert!(!memory.is_settled()); // raw suffix does not require its own summaries
-    assert_eq!(memory.say(memory.source_span("A").unwrap().0,memory.source_span("A").unwrap().1).unwrap(),inputs[0].text);
+    for input in &inputs {
+        let (start,end)=memory.source_span(&input.id).unwrap();
+        assert_eq!(end-start,5); // explicit integration paging delta: oracle has 4
+        assert_eq!(memory.say(start,start+1).unwrap(),"[channel:1 user:2]\n");
+    }
+    assert_eq!(memory.say(memory.source_span("A").unwrap().0,memory.source_span("A").unwrap().1).unwrap(),attributed_input(&inputs[0]));
     server.abort();
 }
 
@@ -170,7 +189,7 @@ async fn native_turn_arrival_during_settle_recomputes_same_activity_without_dupl
     }
     run.memory.changed.notify_waiters();
     let (view,texts)=future.await.unwrap();
-    assert_eq!(texts,vec!["fresh A","fresh B"]);assert!(view.contains("settled old leaf"));
+    assert_eq!(texts,vec!["[channel:1 user:2]\nfresh A","[channel:1 user:2]\nfresh B"]);assert!(view.contains("settled old leaf"));
     assert!(!view.contains("fresh A"));assert!(!view.contains("fresh B"));
     let memory=run.memory.memory.lock().await;
     assert_eq!(memory.lookup_source("B"),Some(old+2));
@@ -200,7 +219,7 @@ async fn native_channel_worker_sends_exact_selected_view_and_raw_suffix_to_fake_
     tokio::time::timeout(Duration::from_secs(5),mock.started.notified()).await.unwrap();
     let request=mock.requests.lock().await[0].clone();
     let contract:Value=serde_json::from_str(include_str!("../tests/fixtures/compactor-contract-0500bf6.json")).unwrap();
-    let raw=contract["suffixes"][0]["raw"].as_array().unwrap().iter().map(|v|v.as_str().unwrap()).collect::<Vec<_>>().join("\n\n");
+    let raw=attributed_large_batch_suffix(&contract).join("\n\n");
     let expected=Provider::start("openai",&expected_view,&raw);
     assert_eq!(request["input"].as_array().unwrap().iter().filter(|v|v["role"]=="user").cloned().collect::<Vec<_>>(),expected);
     assert!(raw.len()<inputs.iter().map(|i|i.text.len()).sum::<usize>());
@@ -226,13 +245,13 @@ async fn native_turn_cancel_and_native_reopen_preserve_admission_exactly_once() 
         let mut memory=run.memory.memory.lock().await;
         let old_bank=std::mem::replace(&mut *memory,Memory::open(dir.path().join("temporary-holder"),128000).unwrap());
         drop(old_bank);
-        *memory=Memory::open(dir.path().join("memory"),128000).unwrap();
+        *memory=Memory::open(dir.path().join("state/memory"),128000).unwrap();
         assert_eq!(memory.zoom(old+1,1).unwrap(),before);
         memory.ready_jobs(usize::MAX);memory.finish(NodeKey{level:0,index:old},"settled old").unwrap();
     }
     let mut queued=vec![a];
     let (_,texts)=h.prepare_native_turn(1,&run.memory,&CancellationToken::new(),&context,&mut queued).await.unwrap();
-    assert_eq!(texts,vec!["fresh A"]);
+    assert_eq!(texts,vec!["[channel:1 user:2]\nfresh A"]);
     let memory=run.memory.memory.lock().await;
     assert_eq!(memory.lookup_source("A"),Some(old+1));assert_eq!(memory.stats()["messages"],old+2);
     assert_eq!(memory.zoom(old+1,1).unwrap(),before);
@@ -242,8 +261,7 @@ async fn native_turn_cancel_and_native_reopen_preserve_admission_exactly_once() 
 #[tokio::test]
 async fn native_channel_worker_cancel_store_and_harness_restart_never_redispatch_input() {
     let (dir,h,run,mock,server)=fixture("openai",vec![]).await;
-    let bank=h.config.state_dir.join("chats/1");
-    {let mut memory=run.memory.memory.lock().await;*memory=Memory::open(&bank,128000).unwrap();}
+    // Keep the actual global bank and fixture original; no forbidden channel bank.
     let old=run.memory.memory.lock().await.append(Kind::Echo,&"old pending".repeat(100)).unwrap();
     let context=crate::ui::ReplyContext::request("cancel-A");
     let input=Input{id:"cancel-A".into(),channel:1,user:2,text:"do not dispatch after cancellation".into()};
@@ -265,8 +283,8 @@ async fn native_channel_worker_cancel_store_and_harness_restart_never_redispatch
     let original={
         let mut memory=c.memory.lock().await;
         memory.ready_jobs(usize::MAX);memory.finish(NodeKey{level:0,index:old},"settled before restart").unwrap();
-        assert_eq!(memory.stats()["messages"],2);
-        let original=memory.zoom(1,1).unwrap();
+        assert_eq!(memory.stats()["messages"],old+2);
+        let original=memory.zoom(old+1,1).unwrap();
         let held=std::mem::replace(&mut *memory,Memory::open(dir.path().join("closed-bank-holder"),128000).unwrap());drop(held);
         original
     };
@@ -279,7 +297,7 @@ async fn native_channel_worker_cancel_store_and_harness_restart_never_redispatch
     assert_eq!((state.as_str(),logged),("cancelled",true));assert!(restarted.store.queued(1).unwrap().is_empty());
     {
         let memory=reopened.memory.lock().await;
-        assert_eq!(memory.zoom(1,1).unwrap(),original);assert_eq!(memory.lookup_source("cancel-A"),Some(1));assert_eq!(memory.stats()["messages"],2);
+        assert_eq!(memory.zoom(old+1,1).unwrap(),original);assert_eq!(memory.lookup_source("cancel-A"),Some(old+1));assert_eq!(memory.stats()["messages"],old+2);
         assert!(memory.is_settled());
     }
     tokio::task::yield_now().await;
@@ -318,7 +336,7 @@ fn compaction_journal_bytes(bank: &std::path::Path) -> std::collections::BTreeMa
 #[tokio::test]
 async fn compactor_shutdown_during_publication_lock_skips_journal_and_native_reopen() {
     let (dir,h,run,mock,server)=fixture("openai",vec![final_response("openai","late summary")]).await;
-    let bank=dir.path().join("memory");
+    let bank=dir.path().join("state/memory");
     let key={let mut memory=run.memory.memory.lock().await;let id=memory.append(Kind::User,&"long input ".repeat(100)).unwrap();NodeKey{level:0,index:id}};
     let worker=tokio::spawn(h.clone().compactor(GLOBAL_COMPACTOR,run.memory.shared.clone()));
     tokio::time::timeout(Duration::from_secs(5),mock.started.notified()).await.unwrap();
@@ -355,7 +373,7 @@ async fn compactor_shutdown_during_publication_lock_skips_journal_and_native_reo
 #[tokio::test]
 async fn compactor_committed_publication_before_shutdown_survives_native_reopen() {
     let (dir,h,run,mock,server)=fixture("openai",vec![final_response("openai","committed summary")]).await;
-    let bank=dir.path().join("memory");
+    let bank=dir.path().join("state/memory");
     let key={let mut memory=run.memory.memory.lock().await;let id=memory.append(Kind::User,&"long input ".repeat(100)).unwrap();NodeKey{level:0,index:id}};
     let original=run.memory.memory.lock().await.zoom(key.index,1).unwrap();
     let before=compaction_journal_bytes(&bank);

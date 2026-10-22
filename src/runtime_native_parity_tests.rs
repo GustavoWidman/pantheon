@@ -43,7 +43,7 @@ async fn native_ordinary_pause_entries_survive_success_refusal_and_native_reopen
         drop(run);
         drop(h);
         server.abort();
-        let reopened = Memory::open(dir.path().join("memory"), 128000).unwrap();
+        let reopened = Memory::open(dir.path().join("state/memory"), 128000).unwrap();
         assert_eq!(reopened.say(0, count).unwrap(), originals);
         assert!(reopened.stats()["journal_healthy"].as_bool().unwrap());
     }
@@ -207,7 +207,7 @@ async fn native_actual_stream_pause_fail_down_and_partial_cancel_preserve_histor
         drop(run);
         drop(h);
         server.abort();
-        let reopened = Memory::open(dir.path().join("memory"), 128000).unwrap();
+        let reopened = Memory::open(dir.path().join("state/memory"), 128000).unwrap();
         assert_eq!(reopened.say(0, count).unwrap(), originals);
     }
 }
@@ -295,7 +295,7 @@ async fn native_openai_error_event_preserves_terminal_reason_and_inert_history_o
         drop(run);
         drop(h);
         server.abort();
-        let reopened = Memory::open(dir.path().join("memory"), 128000).unwrap();
+        let reopened = Memory::open(dir.path().join("state/memory"), 128000).unwrap();
         assert_eq!(reopened.say(0, n).unwrap(), originals);
         assert!(reopened.stats()["journal_healthy"].as_bool().unwrap());
     }
@@ -331,7 +331,7 @@ async fn native_completed_openai_tool_original_retains_raw_arguments_not_parsed_
             };
             assert!(requests[1].to_string().contains(expected), "known name lookup precedes input validation; {name} raw={raw:?}: {}", requests[1]);
             drop(requests); drop(run); drop(h); server.abort();
-            let reopened = Memory::open(dir.path().join("memory"), 128000).unwrap();
+            let reopened = Memory::open(dir.path().join("state/memory"), 128000).unwrap();
             assert_eq!(reopened.say(0, n).unwrap(), originals);
             eprintln!("MEASURED raw tool name={name} raw={raw:?} exact original/error-class/C/reopen");
         }
@@ -414,7 +414,7 @@ async fn native_completed_anthropic_tool_entries_match_js_bytes_and_reopen_36_ca
         assert_eq!(requests.len(),2);
         assert!(!std::str::from_utf8(&requests[1]).unwrap().contains("_pantheon_tool_entries"),"local Entry metadata must not enter wire/cache context");
         drop(requests); drop(run); drop(h); server.abort();
-        let reopened = Memory::open(dir.path().join("memory"),128000).unwrap();
+        let reopened = Memory::open(dir.path().join("state/memory"),128000).unwrap();
         assert_eq!(reopened.say(0,n).unwrap(),originals);
         assert!(reopened.stats()["journal_healthy"].as_bool().unwrap());
     }
@@ -449,7 +449,7 @@ async fn native_completed_call_batch_survives_owned_cancel_before_or_between_use
                     let path = dir.path().join("test-private-trace");
                     run.trace = Some(Memory::open(&path,128000).unwrap());
                     path
-                } else { dir.path().join("memory") };
+                } else { dir.path().join("state/memory") };
                 mock.release.notify_one();
                 let cancel = run.cancel.clone();
                 let owner = h.clone();
@@ -509,7 +509,7 @@ async fn native_unanswered_pause_call_flushes_once_on_success_and_failure() {
         assert!(!bodies.iter().any(|b|b.contains("is unavailable")),"pause Uses must not execute");
         assert_eq!(bodies.last().unwrap(),"never_executed {}");
         let originals=memory.say(0,n).unwrap();drop(memory);drop(run);drop(h);server.abort();
-        let reopened=Memory::open(dir.path().join("memory"),128000).unwrap();assert_eq!(reopened.say(0,n).unwrap(),originals);
+        let reopened=Memory::open(dir.path().join("state/memory"),128000).unwrap();assert_eq!(reopened.say(0,n).unwrap(),originals);
     }
 }
 
@@ -526,7 +526,7 @@ async fn independent_completed_server_tool_pair_survives_native_reopen() {
     h.run_steps(&mut run,"anthropic",&[],"synthetic","independent-server-pair").await.unwrap();
     let m=run.memory.memory.lock().await;let n=m.stats()["messages"].as_u64().unwrap();
     let originals=m.say(0,n).unwrap();drop(m);drop(run);drop(h);server.abort();
-    let reopened=Memory::open(dir.path().join("memory"),128000).unwrap();assert_eq!(reopened.say(0,n).unwrap(),originals);
+    let reopened=Memory::open(dir.path().join("state/memory"),128000).unwrap();assert_eq!(reopened.say(0,n).unwrap(),originals);
     assert!(originals.contains("before")&&originals.contains("after"));
     assert!(originals.contains(r#"web_search {"query":"synthetic"}"#),"U2: completed server Tool Entry missing after native reopen: {originals}");
     assert!(originals.contains("(no output)"),"U2: server result Echo missing after native reopen: {originals}");
@@ -540,7 +540,7 @@ async fn native_completed_observer_matches_pinned_chat_buffering_and_reopen() {
         for child in [false,true] {
             let (dir,mut h,mut run,_mock,server)=fixture("anthropic",vec![]).await;
             Arc::get_mut(&mut h).unwrap().config.agent.show_reasoning=false;
-            let path=if child { run.child=true;run.owner="private-observer".into();let path=dir.path().join("private-observer");run.trace=Some(Memory::open(&path,128000).unwrap());path } else {dir.path().join("memory")};
+            let path=if child { run.child=true;run.owner="private-observer".into();let path=dir.path().join("private-observer");run.trace=Some(Memory::open(&path,128000).unwrap());path } else {dir.path().join("state/memory")};
             let completed=case["events"].as_array().unwrap().iter().map(|e|CompletedEntry {
                 kind:match e["kind"].as_str().unwrap(){"tool"=>ObservationKind::Tool,"echo"=>ObservationKind::Echo,"mind"=>ObservationKind::Thought,_=>ObservationKind::Reply},
                 text:e["text"].as_str().unwrap().into(),of:e["of"].as_str().map(Into::into),
@@ -592,7 +592,7 @@ async fn native_interleaved_completed_server_and_client_entries_keep_order_on_ca
         let typed=native_trace_entries(&m,1);
         let kinds=typed.iter().map(|e|e["kind"].as_str().unwrap()).collect::<Vec<_>>();
         assert_eq!(kinds,if before==0{vec!["unii","unii","tool","echo","unii","tool","tool"]}else{vec!["unii","unii","tool","echo","unii","tool","echo","tool"]});
-        let all=m.say(0,n).unwrap();drop(m);drop(run);drop(h);server.abort();let reopened=Memory::open(dir.path().join("memory"),128000).unwrap();assert_eq!(reopened.say(0,n).unwrap(),all);
+        let all=m.say(0,n).unwrap();drop(m);drop(run);drop(h);server.abort();let reopened=Memory::open(dir.path().join("state/memory"),128000).unwrap();assert_eq!(reopened.say(0,n).unwrap(),all);
         assert_eq!(native_trace_entries(&reopened,1),typed,"interleaving kinds after reopen");
     }
 }
@@ -625,7 +625,7 @@ async fn native_completed_server_entries_match_pinned_wire_or_expose_f2() {
         let typed=native_trace_entries(&memory,1);
         assert_eq!(stored,expected,"{name}");assert_eq!(typed,case["stored"].as_array().unwrap().clone(),"kind/text {name}");
         drop(memory);drop(run);drop(h);server.abort();
-        let reopened=Memory::open(dir.path().join("memory"),128000).unwrap();
+        let reopened=Memory::open(dir.path().join("state/memory"),128000).unwrap();
         assert_eq!((1..n).map(|i|reopened.say(i,i+1).unwrap()).collect::<Vec<_>>(),stored,"reopen {name}");
         assert_eq!(native_trace_entries(&reopened,1),typed,"reopen kind/text {name}");
     }
@@ -678,7 +678,7 @@ async fn native_completed_batches_exclude_arrivals_and_compactor_until_all_entri
         let expected=match mode {"server"=>vec![json!({"kind":"tool","text":"server {}"}),json!({"kind":"echo","text":"result"})],"unanswered"=>vec![json!({"kind":"tool","text":"two"}),json!({"kind":"tool","text":"ten"})],_=>{assert_eq!(after[0],json!({"kind":"tool","text":"unavailable_pair {}"}));assert_eq!(after[1]["kind"],"echo");assert!(after[1]["text"].as_str().unwrap().contains("unavailable_pair is unavailable"));after[..2].to_vec()}};
         assert_eq!(&after[..2],expected.as_slice(),"no interposed input {mode}");assert_eq!(after[2],json!({"kind":"user","text":"arrival"}));
         let (run,result)=writer.await.unwrap();result.unwrap();let all=native_trace_entries(&*run.memory.memory.lock().await,1);
-        drop(run);drop(h);drop(channel);server.abort();let reopened=Memory::open(dir.path().join("memory"),128000).unwrap();assert_eq!(native_trace_entries(&reopened,1),all,"kind/body reopen {mode}");assert!(reopened.stats()["journal_healthy"].as_bool().unwrap());
+        drop(run);drop(h);drop(channel);server.abort();let reopened=Memory::open(dir.path().join("state/memory"),128000).unwrap();assert_eq!(native_trace_entries(&reopened,1),all,"kind/body reopen {mode}");assert!(reopened.stats()["journal_healthy"].as_bool().unwrap());
     }
 }
 
@@ -686,7 +686,7 @@ async fn native_completed_batches_exclude_arrivals_and_compactor_until_all_entri
 async fn native_completed_batch_storage_failure_stops_prefix_without_alternate_writer() {
     for private in [false,true] {
         let (dir,h,mut run,_mock,server)=fixture("anthropic",vec![]).await;
-        let path=if private {let path=dir.path().join("private-batch");run.trace=Some(Memory::open(&path,128000).unwrap());run.child=true;path}else{dir.path().join("memory")};
+        let path=if private {let path=dir.path().join("private-batch");run.trace=Some(Memory::open(&path,128000).unwrap());run.child=true;path}else{dir.path().join("state/memory")};
         std::fs::create_dir(path.join("view.json.new")).unwrap();
         let error=h.log_run_batch(&mut run,&[(Kind::Tool,"durable call".into()),(Kind::Echo,"not admitted".into())]).await.unwrap_err();
         assert!(error.to_string().contains("checkpoint"),"{error:#}");
@@ -716,7 +716,7 @@ async fn native_ordinary_ecmascript_whitespace_matches_pinned_wire_and_reopen() 
                 run.trace = Some(Memory::open(&path, 128000).unwrap());
                 run.child = true;
                 path
-            } else { dir.path().join("memory") };
+            } else { dir.path().join("state/memory") };
             let wire = case["wire"].as_str().unwrap().to_owned();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = format!("http://{}/", listener.local_addr().unwrap());
@@ -818,7 +818,7 @@ async fn native_owned_utf16_presentation_failure_cancel_kind_body_reopen() {
         let result=future.await;assert_eq!(result.is_err(),failed,"{name}: {result:?}");
         let memory=run.memory.memory.lock().await;let stored=native_trace_entries(&memory,1);assert_eq!(stored,expected,"{name}");drop(memory);
         let n:i64=h.store.db.lock().unwrap().query_row("SELECT count(*) FROM tool_runs",[],|row|row.get(0)).unwrap();assert_eq!(n,0,"inert observations never execute");
-        drop(run);drop(h);server.abort();let reopened=Memory::open(dir.path().join("memory"),128000).unwrap();assert_eq!(native_trace_entries(&reopened,1),stored,"kind/body reopen {name}");
+        drop(run);drop(h);server.abort();let reopened=Memory::open(dir.path().join("state/memory"),128000).unwrap();assert_eq!(native_trace_entries(&reopened,1),stored,"kind/body reopen {name}");
         eprintln!("MEASURED UTF16 {name} actual-harness kind/body/reopen inert=true");
     }
 }
@@ -902,10 +902,10 @@ data: {"type":"error","error":{"type":"overloaded_error"}}
         let echo=|slot|json!({"kind":"echo","text":json!({"content":[{"type":"text","text":format!("ack-{who}-{slot}")}]}).to_string()});
         vec![json!({"kind":"tool","text":tool(2,"\\udfff")}),echo(1),echo(2),json!({"kind":"tool","text":tool(3,"\\ud800")}),echo(3),json!({"kind":"unii","text":"done"})]
     };
-    let mut expected_root=vec![json!({"kind":"user","text":"do work"})];expected_root.extend(expected_trace("ROOT"));
+    let mut expected_root=vec![json!({"kind":"user","text":"[channel:1 user:2]\ndo work"})];expected_root.extend(expected_trace("ROOT"));
     assert_eq!(root_trace,expected_root,"complete ordered root kind/body, duplicate-ID last-buffer semantics");
     assert_eq!(private_trace,expected_trace("WORKER"),"complete ordered private kind/body");
-    drop(root);drop(worker);drop(h);server.abort();let reopened=Memory::open(dir.path().join("memory"),128000).unwrap();assert_eq!(native_trace_entries(&reopened,0),root_trace);let private=Memory::open(path,128000).unwrap();assert_eq!(native_trace_entries(&private,0),private_trace);
+    drop(root);drop(worker);drop(h);server.abort();let reopened=Memory::open(dir.path().join("state/memory"),128000).unwrap();assert_eq!(native_trace_entries(&reopened,0),root_trace);let private=Memory::open(path,128000).unwrap();assert_eq!(native_trace_entries(&private,0),private_trace);
     eprintln!("MEASURED concurrent native vendor={vendor} ROOT/WORKER A/B stdio/C, duplicate IDs within/across steps, replacement, passing-retry isolation, kind/body/reopen");
     }
 }
@@ -934,7 +934,7 @@ data: {{"type":"message_stop"}}
         Arc::get_mut(&mut h).unwrap().provider=Provider::mock(url).with_native_transport_for_test();
         h.run_steps(&mut run,vendor,&tools::definitions_with_claude(false,false,false),"fixture","builtin-owned").await.unwrap();
         let requests=captured.lock().await;assert_eq!(requests.len(),2);let next=std::str::from_utf8(&requests[1]).unwrap();assert!(next.contains("fixture evidence"),"irrelevant JS-only fields must not reject read");assert!(next.contains("builtin argument path cannot be represented"),"consumed unpaired path fails explicitly before filesystem use");drop(requests);
-        assert_eq!(std::fs::read_to_string(dir.path().join("evidence.txt")).unwrap(),"fixture evidence");let trace=native_trace_entries(&*run.memory.memory.lock().await,0);drop(run);drop(h);server.abort();let reopened=Memory::open(dir.path().join("memory"),128000).unwrap();assert_eq!(native_trace_entries(&reopened,0),trace);
+        assert_eq!(std::fs::read_to_string(dir.path().join("evidence.txt")).unwrap(),"fixture evidence");let trace=native_trace_entries(&*run.memory.memory.lock().await,0);drop(run);drop(h);server.abort();let reopened=Memory::open(dir.path().join("state/memory"),128000).unwrap();assert_eq!(native_trace_entries(&reopened,0),trace);
         eprintln!("MEASURED builtin vendor={vendor} irrelevant nested UTF16/overflow accepted, consumed path rejected, C actual-http, kind/body/reopen");
     }
 }
@@ -962,7 +962,7 @@ async fn native_owned_utf16_call_ids_keep_raw_association_back_ids_cancel_and_re
             let result=future.await;assert_eq!(result.is_err(),cancel_before_use||terminal_failure);
             let tool=|slot:usize|json!({"kind":"tool","text":format!("{} {{\"slot\":{slot}}}",names[slot-1])});
             let echo=|slot:usize|json!({"kind":"echo","text":format!("Error: tool {} is unavailable to this agent",names[slot-1])});
-            let mut expected=vec![json!({"kind":"user","text":"do work"})];
+            let mut expected=vec![json!({"kind":"user","text":"[channel:1 user:2]\ndo work"})];
             if cancel_before_use{expected.extend([tool(4),tool(2),tool(3),tool(6),tool(7)]);}else{expected.extend([tool(4),echo(1),tool(2),echo(2),tool(3),echo(3),echo(4),tool(6),echo(5),echo(6),tool(7),echo(7),json!({"kind":"unii","text":"done"})]);}
             if terminal_failure {assert_eq!(expected.pop().unwrap(),json!({"kind":"unii","text":"done"}));}
             let trace=native_trace_entries(&*run.memory.memory.lock().await,0);assert_eq!(trace,expected,"raw-ID equality/buffer association {vendor} cancel={cancel_before_use}");
@@ -972,7 +972,7 @@ async fn native_owned_utf16_call_ids_keep_raw_association_back_ids_cancel_and_re
                 for(i,id)in expected_ids.iter().enumerate(){let text=serde_json::to_string(&format!("Error: tool {} is unavailable to this agent",names[i])).unwrap();let expected_back=if vendor=="openai"{format!(r#"{{"call_id":{id},"output":[{{"text":{text},"type":"input_text"}}],"type":"function_call_output"}}"#)}else{format!(r#"{{"content":[{{"text":{text},"type":"text"}}],"is_error":true,"tool_use_id":{id},"type":"tool_result"}}"#)};let at=raw.find(&expected_back).unwrap_or_else(||panic!("actual C bytes missing exact ID/result pair {expected_back}: {raw}"));assert!(i==0||at>previous,"raw Back byte order");previous=at;}
             }
             let issued:i64=h.store.db.lock().unwrap().query_row("SELECT count(*) FROM tool_runs",[],|r|r.get(0)).unwrap();assert_eq!(issued,if cancel_before_use{0}else{7});
-            drop(requests);drop(run);drop(h);server.abort();let reopened=Memory::open(dir.path().join("memory"),128000).unwrap();assert_eq!(native_trace_entries(&reopened,0),expected,"inert kind/body reopen {vendor} cancel={cancel_before_use}");
+            drop(requests);drop(run);drop(h);server.abort();let reopened=Memory::open(dir.path().join("state/memory"),128000).unwrap();assert_eq!(native_trace_entries(&reopened,0),expected,"inert kind/body reopen {vendor} cancel={cancel_before_use}");
             eprintln!("MEASURED opaque-ID vendor={vendor} outcome={outcome} high/low/replacement distinct, raw duplicates/pairs equivalent, exact pending/back/order/reopen");
         }
     }

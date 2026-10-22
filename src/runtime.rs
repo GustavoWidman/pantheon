@@ -4405,7 +4405,7 @@ mod tests {
                         .as_array()
                         .unwrap()
                         .iter()
-                        .any(|f| f["name"] == "Memory view")
+                        .any(|f| f["name"] == "Coordinator memory view")
                 );
             }
         }
@@ -5244,7 +5244,7 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
-    async fn peer_message_wakes_archived_coordinator_with_channel_owned_memory() {
+    async fn peer_message_wakes_archived_coordinator_with_shared_memory_and_channel_owned_reply() {
         let (_directory, h, mut run, mock, server) = fixture(
             "openai",
             vec![final_response("openai", "neighbor response")],
@@ -5324,7 +5324,8 @@ mod tests {
             assert_eq!(requests.len(), 1);
             let input = requests[0]["input"].to_string();
             assert!(input.contains("[channel:1] please share findings"));
-            assert!(!input.contains("private source channel note"));
+            // Coordinators intentionally share instance history; delivery stays channel-owned.
+            assert!(input.contains("private source channel note"));
         }
         mock.release.notify_one();
         tokio::time::timeout(Duration::from_secs(2),async {
@@ -5361,7 +5362,7 @@ mod tests {
                 .contains("please share findings")
         );
         assert!(
-            !run.memory
+            run.memory
                 .memory
                 .lock()
                 .await
