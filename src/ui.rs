@@ -899,7 +899,8 @@ pub fn context_card(
             memory["scope"].as_str().unwrap_or("caller-owned")), false,
     ));
     let compact_used = memory["compactor_view_bytes"].as_u64().unwrap_or(0);
-    let compact_budget = memory["compactor_budget_bytes"].as_u64()
+    let compact_budget = memory["compactor_budget_bytes"]
+        .as_u64()
         .unwrap_or(crate::memory::COMPACTOR_BYTES as u64);
     fields.push((
         "Compactor memory view",
@@ -1891,10 +1892,16 @@ mod tests {
     }
     #[test]
     fn context_global_reports_independent_actual_payload_budgets_not_token_caps() {
-        let card = context_card(&crate::config::Config::default(), "openai/test", "low", &json!({
-            "scope":"instance-global", "view_bytes":64001, "view_budget_bytes":96000,
-            "compactor_view_bytes":17000,"compactor_budget_bytes":32000,"settled":false
-        }), &Value::Null);
+        let card = context_card(
+            &crate::config::Config::default(),
+            "openai/test",
+            "low",
+            &json!({
+                "scope":"instance-global", "view_bytes":64001, "view_budget_bytes":96000,
+                "compactor_view_bytes":17000,"compactor_budget_bytes":32000,"settled":false
+            }),
+            &Value::Null,
+        );
         let main = field(&card, "Coordinator memory view");
         assert!(main.contains("64,001 / 96,000 bytes"));
         assert!(main.contains("62.50 / 93.75 KiB"));
@@ -1905,5 +1912,4 @@ mod tests {
         assert!(compact.contains("16.60 / 31.25 KiB"));
         assert!(compact.contains("additional request content"));
     }
-
 }

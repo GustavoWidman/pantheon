@@ -69,13 +69,18 @@ struct Channel {
 }
 impl std::ops::Deref for Channel {
     type Target = SharedMemory;
-    fn deref(&self) -> &SharedMemory { &self.shared }
+    fn deref(&self) -> &SharedMemory {
+        &self.shared
+    }
 }
 // Discord snowflakes are nonzero. Operational compactor settings use this
 // reserved instance-global scope; it is never a message delivery destination.
 const GLOBAL_COMPACTOR: u64 = 0;
 fn attributed_input(input: &Input) -> String {
-    format!("[channel:{} user:{}]\n{}", input.channel, input.user, input.text)
+    format!(
+        "[channel:{} user:{}]\n{}",
+        input.channel, input.user, input.text
+    )
 }
 struct Child {
     channel: u64,
@@ -199,17 +204,26 @@ impl Harness {
             store.mark_logged(&input.id)?;
         }
         let shared = Arc::new(SharedMemory {
-            memory: Mutex::new(memory), changed: Notify::new(),
-            #[cfg(test)] compaction_selected: Notify::new(),
+            memory: Mutex::new(memory),
+            changed: Notify::new(),
+            #[cfg(test)]
+            compaction_selected: Notify::new(),
         });
         discord.models.initialize(&config);
         for (channel, model) in store.chat_models()? {
             discord.models.set_chat_model(channel, &model);
         }
-        discord.models.set_kind_model(GLOBAL_COMPACTOR, "compact",
-            Some(&store.compactor_model(GLOBAL_COMPACTOR, &config.agent.compactor_model)?))?;
+        discord.models.set_kind_model(
+            GLOBAL_COMPACTOR,
+            "compact",
+            Some(&store.compactor_model(GLOBAL_COMPACTOR, &config.agent.compactor_model)?),
+        )?;
         for channel in store.model_override_channels()? {
-            discord.models.set_kind_model(channel, "curator", store.curator_model(channel)?.as_deref())?;
+            discord.models.set_kind_model(
+                channel,
+                "curator",
+                store.curator_model(channel)?.as_deref(),
+            )?;
         }
         let instructions = config.instructions()?;
         let skills = crate::skill_library::SkillLibrary::open(&config.skills, &config.state_dir)?;
@@ -318,12 +332,21 @@ impl Harness {
         Ok(c)
     }
     pub async fn run(self: Arc<Self>, mut inbound: mpsc::Receiver<Inbound>) -> Result<()> {
-        ensure!(!self.run_started.swap(true, std::sync::atomic::Ordering::AcqRel), "Harness runtime already started; do not create a second global scheduler");
+        ensure!(
+            !self
+                .run_started
+                .swap(true, std::sync::atomic::Ordering::AcqRel),
+            "Harness runtime already started; do not create a second global scheduler"
+        );
         // Start even with no queued channel: an idle reopen may have unfinished
         // native summaries. Never hold the coordinator permit in this scheduler.
         let h = self.clone();
         let compact = tokio::spawn(async move {
-            if let Err(e) = h.clone().compactor(GLOBAL_COMPACTOR, h.shared.clone()).await {
+            if let Err(e) = h
+                .clone()
+                .compactor(GLOBAL_COMPACTOR, h.shared.clone())
+                .await
+            {
                 tracing::error!(error=%e,"global compactor stopped");
                 h.shutdown.cancel();
             }
@@ -753,7 +776,10 @@ impl Harness {
             };
             // Another channel may have held the permit for a full turn.
             let queued = self.store.queued(channel)?;
-            if queued.is_empty() { *c.cancel.lock().await = None; continue; }
+            if queued.is_empty() {
+                *c.cancel.lock().await = None;
+                continue;
+            }
             let context = self.store.reply_context(&queued[0].id)?;
             let mut queued = queued
                 .into_iter()
@@ -2405,7 +2431,11 @@ impl Harness {
         let args = Value::Object(args);
         let c = self.channel(channel).await?;
         let _settings_guard = if matches!(name, "model" | "reasoning") {
-            Some(if args["kind"] == "compact" { self.compactor_settings.lock().await } else { c.settings_lock.lock().await })
+            Some(if args["kind"] == "compact" {
+                self.compactor_settings.lock().await
+            } else {
+                c.settings_lock.lock().await
+            })
         } else {
             None
         };
@@ -2712,7 +2742,11 @@ impl Harness {
                     ["chat", "compact", "curator"].contains(&kind),
                     "Reasoning kind must be chat, compact or curator"
                 );
-                let scope = if kind == "compact" { GLOBAL_COMPACTOR } else { channel };
+                let scope = if kind == "compact" {
+                    GLOBAL_COMPACTOR
+                } else {
+                    channel
+                };
                 let target = match kind {
                     "compact" => self
                         .store
@@ -4226,7 +4260,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            h.store.compactor_model(GLOBAL_COMPACTOR, "fallback").unwrap(),
+            h.store
+                .compactor_model(GLOBAL_COMPACTOR, "fallback")
+                .unwrap(),
             "openai/beta"
         );
         assert_eq!(
@@ -4241,7 +4277,9 @@ mod tests {
         );
         let reopened = Store::open(&dir.path().join("state/runtime.sqlite")).unwrap();
         assert_eq!(
-            reopened.compactor_model(GLOBAL_COMPACTOR, "fallback").unwrap(),
+            reopened
+                .compactor_model(GLOBAL_COMPACTOR, "fallback")
+                .unwrap(),
             "openai/beta"
         );
         assert_eq!(
@@ -4294,7 +4332,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            h.store.compactor_model(GLOBAL_COMPACTOR, "new-config-default").unwrap(),
+            h.store
+                .compactor_model(GLOBAL_COMPACTOR, "new-config-default")
+                .unwrap(),
             "new-config-default"
         );
         assert_eq!(h.config.agent.model, "openai/test");
@@ -4320,7 +4360,10 @@ mod tests {
             .await
             .append(Kind::Talk, &"long source ".repeat(100))
             .unwrap();
-        let worker = tokio::spawn(h.clone().compactor(GLOBAL_COMPACTOR, run.memory.shared.clone()));
+        let worker = tokio::spawn(
+            h.clone()
+                .compactor(GLOBAL_COMPACTOR, run.memory.shared.clone()),
+        );
         mock.started.notified().await;
         assert_eq!(mock.requests.lock().await[0]["model"], "first");
         h.store

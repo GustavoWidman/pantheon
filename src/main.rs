@@ -98,18 +98,12 @@ async fn main() -> Result<()> {
     let lock = pantheon::state_namespace::acquire(&config.state_dir)?;
     match cli.command.unwrap_or(Action::Run) {
         Action::Export { output } => {
-            let m = Memory::open(
-                config.state_dir.join("memory"),
-                config.agent.view_bytes,
-            )?;
+            let m = Memory::open(config.state_dir.join("memory"), config.agent.view_bytes)?;
             std::fs::write(&output, m.export_html())?;
             println!("Exported memory to {}", output.display());
         }
         Action::Import { file } => {
-            let mut m = Memory::open(
-                config.state_dir.join("memory"),
-                config.agent.view_bytes,
-            )?;
+            let mut m = Memory::open(config.state_dir.join("memory"), config.agent.view_bytes)?;
             let index = m.append(Kind::Note, &std::fs::read_to_string(file)?)?;
             println!("Imported note {index}");
         }

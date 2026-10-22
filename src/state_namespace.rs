@@ -40,17 +40,23 @@ pub fn validate(path: &Path) -> Result<()> {
     // Channel-partitioned state must never be silently ignored, reused, or
     // automatically merged. Any transition is a separately authorized offline
     // operation, including user messages appended after a staged snapshot.
-    ensure!(!exists_no_follow(&path.join("chats"))?,
-        "native state schema rejects channel-scoped banks for global memory; use a fresh state directory or an explicit offline transition");
+    ensure!(
+        !exists_no_follow(&path.join("chats"))?,
+        "native state schema rejects channel-scoped banks for global memory; use a fresh state directory or an explicit offline transition"
+    );
     let memory = path.join("memory");
     if exists_no_follow(&memory)? {
         crate::memory::Memory::validate_namespace(&memory).context("invalid global native bank")?;
     }
     let directory = path.join("subagents");
     if exists_no_follow(&directory)? {
-        ensure!(fs::symlink_metadata(&directory)?.is_dir(), "native bank namespace must be a real directory");
+        ensure!(
+            fs::symlink_metadata(&directory)?.is_dir(),
+            "native bank namespace must be a real directory"
+        );
         for entry in fs::read_dir(directory)? {
-            crate::memory::Memory::validate_namespace(entry?.path()).context("invalid private worker bank")?;
+            crate::memory::Memory::validate_namespace(entry?.path())
+                .context("invalid private worker bank")?;
         }
     }
     Ok(())
@@ -201,12 +207,24 @@ mod tests {
         fs::write(state.join(NAME), "pantheon-native-state-v1\n").unwrap();
         let bank = state.join("chats/123");
         let mut m = crate::memory::Memory::open(&bank, 128000).unwrap();
-        m.append(crate::memory::Kind::User, "post-snapshot dummy message must survive").unwrap();
+        m.append(
+            crate::memory::Kind::User,
+            "post-snapshot dummy message must survive",
+        )
+        .unwrap();
         drop(m);
-        let path = fs::read_dir(bank.join("main")).unwrap().next().unwrap().unwrap().path();
+        let path = fs::read_dir(bank.join("main"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
         let before = fs::read(&path).unwrap();
         assert!(acquire(state).is_err());
-        assert_eq!(fs::read_to_string(state.join(NAME)).unwrap(), "pantheon-native-state-v1\n");
+        assert_eq!(
+            fs::read_to_string(state.join(NAME)).unwrap(),
+            "pantheon-native-state-v1\n"
+        );
         assert!(!state.join("memory").exists());
         assert!(!state.join("daemon.lock").exists());
         assert_eq!(fs::read(&path).unwrap(), before);
@@ -228,5 +246,4 @@ mod tests {
             fs::remove_file(temp.path().join(name)).unwrap();
         }
     }
-
 }
