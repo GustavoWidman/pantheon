@@ -1,0 +1,49 @@
+name: exact-release-package-verification
+on:
+  push:
+    branches: [package-verification/v0211-static-20261023-v3]
+permissions:
+  contents: read
+concurrency:
+  group: package-verification-v0211-static-20261023-v3
+  cancel-in-progress: false
+jobs:
+  inspect:
+    if: github.run_attempt == 1 && github.repository == 'GustavoWidman/pantheon'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Verification code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+          path: verification
+      - name: Immutable release source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: e358375a94d0f949caa369f20bd537efe98e28af
+          persist-credentials: false
+          fetch-depth: 1
+          path: release
+      - uses: DeterminateSystems/nix-installer-action@90bb610b90bf290cad97484ba341453bd1cbefea
+      - uses: DeterminateSystems/magic-nix-cache-action@84c0677f58dcedf3b91f8223ce36a9ea5b3c84b7
+        with:
+          use-gha-cache: enabled
+          use-flakehub: disabled
+      - name: Realize once and inspect statically
+        run: python3 -I -B verification/.github/scripts/inspect-package.py inspect
+      - name: Seal bounded evidence
+        id: seal
+        if: always()
+        run: python3 -I -B verification/.github/scripts/inspect-package.py seal
+      - name: Evidence only, no package binaries
+        if: always() && steps.seal.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: v0211-x86-static-evidence
+          path: package-evidence/*.json
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 6
+          overwrite: false
