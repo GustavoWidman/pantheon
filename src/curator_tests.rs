@@ -1291,3 +1291,93 @@ async fn finite_reviewer_cap_never_implicitly_approves_staged_changes() {
         assert!(server.state.requests.lock().unwrap().len() <= 2 + 2 * cap);
     }
 }
+
+#[test]
+fn native_full_zoom_page_survives_private_research_tool_delivery() {
+    for escaped in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let mut memory = Memory::open(root.path(), 128000).unwrap();
+        let mut page = format!(
+            "{}CENTRAL_PRIVATE_HISTORY_SENTINEL{}",
+            "a".repeat(14984),
+            "b".repeat(14984)
+        );
+        if escaped {
+            page.replace_range(..5, "\n\"\\😀");
+        }
+        assert_eq!(page.encode_utf16().count(), 30000);
+        memory.append(Kind::User, &page).unwrap();
+        while let Some(key) = memory.ready_jobs(1).first().copied() {
+            memory.finish(key, "private summary").unwrap();
+        }
+        let snapshot = memory.snapshot().unwrap();
+        let text = snapshot.zoom(0, 1).unwrap();
+        let call = ToolCall {
+            id: "private-full-page".into(),
+            name: "zoom".into(),
+            arguments: json!({"id":0,"n":1}),
+        };
+        for vendor in ["openai", "anthropic", "zai"] {
+            let native_call = match vendor {
+                "openai" => {
+                    json!({"type":"function_call","call_id":call.id,"name":"zoom","arguments":call.arguments.to_string()})
+                }
+                "anthropic" => {
+                    json!({"role":"assistant","content":[{"type":"tool_use","id":call.id,"name":"zoom","input":call.arguments}]})
+                }
+                _ => {
+                    json!({"role":"assistant","content":null,"tool_calls":[{"id":call.id,"type":"function","function":{"name":"zoom","arguments":call.arguments.to_string()}}]})
+                }
+            };
+            let mut history = vec![native_call];
+            append_research_result(vendor, &mut history, &call, json!({"text":text}), false);
+            // Inspect the actual final provider envelope, including JSON escaping.
+            let encoded = match vendor {
+                "openai" => history[1]["output"].as_str().unwrap(),
+                "anthropic" => history[1]["content"][0]["content"].as_str().unwrap(),
+                _ => history[1]["content"].as_str().unwrap(),
+            };
+            let decoded: Value = serde_json::from_str(encoded).unwrap();
+            assert_eq!(
+                decoded["text"], text,
+                "{vendor} escaped={escaped}: private zoom truncated"
+            );
+            let model = if vendor == "zai" {
+                "zai/glm-5.3".to_owned()
+            } else {
+                format!("{vendor}/test")
+            };
+            let body = Provider::request_body(
+                &model,
+                if vendor == "zai" { "low" } else { "medium" },
+                "private review",
+                &history,
+                &[],
+            )
+            .unwrap();
+            // Serialize/parse the final wire body as well as the transcript.
+            let wire: Value = serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();
+            let messages = if vendor == "openai" {
+                &wire["input"]
+            } else {
+                &wire["messages"]
+            };
+            let item = messages
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| match vendor {
+                    "openai" => m["type"] == "function_call_output",
+                    "anthropic" => m["content"][0]["type"] == "tool_result",
+                    _ => m["role"] == "tool",
+                })
+                .unwrap();
+            let value = match vendor {
+                "openai" => item["output"].as_str().unwrap(),
+                "anthropic" => item["content"][0]["content"].as_str().unwrap(),
+                _ => item["content"].as_str().unwrap(),
+            };
+            assert_eq!(serde_json::from_str::<Value>(value).unwrap()["text"], text);
+        }
+    }
+}

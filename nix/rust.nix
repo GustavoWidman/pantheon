@@ -19,6 +19,10 @@ rustPlatform.buildRustPackage {
       ../Cargo.lock
       ../src
       ../skills
+      ../tests/fixtures/uniichat-0500bf6.json
+      ../LICENSE
+      ../THIRD_PARTY_NOTICES.md
+      ../licenses
       (lib.fileset.fileFilter (file: file.hasExt "rs") ../tests)
     ];
   };
@@ -37,9 +41,16 @@ rustPlatform.buildRustPackage {
   postCheck = ''
     cargo test --doc --offline --target ${stdenv.hostPlatform.rust.rustcTarget}
   '';
+  postInstall = ''
+    mkdir -p "$out/share/licenses/pantheon"
+    cp LICENSE THIRD_PARTY_NOTICES.md licenses/uniichat-Apache-2.0.txt "$out/share/licenses/pantheon/"
+  '';
   meta = {
     description = "Unwrapped Pantheon executable";
-    license = lib.licenses.mit;
+    license = [
+      lib.licenses.mit
+      lib.licenses.asl20
+    ];
     mainProgram = "pantheon";
     platforms = lib.platforms.linux;
   };

@@ -1,6 +1,6 @@
 //! Reproduce startup costs with complete ROOT records and an empty summary tree.
 //! Fixture writes happen before the timer; startup includes lock acquisition,
-//! JSON parsing, validation, incremental view replay, and frontier construction.
+//! JSON parsing, validation, native index rebuilding, and frontier construction.
 //!
 //! cargo run --release --example memory_bench -- 10000 20000
 
@@ -33,8 +33,10 @@ fn main() -> Result<()> {
     for count in counts {
         ensure!(count > 0, "message count must be positive");
         let directory = tempfile::tempdir()?;
+        // Create only the ordinary native empty schema before constructing
+        // synthetic native originals. This benchmark never imports a bank.
+        drop(Memory::open(directory.path(), VIEW_BYTES)?);
         let main = directory.path().join("main");
-        fs::create_dir(&main)?;
         let path = main.join("2026-01-01.jsonl");
         let text = "Benchmark original user message retained whole, without any existing summary. "
             .repeat(10);
@@ -64,8 +66,8 @@ fn main() -> Result<()> {
                 "benchmark fixture unexpectedly changed"
             );
             ensure!(
-                memory.ready_jobs(usize::MAX).len() == 1 && !memory.is_settled(),
-                "benchmark should retain one unbuilt leaf frontier"
+                memory.ready_jobs(usize::MAX).len() == count.min(64) && !memory.is_settled(),
+                "benchmark should reserve the bounded 64-leaf frontier"
             );
         }
         times.sort_by(f64::total_cmp);

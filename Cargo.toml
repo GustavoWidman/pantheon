@@ -1,9 +1,9 @@
 [package]
 name = "pantheon"
-version = "0.20.4"
+version = "0.21.0"
 edition = "2024"
 rust-version = "1.88"
-license = "MIT"
+license = "MIT AND Apache-2.0"
 description = "Durable, always-on Discord agent harness"
 
 [dependencies]

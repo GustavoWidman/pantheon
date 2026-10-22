@@ -1,91 +1,71 @@
-# Prompt-cache diagnostics
+# Prompt cache behavior
 
-Pantheon keeps OptChat's strict fresh-turn loop. Ordinary conversation takes a
-settled memory view before logging the new input, then creates a new provider
-conversation. It does not retain the previous native conversation for short chats.
-Short kind-prefixed messages fitting 512 bytes become verbatim tree leaves without
-a model call. Older adjacent summaries merge in batches after the view exceeds its high watermark. Originals
-remain durable and accessible through `zoom`.
+Ordinary conversation starts each fresh turn with the native OptMem view and
+new whole input. Within a turn, provider-native tool/reasoning messages retain
+their exact order. A persistent backend session is not the memory bank and is
+not necessary for prompt-prefix reuse.
 
-Fresh conversations can still reuse an unchanged prompt prefix. Constant system
-instructions and tool schemas precede the memory view. Appending recent leaves
-preserves older view text; batches merge from 128,000 down to 64,000 rendered
-bytes by default. Pairs are ranked from their last message, preserving old lines
-longer. A batch changes the prefix from the first modified line onward. The exact
-view partition and unfinished-batch state survive restart in `view.json`; only
-legacy chats without a checkpoint need a one-time migration fold. Compaction does not inherently invalidate every earlier token. Within a
-tool loop, Pantheon replays the complete native transcript, including encrypted
-reasoning/signatures, with queued steering after the outstanding tool results.
+## Native blocks and compaction
 
-`/cache` reports actual provider counters, the last six requests, and a weighted
-cache-read ratio over up to 100 root requests in this channel. Missing counters are
-unknown, not zero. OpenAI input includes cached and cache-written tokens; Anthropic
-input totals add fresh input, cache reads and cache creation. Cache writes are shown
-separately. Worker and compactor requests do not overwrite root accounting. `/context`
-uses the same normalization and displays uncategorized input when reuse is unknown.
+Native views emit an opening `<chat>` block, groups of four complete summary
+lines, and the incomplete tail/closing wrapper. The near-tail stable cache
+mark is on the last full group, or the opening block if there are no full
+groups. Concatenation preserves all view bytes. Main and compactor views have
+independent durable partitions. Between messages, the native half-budget batch
+publication gate avoids a prefix rewrite on every parent completion.
 
-The fresh-view diagnostic compares hashes and byte lengths at complete-line
-boundaries. It reports a lower bound on unchanged view bytes and detects model,
-reasoning, system or schema changes. These are local observations of prepared
-requests, not proof of a server cache hit. Snapshots and the bounded counter history
-survive restart without storing prompt text or native reasoning in the diagnostic
-tables. Provider KV entries are remote and have their own retention policy.
+Compaction uses the same root system and frozen skill catalogue as channel
+turns, but has no executable tools. Each retry consists of the original view
+and task plus at most one latest size note; it never accumulates previous
+answers or thoughts. Its launch view is frozen at job reservation and bounded
+by its node and earliest-unfinished-leaf frontier.
 
-Codex requests send matching `session-id` and `prompt_cache_key` values. The
-hyphenated header supplies ChatGPT's cache affinity; a cache key alone does not
-provide the same routing behavior. Random UUIDs persist in `runtime.sqlite`, with
-separate identities for each coordinator, worker, channel compactor, agent's
-hosted search, channel curator and channel reviewer slot. They survive fresh turns, worker resumptions and service restarts.
-Private curator and reviewer hosted searches derive separate, stable identities
-from their persisted parent affinity, so research requests do not compete with
-their drafting or review prefix.
-Separate state databases receive separate identities. These values control routing
-only: every fresh turn still constructs a new provider transcript, and compaction
-can change its reusable prefix. Public API requests keep their existing contract.
+## Transport distinctions
 
-No cache renewal requests, native-tail retention, or provider cache-policy changes
-are introduced. Codex keeps its subscription transport contract; public API cache
-metadata remains omitted there. The opt-in
-`fresh_turn_cache_probe_reports_real_provider_counters` test measures a cold request,
-identical repeated requests with reopened providers/stores and two appended fresh
-views against the configured authenticated Codex model. It prints counters and
-never executes model tool calls.
-Zero reported reuse is a valid finding, not a test failure or evidence of caching
-success. Investigate transport/model behavior separately from local prefix stability.
+- Anthropic requests mark system text and the last whole view block (or
+  opener), plus the automatic request-end mark. This remains within the
+  provider's four-slot budget; no three large character-offset marks remain.
+- Supported public OpenAI models receive an explicit near-tail breakpoint.
+  Unsupported models have that field stripped. A moving lone boundary can
+  reduce reuse under OpenAI's matching rules; block tests are not proof of
+  provider cache hits.
+- Codex requests omit unsupported API breakpoint metadata. Existing durable
+  random `prompt_cache_key` affinity stays scoped to root, worker, compactor
+  and search owner. A stable key does not imply an actual hit.
+- Z.ai has its own unchunked-message adapter. No Anthropic cache semantics are
+  claimed for that transport.
 
-The public API's current prefix matching and usage fields are documented in
-[OpenAI prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching).
-The underlying memory/fresh-turn layout follows
-[OptChat](https://gist.github.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449).
+UniiChat has real shared request coordination: `AskAI.wait/lead` is called by
+`Agent.request`; only its reported hit-rate tests are synthetic. Pantheon now
+implements the corresponding marked-prefix leader/waiter and TTL/LRU policy in
+`provider_cache.rs`. All clones of the service provider share one coordinator.
+The keys include the actual model/control/system/tools/prefix bytes and durable
+routing scope; task text after the mark and later transcript items do not alter
+an already-written prefix. A leader starts immediately before socket submission,
+not while credentials or provider admission are pending. SSE followers wake at
+`message_start` (Anthropic) / `response.output_item.added` (OpenAI), not merely
+headers or `response.created`. Failure/cancellation releases an unfinished
+leader. JSON transports conservatively release on valid body completion.
 
-The corrected merge priority and batched persistence follow the
-[October 8 recipe revision](https://gist.githubusercontent.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449/raw/3c190e06f34aba0c69f49042c526093269604935/optchat.md).
-Its 98.6% turn-cache figure is an Anthropic cache simulation, not a measured
-Pantheon result. These root-view changes do not adopt the recipe's separate
-16–32 KB compactor view, shared turn/compactor prompt, or four-line Anthropic
-blocks; Pantheon's existing compactor and API block policy remain as documented.
+TTL refresh and expired LRU-prefix eviction follow the reference (300s Anthropic,
+1800s public OpenAI). This is process-local cache knowledge, not durable KV state:
+a new process starts cold while retaining Pantheon's durable routing identities.
+Private routing domains remain isolated rather than sharing UniiChat's global
+cache state across unrelated chats. No coordinator entry is inferred for Codex,
+Z.ai or unmarked models. These differences are intentional, not claims about
+unsupported transport capabilities.
 
-## Skill catalogue and curator checks
+## Diagnostics and durable routing
 
-The complete active catalogue is the last system section. Its exact bytes and
-usage/refinement counter snapshots persist per channel. A successful skill load
-updates library counters, not the system string of a running turn or short-gap
-fresh turn. A fresh turn after the configured idle period may refresh this section
-once memory settles; that is an explicit prefix-change boundary, not a provider
-cache-TTL guarantee. Worker turns use the same channel catalogue generation.
+`/cache` reports actual provider cache-read/write counters where supplied,
+separately from fixed-prefix compatibility fingerprints. The root fresh-turn
+view fingerprint distinguishes append growth, unchanged views, coarsening,
+and model/system/tool changes without recording prompt text. Closing wrappers
+are excluded when measuring the stable append prefix. Tool-loop versus fresh
+usage remains distinct. Snapshot storage and durable cache identities survive
+service restart; the engine does not replay a provider-native transcript as
+fresh memory.
 
-Approved changes produce appended notifications: idle notices occupy the final
-new-input block after the old memory view; active notices follow the complete
-native tool-result batch. Announcing a revision updates available guide data, not
-system or tool schemas. Root memory/native history remain authoritative; private
-forks have independent affinities and cannot overwrite root usage diagnostics.
-
-Bounded mock tests cover exact system/schema equality across counter updates,
-short-gap fresh turns and restart, an actual idle refresh, OpenAI encrypted items,
-Anthropic signatures, complete tool-result batches, and loadable announced revisions.
-The opt-in `curator_catalogue_cache_probe` makes five greeting-only requests with
-`codex/gpt-6-luna` by default: cold, frozen catalogue after a counter update,
-appended publication notice, an exact repeat of that request, then a fresh turn
-with a refreshed catalogue. It
-prints native input/cache/output counters and executes no tools. Run only this
-probe when checking the feature; do not run the entire ignored live suite.
+See [optmem-parity.md](optmem-parity.md) for exact mechanism limits and fake-only
+validation. Actual inference/cache usage needs a separately authorized live
+pilot; no paid requests are required by normal tests.
