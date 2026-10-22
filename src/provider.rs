@@ -5,6 +5,8 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::time::Duration;
 
+#[path = "provider_cache.rs"]
+mod cache_coordination;
 #[path = "provider_codex.rs"]
 pub(crate) mod codex;
 #[path = "provider_retry.rs"]
@@ -21,6 +23,7 @@ pub struct Provider {
     codex: CodexAuth,
     catalog: std::sync::Arc<crate::models::Catalog>,
     cache_affinity: uuid::Uuid,
+    cache_coordination: std::sync::Arc<cache_coordination::Coordinator>,
     retries: RequestRetries,
     error_capture: Option<std::path::PathBuf>,
     zai: zai::Config,
@@ -83,6 +86,7 @@ impl Provider {
             codex: CodexAuth::new(AuthConfig::default()),
             catalog: std::sync::Arc::default(),
             cache_affinity: uuid::Uuid::new_v4(),
+            cache_coordination: std::sync::Arc::default(),
             retries: RequestRetries::default(),
             error_capture: None,
             zai: zai::Config::default(),
@@ -99,6 +103,7 @@ impl Provider {
             codex: CodexAuth::new(AuthConfig::default()),
             catalog: std::sync::Arc::default(),
             cache_affinity: uuid::Uuid::new_v4(),
+            cache_coordination: std::sync::Arc::default(),
             // Existing mocks test one exchange; retry fixtures enable their policy explicitly.
             error_capture: None,
             retries: RequestRetries {
@@ -411,13 +416,13 @@ impl Provider {
             .map(|(i, p)| {
                 if vendor == "openai" {
                     let mut v = json!({"type":"input_text","text":p});
-                    if i + 1 < pieces.len() {
+                    if i + 2 == pieces.len() {
                         v["prompt_cache_breakpoint"] = json!({"mode":"explicit"});
                     }
                     v
                 } else {
                     let mut v = json!({"type":"text","text":p});
-                    if i + 1 < pieces.len() {
+                    if i + 2 == pieces.len() {
                         v["cache_control"] = json!({"type":"ephemeral"});
                     }
                     v
@@ -544,7 +549,7 @@ impl Provider {
             }
             Ok(body)
         } else {
-            let mut body = json!({"model":id,"system":system,"messages":history,"tools":tools,"max_tokens":16384,"cache_control":{"type":"ephemeral"}});
+            let mut body = json!({"model":id,"system":[{"type":"text","text":system,"cache_control":{"type":"ephemeral"}}],"messages":history,"tools":tools,"max_tokens":16384,"cache_control":{"type":"ephemeral"}});
             if reasoning != "none" {
                 let budget = match reasoning {
                     "minimal" => 1024,
@@ -803,6 +808,15 @@ impl Provider {
         submitted: Option<&(dyn Fn() -> Result<()> + Sync)>,
         body: &Value,
     ) -> Result<Value> {
+        // Join only after credentials/admission are ready, immediately before
+        // sending. All provider clones share the cache-writer coordinator.
+        // Dropping this future drops its leader guard and releases any waiters.
+        let flight =
+            if let Some((keys, ttl)) = cache_coordination::keys(model, body, self.cache_affinity) {
+                self.cache_coordination.wait(&keys, ttl).await
+            } else {
+                None
+            };
         let mut diagnostic = crate::transport::Exchange::new(model, attempt, self.timeout_seconds);
         diagnostic.request_shape(body);
         diagnostic.error_capture(self.error_capture.clone());
@@ -836,7 +850,13 @@ impl Provider {
             if model.starts_with("zai/") {
                 zai::read_response(response, &mut diagnostic).await
             } else {
-                read_response_observed(response, streaming, Some(&mut diagnostic)).await
+                read_response_coordinated(
+                    response,
+                    streaming,
+                    Some(&mut diagnostic),
+                    flight.as_ref(),
+                )
+                .await
             }
         }
         .await;
@@ -1184,7 +1204,15 @@ async fn read_response(response: reqwest::Response, streaming: bool) -> Result<V
 async fn read_response_observed(
     response: reqwest::Response,
     streaming: bool,
+    diagnostic: Option<&mut crate::transport::Exchange>,
+) -> Result<Value> {
+    read_response_coordinated(response, streaming, diagnostic, None).await
+}
+async fn read_response_coordinated(
+    response: reqwest::Response,
+    streaming: bool,
     mut diagnostic: Option<&mut crate::transport::Exchange>,
+    flight: Option<&cache_coordination::Flight>,
 ) -> Result<Value> {
     use futures_util::StreamExt;
     const MAX: usize = 32 * 1024 * 1024;
@@ -1219,6 +1247,11 @@ async fn read_response_observed(
         );
         if sse {
             let decoded = decoder.feed(&chunk);
+            if decoder.cache_begun
+                && let Some(flight) = flight
+            {
+                flight.begun();
+            }
             if let Some(d) = diagnostic.as_deref_mut() {
                 d.decoded(&decoded);
                 d.events(
@@ -1246,12 +1279,19 @@ async fn read_response_observed(
     if let Some(d) = diagnostic {
         d.stage = "json_decode";
     }
-    serde_json::from_slice(&bytes).context("invalid provider JSON")
+    let value = serde_json::from_slice(&bytes).context("invalid provider JSON")?;
+    // JSON transports have no observable message_start/output_item event.
+    // A complete valid response is a conservative writer-ready boundary.
+    if let Some(flight) = flight {
+        flight.begun();
+    }
+    Ok(value)
 }
 #[derive(Default)]
 struct SseDecoder {
     pending: Vec<u8>,
     data: Vec<String>,
+    cache_begun: bool,
     capture_errors: bool,
     server_tools: Vec<Value>,
     completed_items: std::collections::BTreeMap<u64, Value>,
@@ -1281,6 +1321,14 @@ impl SseDecoder {
                 let event: Value =
                     serde_json::from_str(&payload).context("invalid provider SSE JSON")?;
                 self.events += 1;
+                // Match upstream OpenAI.begun / Anthropic.begun, not HTTP
+                // headers, keepalive bytes or response.created.
+                if matches!(
+                    event["type"].as_str(),
+                    Some("response.output_item.added" | "message_start")
+                ) {
+                    self.cache_begun = true;
+                }
                 // Never retain arbitrary event names, which could contain body content.
                 self.last_event = Some(match event["type"].as_str() {
                     Some("response.created") => "response.created",
@@ -2360,9 +2408,12 @@ mod tests {
     }
     #[test]
     fn explicit_view_marks_are_stable_and_only_sent_to_supported_models() {
-        let view = (0..300)
-            .map(|i| format!("{i}+1|{}\n", "é".repeat(300)))
-            .collect::<String>();
+        let view = format!(
+            "<chat>\n{}</chat>\n",
+            (0..300)
+                .map(|i| format!("{i}+1|{}\n", "é".repeat(300)))
+                .collect::<String>()
+        );
         let history = Provider::start("openai", &view, "go");
         let supported =
             Provider::request_body("openai/gpt-5.6", "medium", "fixed", &history, &[]).unwrap();
@@ -2374,7 +2425,7 @@ mod tests {
                 .iter()
                 .filter(|b| !b["prompt_cache_breakpoint"].is_null())
                 .count(),
-            2
+            1
         );
         assert!(
             unsupported["input"][1]["content"]

@@ -257,7 +257,7 @@ impl Session<'_> {
         let a = &call.arguments;
         match call.name.as_str() {
             "zoom" => Ok(
-                json!({"text":self.memory.zoom(crate::tools::number(a,"id")?,crate::tools::number(a,"n")?)?}),
+                json!({"text":self.memory.zoom_at(crate::tools::number(a,"id")?,crate::tools::number(a,"n")?, a["at"].as_u64().unwrap_or(0) as usize)?}),
             ),
             "date" => Ok(json!({"timestamp":self.memory.date(crate::tools::number(a,"id")?)?})),
             "read" => {
@@ -756,13 +756,14 @@ fn append_research_result(
             }
         })
         .unwrap_or_default();
-    Provider::append_result(
-        vendor,
-        history,
-        call,
-        &crate::skill_library::bounded_json(&value, 24_000).to_string(),
-        error,
-    );
+    // Native zoom is already bounded/paged, including a usable UTF-16 cursor.
+    // Do not replace its exact page with a lossy generic head/tail object.
+    let value = if call.name == "zoom" && !error {
+        value
+    } else {
+        crate::skill_library::bounded_json(&value, 24_000)
+    };
+    Provider::append_result(vendor, history, call, &value.to_string(), error);
     parts
 }
 fn append_research_media(vendor: &str, history: &mut Vec<Value>, parts: Vec<Value>) -> Result<()> {
