@@ -41,6 +41,7 @@ pub struct Harness {
     run_started: std::sync::atomic::AtomicBool,
     compactor_settings: Mutex<()>,
     children: Mutex<HashMap<String, Child>>,
+    known_workers: Mutex<HashSet<String>>,
     capacity: Arc<Semaphore>,
     shell_capacity: Arc<Semaphore>,
     claude_capacity: Arc<Semaphore>,
@@ -148,15 +149,26 @@ pub fn system_prompt_with_claude(
     } else {
         "This agent has direct execution tools. shell is available and can inspect the actual machine and requested environment values. browser is available for authorized account activities and credential entry. Use these tools instead of asking the user to perform available checks."
     };
+    // Root turns and compactions share the upstream memory prompt. Workers use
+    // their own prompt; Tools.ask does not give them compaction instructions.
+    let head = if child {
+        include_str!("child.txt").trim_end().to_owned()
+    } else {
+        format!(
+            "{}\n\n# Compactions\n\n{}",
+            include_str!("master.txt").trim_end(),
+            COMPACT.trim_end()
+        )
+    };
+    // Tools.system appends operator rules after the complete shared prompt.
     format!(
-        "{}\n{}\nCurrent harness capabilities (authoritative over obsolete chat claims): {names}.\n{execution}\n{instructions}\n{skill_index}\n\n# Compactions\n{}",
-        if child {
-            include_str!("child.txt")
-        } else {
-            include_str!("master.txt")
-        },
+        "{head}\n\n# Harness rules\n{}\n{}\nCurrent harness capabilities (authoritative over obsolete chat claims): {names}.\n{execution}\n{skill_index}\n{instructions}",
         include_str!("behavior.txt"),
-        COMPACT
+        if child {
+            include_str!("child-harness.txt")
+        } else {
+            include_str!("harness.txt")
+        },
     )
 }
 fn curator_note(note: &Value) -> Result<String> {
@@ -200,7 +212,11 @@ impl Harness {
         // Recovery is instance-wide, not dependent on which channel is opened
         // first. Append-before-ack with source IDs makes this crash-idempotent.
         for input in store.unlogged_global()? {
-            memory.append_with_id(Kind::User, &attributed_input(&input), &input.id)?;
+            if store.input_is_work(&input.id)? {
+                memory.append_work_with_id(&attributed_input(&input), &input.id)?;
+            } else {
+                memory.append_with_id(Kind::User, &attributed_input(&input), &input.id)?;
+            }
             store.mark_logged(&input.id)?;
         }
         let shared = Arc::new(SharedMemory {
@@ -300,6 +316,7 @@ impl Harness {
             run_started: std::sync::atomic::AtomicBool::new(false),
             compactor_settings: Mutex::new(()),
             children: Mutex::new(HashMap::new()),
+            known_workers: Mutex::new(HashSet::new()),
             shutdown,
         };
         Ok(Arc::new(h))
@@ -461,6 +478,18 @@ impl Harness {
         c.changed.notify_waiters();
         Ok(())
     }
+    async fn append_admitted_input(&self, c: &Channel, input: &Input) -> Result<()> {
+        if self.store.input_is_work(&input.id)? {
+            c.memory
+                .lock()
+                .await
+                .append_work_with_id(&attributed_input(input), &input.id)?;
+            c.changed.notify_waiters();
+            Ok(())
+        } else {
+            Self::append_input(c, input).await
+        }
+    }
     async fn settle(&self, c: &Channel, cancel: &CancellationToken) -> Result<String> {
         loop {
             let changed = c.changed.notified();
@@ -506,7 +535,7 @@ impl Harness {
             }
             for input in queued.iter() {
                 if logged.insert(input.id.clone()) {
-                    Self::append_input(c, input).await?;
+                    self.append_admitted_input(c, input).await?;
                     self.store.mark_logged(&input.id)?;
                 }
             }
@@ -766,7 +795,7 @@ impl Harness {
                         // accepted inputs in the global journal before ack.
                         for input in self.store.queued(channel)? {
                             self.store.input_state(&input.id, "cancelled")?;
-                            Self::append_input(&c, &input).await?;
+                            self.append_admitted_input(&c, &input).await?;
                             self.store.mark_logged(&input.id)?;
                         }
                     }
@@ -813,7 +842,7 @@ impl Harness {
                 // Preserve cancelled admission in the immutable log without answering it.
                 for input in &queued {
                     self.store.input_state(&input.id, "cancelled")?;
-                    Self::append_input(&c, input).await?;
+                    self.append_admitted_input(&c, input).await?;
                     self.store.mark_logged(&input.id)?;
                 }
                 self.notice(
@@ -870,6 +899,15 @@ impl Harness {
                 &view,
             )?;
             let (vendor, _) = model_parts(&settings.0)?;
+            let working = self
+                .children
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, child)| child.channel == channel)
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            let working = self.store.working_names(channel, &working)?;
             let mut run = Run {
                 channel,
                 user: queued[0].user,
@@ -877,13 +915,12 @@ impl Harness {
                 child: false,
                 memory: c.clone(),
                 cancel: cancel.clone(),
-                history: Provider::start(
+                history: Provider::start_turn_with_agents(
                     vendor,
                     &view,
-                    &match note {
-                        Some(note) => format!("{note}\n\n{}", texts.join("\n\n")),
-                        None => texts.join("\n\n"),
-                    },
+                    &texts.join("\n\n"),
+                    note.as_deref(),
+                    &working,
                 ),
                 settings,
                 inputs: ids,
@@ -1284,12 +1321,12 @@ impl Harness {
                 } else if !call.arguments.is_object() {
                     Err(anyhow::anyhow!("The input is not a JSON object."))
                 } else {
-                    self.execute_tool_tracked(run, call, Some(&tool_id)).await
+                    self.execute_tool_output(run, call, Some(&tool_id)).await
                 };
                 let mut error = result.is_err();
-                let output = match result {
+                let (output, units) = match result {
                     Ok(v) => v,
-                    Err(e) => format!("Error: {e}"),
+                    Err(e) => (format!("Error: {e}"), None),
                 };
                 if call.name == "mcp"
                     && serde_json::from_str::<Value>(&output).is_ok_and(|v| v["isError"] == true)
@@ -1348,14 +1385,18 @@ impl Harness {
                     } else {
                         None
                     };
-                Provider::append_result_with_image(
-                    vendor,
-                    &mut run.history,
-                    call,
-                    &output,
-                    error,
-                    image.as_deref(),
-                );
+                if let Some(units) = units {
+                    Provider::append_result_units(vendor, &mut run.history, call, units);
+                } else {
+                    Provider::append_result_with_image(
+                        vendor,
+                        &mut run.history,
+                        call,
+                        &output,
+                        error,
+                        image.as_deref(),
+                    );
+                }
                 if native_events
                     && vendor == "openai"
                     && let Some(last) = run.history.last_mut()
@@ -1589,7 +1630,7 @@ impl Harness {
                 }
                 self.store.bind_context(&input.id, &run.context)?;
                 self.store.input_state(&input.id, "running")?;
-                Self::append_input(&run.memory, &input).await?;
+                self.append_admitted_input(&run.memory, &input).await?;
                 self.store.mark_logged(&input.id)?;
                 let parts = self
                     .attachments
@@ -1624,12 +1665,7 @@ impl Harness {
     async fn execute_tool(self: &Arc<Self>, run: &mut Run, call: &ToolCall) -> Result<String> {
         self.execute_tool_tracked(run, call, None).await
     }
-    async fn execute_tool_tracked(
-        self: &Arc<Self>,
-        run: &mut Run,
-        call: &ToolCall,
-        tool_id: Option<&str>,
-    ) -> Result<String> {
+    fn validate_tool(&self, run: &Run, call: &ToolCall) -> Result<()> {
         ensure!(
             tools::definitions_with_claude(
                 run.child,
@@ -1651,6 +1687,61 @@ impl Harness {
         .expect("tool validated");
         call.arguments
             .validate_builtin(&schema["input_schema"], call.name == "mcp")?;
+        Ok(())
+    }
+    async fn execute_zoom_units(&self, run: &Run, a: &Value) -> Result<Vec<u16>> {
+        if let Some(name) = a["id"].as_str().filter(|name| name.parse::<u64>().is_err()) {
+            let Some(id) = self.store.agent_id(run.channel, name)? else {
+                return Ok(crate::memory::clip_page_units(
+                    &format!("No agent {name}."),
+                    a["at"].as_u64().unwrap_or(0) as usize,
+                ));
+            };
+            ensure!(
+                id.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')),
+                "invalid worker identifier"
+            );
+            let directory = self.config.state_dir.join("subagents").join(id);
+            if !directory.join("view.json").is_file() {
+                return Ok(crate::memory::clip_page_units(
+                    &format!("No agent {name}."),
+                    a["at"].as_u64().unwrap_or(0) as usize,
+                ));
+            }
+            return Memory::agent_log_units(&directory, a["at"].as_u64().unwrap_or(0) as usize);
+        }
+        return run.memory.memory.lock().await.zoom_units_at(
+            a["id"]
+                .as_str()
+                .and_then(|id| id.parse().ok())
+                .map(Ok)
+                .unwrap_or_else(|| tools::number(a, "id"))?,
+            a["n"].as_u64().unwrap_or(1),
+            a["at"].as_u64().unwrap_or(0) as usize,
+        );
+    }
+    async fn execute_tool_output(
+        self: &Arc<Self>,
+        run: &mut Run,
+        call: &ToolCall,
+        tool_id: Option<&str>,
+    ) -> Result<(String, Option<Vec<u16>>)> {
+        if call.name == "zoom" {
+            self.validate_tool(run, call)?;
+            let units = self.execute_zoom_units(run, &call.arguments).await?;
+            Ok((String::from_utf16_lossy(&units), Some(units)))
+        } else {
+            Ok((self.execute_tool_tracked(run, call, tool_id).await?, None))
+        }
+    }
+    async fn execute_tool_tracked(
+        self: &Arc<Self>,
+        run: &mut Run,
+        call: &ToolCall,
+        tool_id: Option<&str>,
+    ) -> Result<String> {
+        self.validate_tool(run, call)?;
         let a: &Value = &call.arguments;
         let value = match call.name.as_str() {
             "models" => self.discord.models.report(
@@ -1694,11 +1785,9 @@ impl Harness {
                 value
             }
             "zoom" => {
-                return run.memory.memory.lock().await.zoom_at(
-                    tools::number(a, "id")?,
-                    tools::number(a, "n")?,
-                    a["at"].as_u64().unwrap_or(0) as usize,
-                );
+                return Ok(String::from_utf16_lossy(
+                    &self.execute_zoom_units(run, a).await?,
+                ));
             }
             "date" => return run.memory.memory.lock().await.date(tools::number(a, "id")?),
             "read" => {
@@ -2050,7 +2139,11 @@ impl Harness {
                 if let Some(channel) = id.strip_prefix("channel:") {
                     self.channel(channel.parse()?).await?.incoming.notify_one();
                 } else {
-                    self.ensure_agent(id).await?;
+                    if !self.children.lock().await.contains_key(id) {
+                        let memory = self.channel(run.channel).await?;
+                        let view = self.settle(&memory, &run.cancel).await?;
+                        self.ensure_agent_with_view(id, Some(view)).await?;
+                    }
                 }
                 json!({"delivered":id,"name":self.store.agent_label(id)?})
             }
@@ -2084,7 +2177,7 @@ impl Harness {
                 channel,
                 user,
                 task,
-                previous,
+                previous: _previous,
                 settings,
                 memory,
                 view,
@@ -2101,18 +2194,68 @@ impl Harness {
                 }
             };
             let _ = h.store.agent_phase(&id, true, "Preparing context");
-            let outcome=async {
-                let resumed=view.is_none();
-                let view=match view {Some(view)=>view,None=>h.settle(&memory,&cancel).await?};
-                let mut trace=Memory::open(h.config.state_dir.join("subagents").join(&id),h.config.agent.view_bytes)?;
-                let prompt=if !resumed {task.clone()} else {format!("Continue the existing task: {task}\nYour previous private turn ended with: {previous}\nThe new inbox notifications contain results of work already started. Use those results to continue; do not start the task over or repeat completed commands or delays. Inspect saved effects if a result is unclear.")};
-                trace.append(Kind::User,&prompt)?;
-                let (vendor,_)=model_parts(&settings.0)?;
-                let catalogue=h.skills.cache_catalogue(&channel.to_string(),&h.skills.catalogue(h.config.curator.description_chars)?,false)?;
-                let worker_system=system_prompt_with_claude(true,false,h.config.claude.enabled,&format!("{}\n{catalogue}",crate::skill_library::INDEX),&h.curator_instructions);
-                let run=Run {channel,user,owner:id.clone(),child:true,memory:memory.clone(),cancel,settings:settings.clone(),history:Provider::start(vendor,&view,&prompt),inputs:vec![],trace:Some(trace),steering:vec![],media:vec![],context:context.clone(),skills:h.skills.snapshot()?,task:prompt.chars().take(8000).collect(),system:Some(worker_system),steps:0,invocation_scope:uuid::Uuid::new_v4().to_string(),counted_skills:HashSet::new()};
+            let outcome = async {
+                let mut trace = Memory::open(
+                    h.config.state_dir.join("subagents").join(&id),
+                    h.config.agent.view_bytes,
+                )?;
+                if trace.stats()["messages"] == 0 {
+                    trace.append(Kind::Note, "subagent")?;
+                    trace.append(Kind::User, &task)?;
+                }
+                let view = if let Some(view) = view {
+                    h.store.set_worker_view(&id, &view)?;
+                    h.known_workers.lock().await.insert(id.clone());
+                    Some(view)
+                } else if h.known_workers.lock().await.contains(&id) {
+                    h.store.worker_view(&id)?
+                } else {
+                    // Tools.agent restores the original log with no captured
+                    // root view after a cold start; zoom still reads live memory.
+                    None
+                };
+                for input in h.store.agent_events(&id)? {
+                    trace.append_with_id(Kind::User, &input.text, &input.id)?;
+                    h.store.agent_event_done(&input.id)?;
+                }
+                let prompt = trace.original_log()?;
+                let (vendor, _) = model_parts(&settings.0)?;
+                let catalogue = h.skills.cache_catalogue(
+                    &channel.to_string(),
+                    &h.skills.catalogue(h.config.curator.description_chars)?,
+                    false,
+                )?;
+                let worker_system = system_prompt_with_claude(
+                    true,
+                    false,
+                    h.config.claude.enabled,
+                    &format!("{}\n{catalogue}", crate::skill_library::INDEX),
+                    &h.curator_instructions,
+                );
+                let run = Run {
+                    channel,
+                    user,
+                    owner: id.clone(),
+                    child: true,
+                    memory: memory.clone(),
+                    cancel,
+                    settings: settings.clone(),
+                    history: Provider::start_worker(vendor, view.as_deref(), &prompt),
+                    inputs: vec![],
+                    trace: Some(trace),
+                    steering: vec![],
+                    media: vec![],
+                    context: context.clone(),
+                    skills: h.skills.snapshot()?,
+                    task: task.chars().take(8000).collect(),
+                    system: Some(worker_system),
+                    steps: 0,
+                    invocation_scope: uuid::Uuid::new_v4().to_string(),
+                    counted_skills: HashSet::new(),
+                };
                 h.clone().run_agent(run).await
-            }.await;
+            }
+            .await;
             let successful = outcome.is_ok();
             let mut report = match outcome {
                 Ok(text) => text,
@@ -2141,6 +2284,13 @@ impl Harness {
         Ok(())
     }
     async fn ensure_agent(self: &Arc<Self>, id: &str) -> Result<()> {
+        self.ensure_agent_with_view(id, None).await
+    }
+    async fn ensure_agent_with_view(
+        self: &Arc<Self>,
+        id: &str,
+        view: Option<String>,
+    ) -> Result<()> {
         if self.shutdown.is_cancelled() || self.children.lock().await.contains_key(id) {
             return Ok(());
         }
@@ -2170,7 +2320,7 @@ impl Harness {
             previous,
             settings: (model, reasoning),
             memory,
-            view: None,
+            view,
             cancel: self.shutdown.child_token(),
             permit,
         })
@@ -5481,11 +5631,9 @@ mod tests {
                 .contains(shell_command)
         );
         let requests = mock.requests.lock().await;
-        assert!(
-            requests[2]
-                .to_string()
-                .contains("Continue the existing task")
-        );
+        assert!(requests[2].to_string().contains("0|note: subagent"));
+        assert!(requests[2].to_string().contains("Private worker progress"));
+        assert!(requests[2].to_string().contains("Hi too early"));
         assert!(requests[2].to_string().contains("stdout"));
         h.shutdown.cancel();
         server.abort();

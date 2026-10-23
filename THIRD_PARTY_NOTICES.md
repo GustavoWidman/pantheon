@@ -4,13 +4,13 @@
 
 The native memory algorithm, compaction task/ruler, view-block policy, and
 paging implementation in `src/memory.rs`, and the adapted compaction
-instructions in `src/compact.txt`, and request-coordination policy in
+instructions in `src/master.txt`, `src/child.txt` and `src/compact.txt`, and request-coordination policy in
 `src/provider_cache.rs`, together with the native provider/compactor behavior
 adaptations documented in `docs/compactor-adapter.md`, are derived from Victor Taelin's UniiChat:
 
 - Project: https://github.com/VictorTaelin/uniichat
 - Reference: `0500bf6a8ea4bf0ce047488562022b1b6532cc30`
-- Sources: `Memory.ts`, `Clip.ts`, `prompt.txt`, `AskAI.ts`, `Agent.ts`, `OpenAI.ts`, `Anthropic.ts`
+- Sources: `Memory.ts`, `Clip.ts`, `prompt.txt`, `Tools.ts`, `Server.ts`, `AskAI.ts`, `Agent.ts`, `OpenAI.ts`, `Anthropic.ts`
 - Copyright: Victor Taelin and UniiChat contributors
 - License: Apache License, Version 2.0
 

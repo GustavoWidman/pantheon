@@ -9,6 +9,21 @@ use std::{
 const MARKER: &str = "pantheon-global-state-v2\n";
 const NAME: &str = "state-format";
 
+/// The daemon owns the writer lock until this guard is dropped.
+#[must_use = "keep the guard alive while using the state directory"]
+pub struct DaemonLock(File);
+
+impl Drop for DaemonLock {
+    fn drop(&mut self) {
+        // Closing only our descriptor can leave flock held by a concurrent
+        // fork until its exec closes the inherited descriptor. Release the
+        // shared open-file-description lock when the actual owner finishes.
+        if let Err(error) = fs2::FileExt::unlock(&self.0) {
+            tracing::error!(%error, "daemon state unlock failed");
+        }
+    }
+}
+
 /// Read-only preflight, before opening locks, SQLite, gateways, or workers.
 /// A lone daemon.lock is an interrupted fresh bootstrap, not durable state.
 pub fn validate(path: &Path) -> Result<()> {
@@ -71,8 +86,8 @@ fn exists_no_follow(path: &Path) -> Result<bool> {
 }
 
 /// Admit, acquire the daemon's lifetime lock, and revalidate before any state
-/// initialization. The caller keeps the returned file alive until shutdown.
-pub fn acquire(path: &Path) -> Result<File> {
+/// initialization. The caller keeps the returned guard alive until shutdown.
+pub fn acquire(path: &Path) -> Result<DaemonLock> {
     validate(path)?;
     durable_directory(path)?;
     let lock = OpenOptions::new()
@@ -84,6 +99,7 @@ pub fn acquire(path: &Path) -> Result<File> {
     fs2::FileExt::try_lock_exclusive(&lock).context(
         "another Pantheon process owns this state directory; stop it before offline export/import",
     )?;
+    let lock = DaemonLock(lock);
     initialize(path)?;
     Ok(lock)
 }
@@ -178,6 +194,22 @@ mod tests {
         fs::write(temp.path().join("daemon.lock"), "").unwrap();
         initialize(temp.path()).unwrap();
         validate(temp.path()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_owner_releases_lock_with_an_inherited_descriptor() {
+        let temp = tempfile::tempdir().unwrap();
+        let owner = acquire(temp.path()).unwrap();
+        // A concurrent fork before exec retains this same open file description.
+        let inherited = owner.0.try_clone().unwrap();
+        assert!(acquire(temp.path()).is_err());
+        drop(owner);
+        let replacement = acquire(temp.path()).unwrap();
+        drop(inherited);
+        assert!(acquire(temp.path()).is_err());
+        drop(replacement);
+        drop(acquire(temp.path()).unwrap());
     }
 
     #[cfg(unix)]

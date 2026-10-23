@@ -35,9 +35,9 @@ pub fn definitions_with_claude(child: bool, coordinator: bool, claude_enabled: b
         ),
         tool(
             "zoom",
-            "Open a native memory span into its two children, or an original page when n=1. at is a UTF-16 character offset within that page (default 0); follow the returned cursor for long output.",
-            json!({"id":{"type":"integer","minimum":0},"n":{"type":"integer","minimum":1},"at":{"type":"integer","minimum":0}}),
-            &["id", "n"],
+            "Open a memory span or read a worker's original log by name or worker ID. n defaults to 1; larger spans open their two children. at continues in UTF-16 code units. Worker logs are limited to this channel.",
+            json!({"id":{"anyOf":[{"type":"integer","minimum":0},{"type":"string"}]},"n":{"type":"integer","minimum":1},"at":{"type":"integer","minimum":0}}),
+            &["id"],
         ),
         tool(
             "date",

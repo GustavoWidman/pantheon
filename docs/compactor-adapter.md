@@ -2,9 +2,11 @@
 
 Pinned reference: VictorTaelin/uniichat
 `0500bf6a8ea4bf0ce047488562022b1b6532cc30`.
-This is the V10 candidate contract, not a blanket parity, model-quality,
-cache-rate or migration-readiness claim. Exact artifacts/tests/review must be
-bound externally; parent V9c package evidence does not cover this successor.
+The parity target is model-visible memory behavior. Pantheon retains Discord
+routing, its tools/attachments, durable storage, locks and provider integrations.
+Cloud billing, imports and process-to-process call handover are outside that
+scope. Deterministic oracles establish behavior for the covered inputs; they do
+not establish identical model answers, cache-hit rates or provider quotas.
 
 ## Compactor outcome ownership
 
@@ -52,6 +54,28 @@ not provider busy retries. Provider diagnostics remain typed/bounded/redacted.
 
 ## Ordinary turns are not compactions
 
+Root turns and compactions use the complete pinned `MASTER` memory prompt,
+with Unii/Pantheon and unii/talk naming adaptations. Harness rules follow it;
+operator instructions remain last, as in `Tools.system`. The earlier custom
+"Each call is either..." paragraph has been removed.
+
+`Chat.call` puts `Turn: the user's new message:\n\n` before the selected raw
+suffix. The production channel actor now does the same. Agent status and product
+notices are separate unmarked blocks before that marked task. They do not alter
+the memory blocks or become part of the task label. Compaction tasks still start
+with `Compaction:` and use the native ruler/input form. Workers receive the
+upstream subagent/view instructions without the root Compactions section.
+
+`Tools.ask` supplies a worker's entire private original log, not summaries or a
+synthetic task/previous-report pair. Worker journals retain Pantheon's durable
+pages; request construction rejoins them into logical `i|kind: text` entries.
+A new worker begins with `note: subagent` and the task. Idle `tell` captures a
+new settled root view; a background continuation keeps its process's captured
+view. A cold restored worker gets its saved log without a captured root view.
+Numeric zoom always reads the live shared root; named zoom reads the worker's
+private log in its owning Discord channel. Reports enter root memory as `work`,
+using trusted admission metadata rather than a text-prefix heuristic.
+
 Ordinary tasks are marked; compactor tasks/corrections remain unmarked. OpenAI
 ordinary requests omit explicit-end cache options; Anthropic ordinary requests
 retain top-level ephemeral cache_control based on original task even after
@@ -92,8 +116,10 @@ Pantheon's object-only guard (an intentional stronger-safety restriction).
 - Z.ai has no pinned upstream adapter. Do not infer equivalent cache semantics.
 - Unknown/legacy Anthropic capability fallback and real model limits remain
   provider constraints. Encrypted-reasoning include control is retained.
-- Root instruction content, device/agent status bytes, tool names and explicit
-  hosted-search delegation are app differences, not unidentified normalization.
+- Shared root and worker memory instructions follow the pinned source. Harness
+  tools, execution device descriptions, Discord provenance and hosted-search
+  delegation remain Pantheon integrations. Background delegation remains the
+  user-requested Pantheon policy.
 - Per-write fsync, fail-closed journals, single writer, stable/private routing,
   strict coordinates, publication cancellation and restart non-replay remain.
 - Cutoff reasons are bounded/sanitized before user-visible persistence; literal
@@ -104,8 +130,9 @@ Pantheon's object-only guard (an intentional stronger-safety restriction).
 - Actual recall, cache residency/rates, subscription quota, performance, ARM
   package validation, current-tail migration and live cutover are unvalidated.
 
-Fake deterministic tests do not authorize inference, the stopped V4 pilot,
-legacy replay, canonical/live writes, commits/pushes/merges or deployment.
+Validation uses isolated synthetic banks and loopback endpoints. The opt-in live
+behavior test makes three controlled inference calls without executing tools.
+Neither kind of test changes the running service or its memory.
 
 
 ### Owned native provider values and compactor continuation

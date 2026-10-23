@@ -29,7 +29,7 @@ async fn global_channels_share_ids_zoom_date_and_keep_routing_private() {
     // Native worker recall intentionally uses the shared root, not trace IDs.
     root.child = true;
     root.trace = Some(Memory::open(h.config.state_dir.join("subagents/test"), 128000).unwrap());
-    assert!(root.trace.as_ref().unwrap().zoom(id, 1).is_err());
+    assert!(root.trace.as_ref().unwrap().zoom(id, 1).unwrap().starts_with("No line "));
     assert_eq!(root.memory.memory.lock().await.zoom(id, 1).unwrap(), zoom);
     let call = ToolCall {
         id: "global-zoom".into(),
