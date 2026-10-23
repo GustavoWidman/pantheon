@@ -530,6 +530,66 @@ impl Provider {
     pub fn start(vendor: &str, view: &str, text: &str) -> Vec<NativeValue> {
         Self::start_marked(vendor, view, text, true)
     }
+    /// Chat.call labels the fresh raw suffix explicitly; compactions and worker
+    /// logs have their own task forms. Product notices precede the marked task.
+    pub fn start_turn(
+        vendor: &str,
+        view: &str,
+        text: &str,
+        notice: Option<&str>,
+    ) -> Vec<NativeValue> {
+        Self::start_turn_with_agents(vendor, view, text, notice, &[])
+    }
+    pub fn start_turn_with_agents(
+        vendor: &str,
+        view: &str,
+        text: &str,
+        notice: Option<&str>,
+        agents: &[String],
+    ) -> Vec<NativeValue> {
+        let at_work = format!(
+            "Agents at work now: {}\n\n",
+            if agents.is_empty() {
+                "none.".to_owned()
+            } else {
+                format!("{}.", agents.join(", "))
+            }
+        );
+        let task = format!("Turn: the user's new message:\n\n{text}");
+        if vendor == "zai" {
+            return Self::start(
+                vendor,
+                view,
+                &match notice {
+                    Some(notice) => format!("{at_work}{notice}\n\n{task}"),
+                    None => format!("{at_work}{task}"),
+                },
+            );
+        }
+        let mut history = Self::start(vendor, view, &task);
+        for notice in std::iter::once(at_work.as_str()).chain(notice) {
+            let mut blocks = history[0].field("content").unwrap().elements();
+            let block = Self::user(vendor, notice)
+                .field("content")
+                .unwrap()
+                .elements()
+                .remove(0);
+            blocks.insert(blocks.len() - 1, block);
+            history[0].set("content", NativeValue::array(blocks));
+        }
+        history
+    }
+    /// Tools.ask sends a worker's original log, with no captured root view when
+    /// restoring an idle worker after a cold process start.
+    pub fn start_worker(vendor: &str, view: Option<&str>, log: &str) -> Vec<NativeValue> {
+        let mut history = Self::start(vendor, view.unwrap_or(""), log);
+        if view.is_none() && vendor != "zai" {
+            let mut blocks = history[0].field("content").unwrap().elements();
+            blocks.remove(0);
+            history[0].set("content", NativeValue::array(blocks));
+        }
+        history
+    }
     pub(crate) fn start_compaction(vendor: &str, view: &str, text: &str) -> Vec<NativeValue> {
         Self::start_marked(vendor, view, text, false)
     }
@@ -622,6 +682,37 @@ impl Provider {
         error: bool,
     ) {
         Self::append_result_with_image(vendor, history, call, result, error, None);
+    }
+    pub fn append_result_units(
+        vendor: &str,
+        history: &mut Vec<NativeValue>,
+        call: &ToolCall,
+        units: Vec<u16>,
+    ) {
+        Self::append_result(
+            vendor,
+            history,
+            call,
+            &String::from_utf16_lossy(&units),
+            false,
+        );
+        let item = history.last_mut().expect("appended result");
+        let text = NativeValue::text_units(units);
+        if vendor == "zai" {
+            item.set("content", text);
+        } else {
+            let mut block =
+                NativeValue::from(json!({"type":if vendor=="openai" {"input_text"} else {"text"}}));
+            block.set("text", text);
+            let content = NativeValue::array([block]);
+            if vendor == "openai" {
+                item.set("output", content);
+            } else {
+                let mut blocks = item.field("content").unwrap().elements();
+                blocks.last_mut().unwrap().set("content", content);
+                item.set("content", NativeValue::array(blocks));
+            }
+        }
     }
     pub fn append_result_with_image(
         vendor: &str,
@@ -1045,15 +1136,13 @@ impl Provider {
         submitted: Option<&(dyn Fn() -> Result<()> + Sync)>,
         native: bool,
     ) -> Result<NativeValue> {
-        let body = &**owned;
         let (vendor, _) = model_parts(model)?;
         let is_codex = model.starts_with("codex/");
         if is_codex {
             let affinity = self.cache_affinity.to_string();
             let capabilities = self.codex_capabilities(model);
-            let wire = codex::Request::prepare(body, capabilities, self.cache_affinity)?;
+            let wire = codex::Request::prepare_native(owned, capabilities, self.cache_affinity)?;
             // Keep diagnostic shape structural; serialization uses the typed request, not Value.
-            let body = wire.value()?;
             let mut credentials = self.codex.credentials(None).await?;
             let mut refreshed = false;
             for attempt in 1..=self.retries.max_attempts {
@@ -1087,7 +1176,7 @@ impl Provider {
                         attempt,
                         true,
                         submitted,
-                        &NativeValue::from(body.clone()),
+                        &wire.native()?,
                         false,
                     )
                     .await;

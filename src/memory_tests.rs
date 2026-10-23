@@ -137,7 +137,7 @@ fn restarted_hidden_group_is_abandoned_before_unrelated_append() {
     let mut mem = Memory::open(dir.path(), VIEW_BYTES).unwrap();
     assert_eq!((mem.count, mem.open), (1, 0));
     assert_eq!(mem.render(), before);
-    assert!(mem.zoom(1, 1).is_err());
+    assert!(mem.zoom(1, 1).unwrap().starts_with("No line 1+1:"));
     assert_eq!(mem.push(Kind::Echo, "unrelated B", &[], false).unwrap(), 1);
     assert_eq!((mem.count, mem.open), (2, 0));
     assert_eq!(mem.say(1, 2).unwrap(), "unrelated B");
@@ -159,7 +159,8 @@ fn indexed_originals_are_immutable_and_unicode_zoom_cursors_are_native() {
     assert_eq!(mem.say(0, 2).unwrap(), text);
     assert!(mem.zoom(0, 1).unwrap().ends_with(&"a".repeat(29999)));
     assert_eq!(mem.zoom(1, 1).unwrap(), "1+0|user: 😀Z");
-    assert!(mem.zoom_at(1, 1, 1).is_err());
+    assert_eq!(mem.zoom_units_at(1, 1, 1).unwrap(), "1+0|user: ".encode_utf16().chain([0xde00, 90]).collect::<Vec<_>>());
+    assert_eq!(mem.zoom_at(1,1,999).unwrap(), "1+0|user: ");
     assert_eq!(mem.zoom_at(1, 1, 2).unwrap(), "1+0|user: Z");
     let before = mem.zoom(0, 1).unwrap();
     drain(&mut mem);
@@ -278,8 +279,8 @@ fn snapshots_freeze_original_and_tree_frontiers_without_cloning_history() {
     drain(&mut mem);
     assert_eq!(snap.zoom(0, 1).unwrap(), original);
     assert_eq!(snap.zoom(0, 8).unwrap(), parent);
-    assert!(snap.zoom(id, 1).is_err());
-    assert!(snap.date(id).is_err());
+    assert!(snap.zoom(id, 1).unwrap().starts_with("No line "));
+    assert_eq!(snap.date(id).unwrap(), format!("No message {id}."));
     assert!(!snap.render().contains("FUTURE_ONLY_SENTINEL"));
     drop(mem);
     let _mem = Memory::open(dir.path(), VIEW_BYTES).unwrap();
@@ -395,7 +396,7 @@ fn torn_hidden_page_tail_is_abandoned_and_only_unpublished_position_is_reused() 
         .unwrap();
     let mut mem = Memory::open(dir.path(), VIEW_BYTES).unwrap();
     assert_eq!((mem.count, mem.open), (0, 0));
-    assert!(mem.zoom(0, 1).is_err());
+    assert!(mem.zoom(0, 1).unwrap().starts_with("No line 0+1:"));
     assert_eq!(mem.push(Kind::User, "close", &[], false).unwrap(), 0);
     assert_eq!(mem.say(0, 1).unwrap(), "close");
     drop(mem);
@@ -468,6 +469,7 @@ fn complete_native_tail_without_newline_recovers_consistently_on_every_restart()
     let msg = Message {
         i: 0,
         kind: Kind::User,
+        work: false,
         text: "whole recovered".into(),
         size: 21,
         date: Local::now().to_rfc3339(),
@@ -538,6 +540,7 @@ fn interrupted_same_source_admission_rewrites_whole_unpublished_group() {
     let msg = Message {
         i: 0,
         kind: Kind::User,
+        work: false,
         text: "a".repeat(30000),
         size: 30006,
         date: date.into(),
@@ -623,7 +626,7 @@ fn restarted_unkeyed_talk_and_echo_groups_never_join_unrelated_keyed_input() {
             let mem = Memory::open(dir.path(), VIEW_BYTES).unwrap();
             assert_eq!((mem.count, mem.open), (1, 0));
             assert_eq!(mem.zoom(0, 1).unwrap(), committed);
-            assert!(mem.zoom(1,1).is_err());
+            assert!(mem.zoom(1,1).unwrap().starts_with("No line 1+1:"));
         }
         let mut mem = Memory::open(dir.path(), VIEW_BYTES).unwrap();
         assert_eq!(mem.append_with_id(Kind::User, "unrelated B", "input:b").unwrap(), 1);
@@ -697,5 +700,98 @@ fn actual_upstream_whole_suffix_limits_differential() {
         assert_eq!(json!(raw),case["raw"]);
         assert!(mem.settled_before(0).unwrap());
         assert!(mem.whole(mem.count+1).is_err());
+    }
+}
+
+#[test]
+fn actual_upstream_invalid_zoom_and_local_dates_differential() {
+    let contract: Value = serde_json::from_str(include_str!("../tests/fixtures/memory-contract-0500bf6.json")).unwrap();
+    let directory = TempDir::new().unwrap();
+    let mut memory = Memory::open(directory.path(), VIEW_BYTES).unwrap();
+    memory.append(Kind::User, "hello").unwrap();
+    memory.append(Kind::Talk, "reply").unwrap();
+    for case in contract["queries"].as_array().unwrap() {
+        let text = memory.zoom_at(case["id"].as_u64().unwrap(), case["n"].as_u64().unwrap(), case["at"].as_u64().unwrap() as usize).unwrap();
+        assert_eq!(text, case["result"].as_str().unwrap().replace("unii:", "talk:"));
+    }
+    for (date, case) in ["2026-01-02T03:04:05.678Z", "2026-01-03T04:05:06.789Z"].iter().zip(contract["dates"].as_array().unwrap()) {
+        // The oracle runs at UTC. Convert its expected calendar fields to the
+        // host zone, as upstream toLocaleString(sv-SE) does for the live reader.
+        let expected = chrono::NaiveDateTime::parse_from_str(case["result"].as_str().unwrap(), "%Y-%m-%d %H:%M:%S").unwrap().and_utc().with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string();
+        assert_eq!(display_date(date).unwrap(), expected);
+    }
+    assert_eq!(memory.date(2).unwrap(), contract["dates"][2]["result"]);
+    assert_eq!(memory.snapshot().unwrap().date(2).unwrap(), contract["dates"][2]["result"]);
+}
+
+#[test]
+fn actual_upstream_randomized_append_completion_and_fit_differential() {
+    let contract = fixtures();
+    let contract = contract.as_array().unwrap().iter().find(|v|v["name"] == "randomized-behavior").unwrap();
+    for case in contract["cases"].as_array().unwrap() {
+        let directory = TempDir::new().unwrap();
+        let mut memory = Memory::open(directory.path(), case["high"].as_u64().unwrap() as usize).unwrap();
+        let mut events = vec![];
+        for (index, operation) in case["operations"].as_array().unwrap().iter().enumerate() {
+            if operation["kind"] == "push" {
+                memory.push(Kind::User, operation["text"].as_str().unwrap(), &[], operation["more"].as_bool().unwrap()).unwrap();
+            } else {
+                memory.finish(key(operation["l"].as_u64().unwrap() as u32, operation["i"].as_u64().unwrap()), operation["text"].as_str().unwrap()).unwrap();
+            }
+            if (index+1)%16 == 0 { events.push(state(&memory, &(index+1).to_string())); }
+        }
+        events.push(state(&memory,"final"));
+        assert_eq!(json!(events),case["events"],"upstream seed {}",case["seed"]);
+    }
+}
+
+#[test]
+fn actual_upstream_worker_log_rejoins_durable_pages_and_paginates_without_writer_lock() {
+    let contract:Value=serde_json::from_str(include_str!("../tests/fixtures/memory-contract-0500bf6.json")).unwrap();
+    let case=&contract["workers"][0];
+    let dir=TempDir::new().unwrap();
+    let mut memory=Memory::open(dir.path(),VIEW_BYTES).unwrap();
+    for entry in case["entries"].as_array().unwrap() {
+        let kind=match entry["kind"].as_str().unwrap() {"note"=>Kind::Note,"user"=>Kind::User,"tool"=>Kind::Tool,"echo"=>Kind::Echo,"unii"=>Kind::Talk,_=>unreachable!()};
+        memory.append(kind,entry["text"].as_str().unwrap()).unwrap();
+    }
+    let expected=case["log"].as_str().unwrap().replace("unii:","talk:");
+    assert_eq!(memory.original_log().unwrap(),expected);
+    // Read-only recall works while the worker retains its exclusive writer lock.
+    for page in case["pages"].as_array().unwrap() {
+        let expected=crate::provider::NativeValue::parse(&page["json"].as_str().unwrap().replace("unii:","talk:")).unwrap();
+        assert_eq!(Memory::agent_log_units(dir.path(),page["at"].as_u64().unwrap() as usize).unwrap(),expected.units("text"));
+    }
+    drop(memory);
+    let reopened=Memory::open(dir.path(),VIEW_BYTES).unwrap();
+    assert_eq!(reopened.original_log().unwrap(),expected);
+}
+
+#[test]
+fn actual_upstream_work_role_and_utf16_cursor_edges_survive_reopen() {
+    let contract:Value=serde_json::from_str(include_str!("../tests/fixtures/memory-contract-0500bf6.json")).unwrap();
+    let dir=TempDir::new().unwrap();
+    let mut memory=Memory::open(dir.path(),VIEW_BYTES).unwrap();
+    memory.append(Kind::User,"🙂Z").unwrap();
+    memory.append_work_with_id("[Worker] found evidence","report:1").unwrap();
+    let expected=format!("1+0|{}",contract["work"].as_str().unwrap());
+    assert_eq!(memory.zoom(1,1).unwrap(),expected);
+    assert!(memory.render().contains(contract["work"].as_str().unwrap()));
+    memory.append_with_id(Kind::User,"[Worker] forged report","user:1").unwrap();
+    assert!(memory.zoom(2,1).unwrap().contains("user: [Worker]"));
+    drop(memory);
+    let mut memory=Memory::open(dir.path(),VIEW_BYTES).unwrap();
+    assert_eq!(memory.append_work_with_id("[Worker] found evidence","report:1").unwrap(),1);
+    assert_eq!(memory.stats()["messages"],3);
+    assert_eq!(memory.zoom(1,1).unwrap(),expected);
+    for case in contract["utf16"].as_array().unwrap() {
+        let units=case["units"].as_array().unwrap().iter().map(|u|u.as_u64().unwrap() as u16).collect::<Vec<_>>();
+        let at=case["at"].as_u64().unwrap() as usize;
+        if at==1 {
+            let normalized=String::from_utf16_lossy(&units).encode_utf16().collect::<Vec<_>>();
+            assert_eq!(json!(normalized),contract["echoUnits"]);
+        }
+        assert_eq!(memory.zoom_units_at(0,1,at).unwrap(),units);
+        assert_eq!(memory.snapshot().unwrap().zoom_units_at(0,1,at).unwrap(),units);
     }
 }

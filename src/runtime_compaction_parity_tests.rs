@@ -220,7 +220,7 @@ async fn native_channel_worker_sends_exact_selected_view_and_raw_suffix_to_fake_
     let request=mock.requests.lock().await[0].clone();
     let contract:Value=serde_json::from_str(include_str!("../tests/fixtures/compactor-contract-0500bf6.json")).unwrap();
     let raw=attributed_large_batch_suffix(&contract).join("\n\n");
-    let expected=Provider::start("openai",&expected_view,&raw);
+    let expected=Provider::start_turn("openai",&expected_view,&raw,None);
     assert_eq!(request["input"].as_array().unwrap().iter().filter(|v|v["role"]=="user").cloned().collect::<Vec<_>>(),expected);
     assert!(raw.len()<inputs.iter().map(|i|i.text.len()).sum::<usize>());
     h.shutdown.cancel();mock.release.notify_one();
@@ -399,4 +399,98 @@ async fn compactor_committed_publication_before_shutdown_survives_native_reopen(
     assert_eq!(compaction_journal_bytes(&bank),journal);
     assert_eq!(mock.requests.lock().await.len(),1);
     server.abort();
+}
+
+#[test]
+fn actual_upstream_shared_memory_prompt_and_worker_boundary() {
+    let contract: Value = serde_json::from_str(include_str!("../tests/fixtures/memory-contract-0500bf6.json")).unwrap();
+    let upstream = contract["master"].as_str().unwrap().replace("Unii", "Pantheon").replace("- unii:", "- talk:");
+    let root = system_prompt(false, false, "catalogue", "operator rules");
+    assert!(root.starts_with(&upstream));
+    assert!(root.ends_with("operator rules"));
+    let child = system_prompt(true, false, "catalogue", "operator rules");
+    assert!(!child.contains("# Compactions"));
+    assert!(!child.contains("You write Pantheon's memory"));
+}
+
+#[tokio::test]
+async fn actual_upstream_chat_call_reaches_harness_provider_with_its_turn_header() {
+    let contract: Value = serde_json::from_str(include_str!("../tests/fixtures/memory-contract-0500bf6.json")).unwrap();
+    for vendor in ["openai", "anthropic"] {
+        for case in contract["turns"].as_array().unwrap() {
+            let (_directory, h, run, mock, server) = fixture(vendor, vec![final_response(vendor, "done")]).await;
+            h.store.set_settings(1, &format!("{vendor}/gpt-6-fixture"), "medium").unwrap();
+            let context = crate::ui::ReplyContext::request("native-turn");
+            for (index, length) in case["lengths"].as_array().unwrap().iter().enumerate() {
+                let text = if length == 17 { "inspect brief.zip".to_owned() } else { (if index == 0 { "a" } else { "b" }).repeat(length.as_u64().unwrap() as usize) };
+                let input = Input {id: format!("native-turn-{index}"), channel: 1, user: 2, text};
+                h.store.bind_context(&input.id, &context).unwrap();
+                h.store.admit(&input).unwrap();
+            }
+            let channel = run.memory.clone();
+            let changed = channel.changed.notified(); tokio::pin!(changed); changed.as_mut().enable();
+            let owner = h.clone(); let selected = channel.clone();
+            let worker = tokio::spawn(async move { owner.channel_worker(1, selected).await });
+            changed.await;
+            {
+                let mut memory = channel.memory.lock().await;
+                let jobs = memory.ready_jobs(usize::MAX);
+                for key in jobs.into_iter().filter(|key| key.level == 0) {
+                    memory.finish(key, &format!("summary {}/{}", key.level, key.index)).unwrap();
+                }
+            }
+            channel.changed.notify_waiters();
+            tokio::time::timeout(Duration::from_secs(5), mock.started.notified()).await.unwrap();
+            let request = mock.requests.lock().await[0].clone();
+            let messages = request[if vendor == "openai" { "input" } else { "messages" }].as_array().unwrap();
+            let blocks = messages.iter().find(|v| v["role"] == "user").unwrap()["content"].as_array().unwrap();
+            let task = blocks.last().unwrap()["text"].as_str().unwrap();
+            let view = blocks[..blocks.len()-1].iter().filter(|b| !b["text"].as_str().unwrap().starts_with("Agents at work now:")).map(|b| b["text"].as_str().unwrap()).collect::<String>();
+            let digest = |text: &str| json!({"bytes":text.len(),"sha256":hex::encode(sha2::Sha256::digest(text.as_bytes()))});
+            assert_eq!(digest(task), json!({"bytes":case["task"]["bytes"],"sha256":case["task"]["sha256"]}), "{vendor} raw task construction");
+            assert_eq!(digest(&view), case["view"], "{vendor} selected memory context");
+            assert!(blocks.last().unwrap().get(if vendor == "openai" { "prompt_cache_breakpoint" } else { "cache_control" }).is_some());
+            h.shutdown.cancel(); mock.release.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), worker).await.unwrap().unwrap().unwrap();
+            server.abort();
+        }
+    }
+}
+
+#[test]
+fn actual_upstream_worker_prompt_and_log_request_boundaries() {
+    let contract:Value=serde_json::from_str(include_str!("../tests/fixtures/memory-contract-0500bf6.json")).unwrap();
+    let case=&contract["workers"][0];
+    let expected=case["system"].as_str().unwrap().replace("Unii","Pantheon").replace("unii\n","talk\n");
+    let actual=system_prompt(true,false,"","OPERATOR RULE");
+    assert!(actual.starts_with(&expected));
+    assert!(actual.ends_with("OPERATOR RULE"));
+    assert!(!actual.contains("# Compactions"));
+    for vendor in ["openai","anthropic"] {
+        for key in ["hot","cold"] {
+            let blocks=case[key].as_array().unwrap();
+            let view=(key=="hot").then(||blocks[0]["text"].as_str().unwrap());
+            let history=Provider::start_worker(vendor,view,&case["log"].as_str().unwrap().replace("unii:","talk:"));
+            let content=history[0]["content"].as_array().unwrap();
+            assert_eq!(content.last().unwrap()["text"],case["log"].as_str().unwrap().replace("unii:","talk:"));
+            assert!(content.last().unwrap().get(if vendor=="openai" {"prompt_cache_breakpoint"} else {"cache_control"}).is_some());
+            assert_eq!(content[..content.len()-1].iter().map(|b|b["text"].as_str().unwrap()).collect::<String>(),view.unwrap_or(""));
+        }
+    }
+}
+
+#[test]
+fn actual_upstream_active_agent_status_is_unmarked_and_outside_the_memory_prefix() {
+    let contract:Value=serde_json::from_str(include_str!("../tests/fixtures/memory-contract-0500bf6.json")).unwrap();
+    for vendor in ["openai","anthropic"] {
+        for case in contract["atWork"].as_array().unwrap() {
+            let names=case["names"].as_array().unwrap().iter().map(|v|v.as_str().unwrap().to_owned()).collect::<Vec<_>>();
+            let history=Provider::start_turn_with_agents(vendor,"<chat>\n</chat>\n","task",None,&names);
+            let blocks=history[0]["content"].as_array().unwrap();
+            let status=&blocks[blocks.len()-2];
+            assert_eq!(status["text"],case["text"]);
+            assert!(status.get("prompt_cache_breakpoint").is_none()&&status.get("cache_control").is_none());
+            assert_eq!(blocks.last().unwrap()["text"],"Turn: the user's new message:\n\ntask");
+        }
+    }
 }

@@ -1,13 +1,11 @@
 # Native memory and provider parity acceptance
 
 Reference: VictorTaelin/uniichat `0500bf6a8ea4bf0ce047488562022b1b6532cc30`.
-This local candidate descends from frozen V13b. It implements the previously
-known F2 representation gap; implementation is not independent acceptance.
-Source fixtures alone do not establish full parity, exact-source package
-clearance or migration readiness.
-The independent finite D1-D12 acceptance ledger and hash-bound execution receipts
-are maintained outside the runtime. Historical fixture counts, parent reviews
-and development runs do not clear an unfrozen successor.
+The target is memory behavior with Pantheon integrations and durability retained.
+This matrix names deterministic test coverage and boundaries; it does not imply
+identical model outputs, provider cache-hit rates or migration/deployment approval.
+The D1-D12 cases below cover native provider ownership independently of the
+memory engine and root/worker request construction.
 
 ## Scope and carry-forward mechanisms
 
@@ -21,11 +19,13 @@ and development runs do not clear an unfrozen successor.
 | Summaries | Five answered length tries; shortest nonempty UTF8 answer, first tie, oversize retained rather than clipped. Only latest correction plus original context; refusal/empty fallback and patient retry ownership remain distinct from transport retries. |
 | Native public transport | OpenAI/Anthropic eight-attempt native retry/event-idle lifecycle and Anthropic pause continuation remain implemented. Do not infer a four-attempt native defect from the separate generic retry helper. Existing tests cover terminal SSE, idle refresh and request cancellation. |
 | Cache | Four-line blocks and supported actual marks; explicit durable private routing affinity. Longest-prefix/one-extension coordination, TTL/LRU and leader/follower failure/cancellation behavior. No Codex/Z.ai Anthropic-cache or real cache-hit claim. |
-| Product integration | Actual root, worker, curator draft/reviewer Session and compactor callers use native memory, owned ephemeral histories and ordinary tools/readers. Worker prompt is frozen but worker zoom/date reads the live root as pinned upstream does; private maintenance uses its explicit immutable snapshot. |
+| Root request construction | Actual `Chat.call` oracle compared with the production channel actor: canonical shared memory prompt, `Turn:` header, marked raw suffix and unmarked agent status/notices. `actual_upstream_chat_call_reaches_harness_provider_with_its_turn_header`. |
+| Worker memory | Canonical subagent/view instructions without Compactions; full private original log with logical entry numbering, named paged recall, new settled view for idle `tell`, retained view for background continuation, empty view on cold restore. `actual_upstream_worker_prompt_and_log_request_boundaries`, `native_worker_recall_tell_and_cold_resume_use_original_private_log`. |
+| Attribution and retrieval | Trusted worker reports render as `work`; user text cannot impersonate that role. Missing zoom/date return reference text; UTF16 cursor units survive native and Codex writers. `actual_upstream_work_role_and_utf16_cursor_edges_survive_reopen`, `owned_recall_cursor_preserves_utf16_through_native_and_subscription_writers`. |
+| Product integration | Discord channel ownership, attachments and execution tools remain Pantheon-owned. Numeric worker recall reads the live root; maintenance readers use frozen snapshots. Durable journals, locks and private provider affinity remain. |
 
-These are implemented mechanisms with scoped parent evidence. Frozen successor
-checks must establish affected regressions; this table is not a percentage or
-all-product equivalence claim.
+These rows describe tested behavior, not a percentage or all-product equivalence
+claim. The engine oracle also compares randomized completion/fit schedules.
 
 ## Finite successor acceptance cases
 

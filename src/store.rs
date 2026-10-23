@@ -114,6 +114,19 @@ impl Store {
                 [],
             )?;
         }
+        let inbox_columns = db
+            .prepare("PRAGMA table_info(inbox)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if !inbox_columns.iter().any(|c| c == "work") {
+            db.execute(
+                "ALTER TABLE inbox ADD COLUMN work INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS worker_views(id TEXT PRIMARY KEY,view TEXT NOT NULL);",
+        )?;
         crate::attachments::initialize(&db)?;
         Ok(Self { db: Mutex::new(db) })
     }
@@ -162,6 +175,15 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(admitted)
+    }
+    pub fn input_is_work(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT work!=0 FROM inbox WHERE id=?1", [id], |r| r.get(0))
+            .optional()?
+            .unwrap_or(false))
     }
     pub fn queued(&self, channel: u64) -> Result<Vec<Input>> {
         let db = self.db.lock().unwrap();
@@ -925,6 +947,53 @@ impl Store {
     pub fn agent(&self, id: &str) -> Result<Option<AgentRecord>> {
         Ok(self.db.lock().unwrap().query_row("SELECT t.channel,t.user,t.task,COALESCE(t.report,''),a.model,a.reasoning FROM tasks t JOIN agent_settings a ON a.id=t.id WHERE t.id=?1",[id],|r|Ok(AgentRecord{channel:r.get::<_,String>(0)?.parse().unwrap_or(0),user:r.get::<_,String>(1)?.parse().unwrap_or(0),task:r.get(2)?,report:r.get(3)?,model:r.get(4)?,reasoning:r.get(5)?})).optional()?)
     }
+    pub fn working_names(&self, channel: u64, ids: &[String]) -> Result<Vec<String>> {
+        let db = self.db.lock().unwrap();
+        let mut statement=db.prepare("SELECT t.rowid,COALESCE(u.name,'Worker') FROM tasks t LEFT JOIN ui_agents u ON u.owner=t.id WHERE t.channel=?1 AND t.id=?2")?;
+        let mut names = Vec::<(i64, String)>::new();
+        for id in ids {
+            if let Some(row) = statement
+                .query_row(params![channel.to_string(), id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()?
+            {
+                names.push(row);
+            }
+        }
+        names.sort_by_key(|(order, _)| *order);
+        Ok(names.into_iter().map(|(_, name)| name).collect())
+    }
+    pub fn agent_id(&self, channel: u64, name: &str) -> Result<Option<String>> {
+        let db = self.db.lock().unwrap();
+        if let Some(id) = db
+            .query_row(
+                "SELECT id FROM tasks WHERE channel=?1 AND id=?2",
+                params![channel.to_string(), name],
+                |r| r.get(0),
+            )
+            .optional()?
+        {
+            return Ok(Some(id));
+        }
+        let ids = db.prepare("SELECT t.id FROM tasks t JOIN ui_agents a ON a.owner=t.id WHERE t.channel=?1 AND a.name=?2 LIMIT 2")?.query_map(params![channel.to_string(),name], |r|r.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
+        ensure!(ids.len() <= 1, "agent name is ambiguous; use its worker ID");
+        Ok(ids.into_iter().next())
+    }
+    pub fn worker_view(&self, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT view FROM worker_views WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+    pub fn set_worker_view(&self, id: &str, view: &str) -> Result<()> {
+        self.db.lock().unwrap().execute("INSERT INTO worker_views(id,view) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET view=excluded.view", params![id,view])?;
+        Ok(())
+    }
     pub fn admit_event(&self, input: &Input, owner: &str) -> Result<()> {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
@@ -1319,7 +1388,7 @@ fn deliver_event(
     crate::ui::copy_context(tx, owner, id)?;
     if owner == format!("channel:{channel}") {
         if tx.execute(
-            "INSERT OR IGNORE INTO inbox(id,channel,user,text,created) VALUES(?1,?2,?3,?4,?5)",
+            "INSERT OR IGNORE INTO inbox(id,channel,user,text,created,work) VALUES(?1,?2,?3,?4,?5,1)",
             params![id, channel.to_string(), user.to_string(), text, now()],
         )? == 1
         {

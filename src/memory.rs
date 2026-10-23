@@ -94,6 +94,8 @@ impl NodeKey {
 struct Message {
     i: u64,
     kind: Kind,
+    #[serde(default, skip_serializing_if = "is_false")]
+    work: bool,
     text: String,
     size: usize,
     date: String,
@@ -104,6 +106,16 @@ struct Message {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     images: Vec<String>,
 }
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Default)]
+struct MessageOptions<'a> {
+    date: Option<&'a str>,
+    work: bool,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct Node {
     l: u32,
@@ -367,12 +379,26 @@ impl MemorySnapshot {
     }
     pub fn zoom_at(&self, id: u64, n: u64, at: usize) -> Result<String> {
         let (main, tree) = self.journals()?;
+        Ok(String::from_utf16_lossy(&zoom(
+            &main,
+            &tree,
+            self.count,
+            self.serial,
+            id,
+            n,
+            at,
+        )?))
+    }
+    pub fn zoom_units_at(&self, id: u64, n: u64, at: usize) -> Result<Vec<u16>> {
+        let (main, tree) = self.journals()?;
         zoom(&main, &tree, self.count, self.serial, id, n, at)
     }
     pub fn date(&self, id: u64) -> Result<String> {
-        ensure!(id < self.count, "No message {id}.");
+        if id >= self.count {
+            return Ok(format!("No message {id}."));
+        }
         let (main, _) = self.journals()?;
-        Ok(main.read::<Message>(id)?.context("missing original")?.date)
+        display_date(&main.read::<Message>(id)?.context("missing original")?.date)
     }
 }
 impl Drop for Memory {
@@ -638,16 +664,31 @@ impl Memory {
         Ok(())
     }
     pub fn append(&mut self, kind: Kind, text: &str) -> Result<u64> {
-        self.append_entry(kind, text, &[], false, None, None)
+        self.append_entry(kind, text, &[], false, None, MessageOptions::default())
     }
     pub fn append_with_id(&mut self, kind: Kind, text: &str, source_id: &str) -> Result<u64> {
+        self.append_sourced(kind, text, source_id, false)
+    }
+    pub fn append_work_with_id(&mut self, text: &str, source_id: &str) -> Result<u64> {
+        self.append_sourced(Kind::User, text, source_id, true)
+    }
+    fn append_sourced(
+        &mut self,
+        kind: Kind,
+        text: &str,
+        source_id: &str,
+        work: bool,
+    ) -> Result<u64> {
         ensure!(!source_id.is_empty(), "empty source ID");
         if let Some(id) = self.sources.get(source_id).copied() {
             let mut joined = String::new();
             let mut i = id;
             loop {
                 let msg = self.message(i)?;
-                ensure!(msg.kind == kind, "admission kind mismatch");
+                ensure!(
+                    msg.kind == kind && msg.work == work,
+                    "admission kind mismatch"
+                );
                 joined.push_str(&msg.text);
                 i += 1;
                 if !msg.more {
@@ -660,7 +701,17 @@ impl Memory {
             );
             return Ok(id);
         }
-        self.append_entry(kind, text, &[], false, Some(source_id), None)
+        self.append_entry(
+            kind,
+            text,
+            &[],
+            false,
+            Some(source_id),
+            MessageOptions {
+                work,
+                ..Default::default()
+            },
+        )
     }
     pub fn has_source(&self, source_id: &str) -> bool {
         self.lookup_source(source_id).is_some()
@@ -677,7 +728,7 @@ impl Memory {
     /// Images are immutable names managed by the attachment owner; the memory
     /// engine stores/retrieves their references, never decodes or executes them.
     pub fn push(&mut self, kind: Kind, text: &str, images: &[String], more: bool) -> Result<u64> {
-        self.append_entry(kind, text, images, more, None, None)
+        self.append_entry(kind, text, images, more, None, MessageOptions::default())
     }
     fn append_entry(
         &mut self,
@@ -686,13 +737,14 @@ impl Memory {
         images: &[String],
         more: bool,
         source_id: Option<&str>,
-        date: Option<&str>,
+        options: MessageOptions<'_>,
     ) -> Result<u64> {
         self.healthy()?;
         let first = self.count + self.open;
         let texts = clip_pages(text);
         let n = texts.len().max(images.len().div_ceil(20));
-        let date = date
+        let date = options
+            .date
             .map(str::to_owned)
             .unwrap_or_else(|| Local::now().to_rfc3339());
         let records: Vec<_> = (0..n)
@@ -707,6 +759,7 @@ impl Memory {
                 let mut msg = Message {
                     i,
                     kind,
+                    work: options.work,
                     size: 0,
                     text,
                     date: date.clone(),
@@ -1033,6 +1086,9 @@ impl Memory {
         self.zoom_at(id, n, 0)
     }
     pub fn zoom_at(&self, id: u64, n: u64, at: usize) -> Result<String> {
+        Ok(String::from_utf16_lossy(&self.zoom_units_at(id, n, at)?))
+    }
+    pub fn zoom_units_at(&self, id: u64, n: u64, at: usize) -> Result<Vec<u16>> {
         zoom(
             &self.main_log,
             &self.tree_log,
@@ -1044,13 +1100,37 @@ impl Memory {
         )
     }
     pub fn date(&self, id: u64) -> Result<String> {
-        Ok(self.message(id)?.date)
+        if id >= self.count {
+            return Ok(format!("No message {id}."));
+        }
+        display_date(&self.message(id)?.date)
     }
     pub fn stats(&self) -> serde_json::Value {
         serde_json::json!({"format":"uniichat-0500bf6-v1","messages":self.count,"open_pages":self.open,"summaries":self.serial,
             "resident_nodes":self.nodes.len(),"view_lines":self.view.parts.len(),"view_bytes":part_bytes(&self.view.parts,&self.nodes),
             "view_budget_bytes":self.budget,"compactor_view_bytes":part_bytes(&self.seen.parts,&self.nodes),
             "compactor_budget_bytes":COMPACTOR_BYTES,"compactor_frontier":self.first_unbuilt(),"settled":self.is_settled(),"ready_jobs":self.ready.len(),"journal_healthy":!self.poisoned})
+    }
+    /// Read a worker's original log without taking its writer lock or changing
+    /// indexes. The atomic checkpoint bounds the reader to published originals.
+    pub fn agent_log(directory: &Path, at: usize) -> Result<String> {
+        Ok(String::from_utf16_lossy(&Self::agent_log_units(
+            directory, at,
+        )?))
+    }
+    pub fn agent_log_units(directory: &Path, at: usize) -> Result<Vec<u16>> {
+        let saved: SavedView = serde_json::from_slice(&fs::read(directory.join("view.json"))?)?;
+        let main = Journal {
+            #[cfg(test)]
+            fault: WriteFault::default(),
+            directory: directory.join("main"),
+            index: File::open(directory.join("main.index"))?,
+            current: None,
+        };
+        Ok(clip_page_units(&original_log(&main, saved.messages)?, at))
+    }
+    pub fn original_log(&self) -> Result<String> {
+        original_log(&self.main_log, self.count)
     }
     pub fn export_html(&self) -> String {
         // An operator export deliberately materializes its output, not live RAM.
@@ -1171,18 +1251,34 @@ fn zoom(
     id: u64,
     n: u64,
     at: usize,
-) -> Result<String> {
-    ensure!(
-        n.is_power_of_two()
-            && id.is_multiple_of(n)
-            && id.checked_add(n).is_some_and(|e| e <= count),
-        "No line {id}+{n}."
-    );
+) -> Result<Vec<u16>> {
+    if !(n.is_power_of_two()
+        && id.is_multiple_of(n)
+        && id.checked_add(n).is_some_and(|e| e <= count))
+    {
+        let roots = roots(count)
+            .iter()
+            .map(|key| format!("{}+{}", key.start(), key.count()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Ok(format!(
+            "No line {id}+{n}: n is a power of 2, id a multiple of n. The tree's roots: {roots}."
+        )
+        .encode_utf16()
+        .collect());
+    }
     if n == 1 {
         let msg: Message = main.read(id)?.context("missing original")?;
         let mut page = msg.clone();
-        page.text = clip_page(&msg.text, at)?;
-        return Ok(format!("{id}+0|{}", show(&page, at == 0)));
+        page.text.clear();
+        let prefix = format!("{id}+0|{}", show(&page, false));
+        let mut out = prefix.encode_utf16().collect::<Vec<_>>();
+        out.extend(clip_page_units(&msg.text, at));
+        if at == 0 {
+            let shown = show(&page, true);
+            out.extend(shown[show(&page, false).len()..].encode_utf16());
+        }
+        return Ok(out);
     }
     let key = NodeKey {
         level: n.ilog2(),
@@ -1196,7 +1292,37 @@ fn zoom(
         let text = node.map_or_else(|| PLACEHOLDER.to_owned(), |n| flatten(&n.text));
         lines.push(format!("{}+{}|{text}", half.start(), half.count()));
     }
-    Ok(lines.join("\n"))
+    Ok(lines.join("\n").encode_utf16().collect())
+}
+
+fn display_date(date: &str) -> Result<String> {
+    Ok(chrono::DateTime::parse_from_rfc3339(date)?
+        .with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string())
+}
+
+fn original_log(main: &Journal, count: u64) -> Result<String> {
+    let mut lines = Vec::new();
+    let mut page = 0;
+    while page < count {
+        let mut original: Message = main.read(page)?.context("missing worker original")?;
+        page += 1;
+        while original.more && page < count {
+            let next: Message = main.read(page)?.context("missing worker continuation")?;
+            ensure!(
+                original.kind == next.kind,
+                "worker entry kind changed within its pages"
+            );
+            original.text.push_str(&next.text);
+            original.images.extend(next.images);
+            original.more = next.more;
+            page += 1;
+        }
+        ensure!(!original.more, "worker entry is unpublished");
+        lines.push(format!("{}|{}", lines.len(), show(&original, true)));
+    }
+    Ok(lines.join("\n\n"))
 }
 
 /// JavaScript Clip.clip_end: count UTF-16 code units, prefer the last newline
@@ -1234,31 +1360,31 @@ pub fn clip_pages(text: &str) -> Vec<String> {
     }
     pages
 }
-fn clip_page(text: &str, at: usize) -> Result<String> {
-    let mut units = 0;
-    let mut start = None;
-    for (byte, ch) in text.char_indices() {
-        if units == at {
-            start = Some(byte);
-            break;
-        }
-        units += ch.len_utf16();
+pub(crate) fn clip_page_units(text: &str, at: usize) -> Vec<u16> {
+    let units = text.encode_utf16().collect::<Vec<_>>();
+    let start = at.min(units.len());
+    let end = if units.len() - start <= TOOL_CHARS {
+        units.len()
+    } else {
+        let cap = start + TOOL_CHARS;
+        units[start..cap]
+            .iter()
+            .rposition(|c| *c == 10)
+            .map(|i| start + i + 1)
+            .unwrap_or(cap - usize::from((units[cap] >> 10) == 0x37))
+    };
+    let mut out = units[start..end].to_vec();
+    if end < units.len() {
+        out.extend(
+            format!(
+                "\n[characters {}-{end} of {}; go on with at {end}]",
+                at + 1,
+                units.len()
+            )
+            .encode_utf16(),
+        );
     }
-    if at == text.encode_utf16().count() {
-        start = Some(text.len())
-    }
-    let start = start.context("at must be a UTF-16 character boundary within the page")?;
-    let end = page_end(text, start);
-    let mut out = text[start..end].to_owned();
-    if end < text.len() {
-        let next = text[..end].encode_utf16().count();
-        out.push_str(&format!(
-            "\n[characters {}-{next} of {}; go on with at {next}]",
-            at + 1,
-            text.encode_utf16().count()
-        ))
-    }
-    Ok(out)
+    out
 }
 
 /// Four-line blocks, with a separate opening and incomplete tail. Provider
@@ -1410,7 +1536,11 @@ pub fn compaction_over(line: &str) -> String {
 }
 
 fn show(msg: &Message, images: bool) -> String {
-    let mut out = format!("{}: {}", msg.kind.as_str(), msg.text);
+    let mut out = format!(
+        "{}: {}",
+        if msg.work { "work" } else { msg.kind.as_str() },
+        msg.text
+    );
     if images {
         for name in &msg.images {
             out.push_str(&format!("\n[image docs/images/{name}]"))

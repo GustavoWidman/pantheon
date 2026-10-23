@@ -488,7 +488,7 @@ async fn ordinary_task_and_compaction_choose_their_own_behavior() {
             &model,
             "high",
             &system,
-            &Provider::start("openai", &view, task),
+            &Provider::start_turn("openai", &view, task, None),
             &defs,
         )
         .await
@@ -541,7 +541,7 @@ async fn ordinary_task_and_compaction_choose_their_own_behavior() {
             &model,
             "high",
             &system,
-            &Provider::start("openai", "<chat>\n</chat>\n", "hey, how's it going?"),
+            &Provider::start_turn("openai", "<chat>\n</chat>\n", "hey, how's it going?", None),
             &defs,
         )
         .await
@@ -558,4 +558,51 @@ async fn ordinary_task_and_compaction_choose_their_own_behavior() {
     println!(
         "PASS: ordinary artifact request acts, compaction summarizes, greeting converses; no tool calls executed"
     );
+}
+
+/// Optional local incident replay. The fixture contains private conversation;
+/// only its path is passed through the environment, never checked into git.
+#[tokio::test]
+#[ignore = "requires a Codex login and PANTHEON_TEST_INCIDENT_FIXTURE; no tools execute"]
+async fn recovered_incident_with_native_turn_construction() {
+    let path =
+        std::env::var("PANTHEON_TEST_INCIDENT_FIXTURE").expect("private fixture path required");
+    let fixture: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let system = pantheon::runtime::system_prompt_with_claude(
+        false,
+        false,
+        true,
+        &format!(
+            "{}\n{}",
+            pantheon::skill_library::INDEX,
+            fixture["catalogue"].as_str().unwrap()
+        ),
+        fixture["instructions"].as_str().unwrap(),
+    );
+    let task = fixture["task"].as_str().unwrap();
+    let (notice, task) = task
+        .split_once("</system-notification>\n\n")
+        .map(|(notice, task)| (Some(format!("{notice}</system-notification>")), task))
+        .unwrap_or((None, task));
+    let history = Provider::start_turn(
+        "openai",
+        fixture["view"].as_str().unwrap(),
+        task,
+        notice.as_deref(),
+    );
+    let model =
+        std::env::var("PANTHEON_TEST_CODEX_MODEL").unwrap_or_else(|_| "codex/gpt-6.1-sol".into());
+    let provider = Provider::new(120).unwrap();
+    let defs = tools::definitions_with_claude(false, false, true);
+    for _ in 0..3 {
+        let response = provider
+            .step(&model, "high", &system, &history, &defs)
+            .await
+            .unwrap();
+        assert!(
+            !response.calls.is_empty(),
+            "recovered ordinary task must initiate work"
+        );
+    }
+    println!("PASS: recovered incident initiated work in all 3 replays; no tools executed");
 }

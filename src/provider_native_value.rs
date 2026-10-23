@@ -18,6 +18,9 @@ impl std::fmt::Debug for NativeValue {
     }
 }
 impl NativeValue {
+    pub(crate) fn text_units(units: Vec<u16>) -> Self {
+        Self::new(Json::String(units))
+    }
     pub(crate) fn new(source: Json) -> Self {
         let view = project(&source);
         Self { source, view }
@@ -83,6 +86,11 @@ pub(crate) fn project(value: &Json) -> Value {
         _ => serde_json::from_str(&value.stringify()).unwrap_or(Value::Null),
     }
 }
+impl<'de> serde::Deserialize<'de> for NativeValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Value::deserialize(deserializer).map(Self::from)
+    }
+}
 impl From<Value> for NativeValue {
     fn from(value: Value) -> Self {
         Self::new(Json::parse(&value.to_string()).expect("typed JSON"))
@@ -137,6 +145,34 @@ pub(super) fn prepare_request(
 ) -> anyhow::Result<NativeValue> {
     use serde_json::json;
     let mut out = NativeValue::from(body.clone());
+    if model.starts_with("codex/") {
+        let mut input = Vec::new();
+        if let Some(first) = body["input"]
+            .as_array()
+            .and_then(|v| v.first())
+            .filter(|v| v["role"] == "developer")
+        {
+            input.push(first.clone().into());
+        }
+        for source in history {
+            let mut item = source.clone();
+            if item.get("type").is_none() && item.get("role").is_some() {
+                item.set("type", json!("message"));
+            }
+            if let Some(content) = item.field("content").filter(|c| c.is_array()) {
+                item.set(
+                    "content",
+                    NativeValue::array(content.elements().into_iter().map(|mut b| {
+                        b.remove("prompt_cache_breakpoint");
+                        b
+                    })),
+                );
+            }
+            input.push(item);
+        }
+        out.set("input", NativeValue::array(input));
+        return Ok(out);
+    }
     if !(model.starts_with("anthropic/") || model.starts_with("openai/")) {
         return Ok(out);
     }

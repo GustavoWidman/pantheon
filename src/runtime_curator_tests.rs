@@ -80,16 +80,17 @@ async fn curator_idle_publication_waits_for_real_input_and_preserves_memory_pref
         let requests = mock.requests.lock().await;
         let blocks = requests[0]["input"][1]["content"].as_array().unwrap();
         assert_eq!(
-            blocks[..blocks.len() - 1]
+            blocks[..blocks.len() - 3]
                 .iter()
                 .map(|b| b["text"].as_str().unwrap())
                 .collect::<String>(),
             before
         );
-        let incoming = blocks.last().unwrap()["text"].as_str().unwrap();
+        let incoming = blocks[blocks.len()-2]["text"].as_str().unwrap();
         assert!(incoming.starts_with("<system-notification>"));
         assert!(incoming.contains("<curator-skill-add name=\"deployment-checks\" revision=\"1\">"));
-        assert!(incoming.ends_with("Continue the conversation"));
+        assert_eq!(blocks.last().unwrap()["text"], "Turn: the user's new message:\n\n[channel:1 user:2]\nContinue the conversation");
+        assert!(blocks[blocks.len()-2].get("prompt_cache_breakpoint").is_none());
         assert_eq!(
             h.skills
                 .snapshot()

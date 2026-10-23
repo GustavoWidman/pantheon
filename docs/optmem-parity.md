@@ -1,30 +1,21 @@
 # Native OptMem, reference 0500bf6
 
-This implementation starts with an empty native bank. Its runtime understands
-one schema and native page/span addresses only. Directory marker and checkpoint
-versions are generic schema validation, performed before opening writer files.
-There are no runtime import, alias, address translation or migration paths.
-The daemon additionally validates its native root namespace and every existing
-chat/subagent bank read-only before opening operational databases or workers.
-This startup admission guard is generic schema validation, not format detection
-or conversion. 0.21.0 requires fresh native state; external conversion/cutover is
-separate. See [service.md](service.md#0210-native-state-boundary).
+The target is Uniichat's model-visible memory behavior, pinned to commit
+`0500bf6a8ea4bf0ce047488562022b1b6532cc30`. Pantheon retains Discord ownership
+and delivery, attachment/tool integrations, provider authentication, and its
+stronger fsync/locking. Storage layout, cloud billing, imports and in-flight
+process handover are not being replaced.
 
-Reference: VictorTaelin/uniichat
-`0500bf6a8ea4bf0ce047488562022b1b6532cc30`, especially `Memory.ts`, `Clip.ts`,
-`prompt.txt`, `Anthropic.ts`, and `AskAI.ts`. Attribution and license are in
-`THIRD_PARTY_NOTICES.md`.
+The runtime uses one native schema and positional page/span addresses. Startup
+validates the root namespace and existing banks before opening writer files.
+This change reads existing v0.21 native banks; no reset or historical rewrite
+is needed. Report-role metadata is additive, and older originals keep their
+stored attribution. The daemon remains a single writer.
 
-## Parity scope (corrected after provider-boundary review)
-
-This checklist describes tested native memory mechanisms, not blanket end-to-end
-provider parity. The earlier review missed refusal/outcome and block joining at
-the provider-to-compactor boundary; engine fixtures did not exercise Memory.build
-through a real adapter. The separately implemented importer also incorrectly
-enforced 512 bytes as a hard output cap. That gap was outside the earlier engine
-review and invalidated the blanket parity assurance. See [compactor-adapter.md](compactor-adapter.md) for the
-focused correction and explicit remaining constraints. No recall, cache-rate,
-subscription-quota, legacy migration or exact model-output equivalence follows.
+See [compactor-adapter.md](compactor-adapter.md) for root/worker request
+construction and [behavioral-parity-matrix.md](behavioral-parity-matrix.md) for
+provider and transport boundaries. Source parity cannot guarantee the same
+stochastic answers, recall quality, cache-hit rates or subscription quotas.
 
 ## Native mechanism contract
 
@@ -49,7 +40,9 @@ subscription-quota, legacy migration or exact model-output equivalence follows.
   halves. Sources <=512 UTF-8 bytes are stored locally in batches. Parents use
   flattened child lines; original leaf sources include author/image references.
 - Native zoom spans require aligned ID and power-of-two count. Zoom `at` is a
-  **page-local UTF-16 cursor**, validated against scalar boundaries. Original
+  **page-local UTF-16 cursor**, including a cursor inside a surrogate pair or
+  beyond the end. Native provider output preserves those code units; persisted
+  originals apply the reference `Memory.root` well-formed conversion. Original
   text is not overwritten by compaction. A parent returns the two child lines,
   or the native not-yet-summarized placeholder.
 - Main view: 128,000 UTF-8 payload bytes high, half low. Independent `seen`
@@ -145,8 +138,8 @@ completed nodes; interrupted not-yet-durable jobs become ordinary pending work.
    fsynced records remain in the append-only journal; disposable indexes select
    the latest unfinished-frontier replacement. Same-source admission retries
    write the complete group again, not an inferred suffix. No unrelated closing
-   append can publish the abandoned prefix. Rust strings are valid Unicode, so there is no
-   lossy lone-surrogate input normalization inside the engine.
+   append can publish the abandoned prefix. Originals are well-formed Unicode,
+   matching upstream `Memory.root(...).text.toWellFormed()`.
 2. Startup **streams all journal records to rebuild/validate indexes** instead
    of trusting persistent index frontiers. Bodies are dropped immediately, so
    resident text is bounded, but cold startup is still O(history bytes).
@@ -161,8 +154,9 @@ completed nodes; interrupted not-yet-durable jobs become ordinary pending work.
    There is no import mode in this runtime. Normal scheduling and cancellation
    use Pantheon's existing executor and cancellation token. A process restart
    does not preserve an in-flight remote inference call.
-5. Pantheon uses its own actor kinds, shared harness/skills system instructions,
-   and attachment service. It does not duplicate UniiChat's image resizing,
+5. Root/worker memory instructions follow the pinned source, with actor naming
+   adaptations and Pantheon harness/skills instructions appended. The attachment
+   service remains Pantheon-owned. It does not duplicate UniiChat's image resizing,
    cloud billing, UI or server act format. Native image references/pages follow
    the reference placement and rendering rules.
 6. Cache blocks are implemented in the adapters, but provider capabilities
@@ -244,29 +238,25 @@ and release at the exact OpenAI stream event before leader body completion.
 No live API or history bank
 is used by these tests.
 
-Phase two is an independent offline data transformation tool. Its requirements
-are recorded outside the engine; native span/paging invariants are not relaxed
-to accommodate an input dataset. It is not implemented here.
+`tests/fixtures/generate-memory-contract.ts` additionally executes actual
+`Chat.call`, `Tools.ask`, `Tools.at_work`, `Memory.agent_show`, `Memory.zoom`,
+`Memory.date` and `Memory.root` against temporary upstream banks. It captures
+root task/view digests, canonical prompts, hot/cold worker log requests, named
+log pages, missing spans/dates, and UTF-16 cursor/normalization edges. Network is
+disabled. Regenerate with the same pinned checkout:
 
-## Current finite parity boundary
+```
+bun tests/fixtures/generate-memory-contract.ts /path/to/uniichat-0500bf6 \
+  > tests/fixtures/memory-contract-0500bf6.json
+```
 
-The [finite behavioral matrix](behavioral-parity-matrix.md) is the current
-checklist. The V13b parent has scoped memory/route evidence. The local successor
-implements the previously known F2 input/continuation representation gap using
-invocation-owned ECMAScript JSON values through public provider decode, Uses,
-history and actual HTTP/stdio transport. Implementation and development test
-results do not establish frozen independent acceptance or package clearance.
+The engine oracle also includes deterministic randomized append/completion/fit
+traces across three watermarks and completion orders. Runtime tests exercise the
+actual channel actor, worker spawn/tell/resume, live root recall, named private
+recall, channel boundaries, report attribution, and provider serialization.
+The ignored live behavior evaluation checks ordinary work, compaction, and
+conversation without executing proposed tools. It is a behavior sample, not a
+proof that future model answers always choose correctly.
 
-A/B/C assertions distinguish pre-RPC classification, actual RPC bytes/headers
-and the actual next provider HTTP body. Native-reader reopen compares ordered
-original kinds and bodies, not only text counts. All 23 saved server cases are
-required to match; a decoding error is not an equivalent trace. Private Sessions
-exercise their actual A/C adapter, not nonexistent remote MCP tools.
-
-Per-record fsync, private affinity, inert restart, bounded decoder resources,
-object-only tool roots and bounded secret-sanitized cutoff reasons remain named
-adaptations. Modern MCP annotated scalar lone-UTF16 headers have a separately
-named open interoperability disposition; ordinary nested/unannotated/stdio
-remote UTF16 bodies must remain lossless. No broad remote-UTF16 exclusion is
-accepted. No source-only test or reviewed package authorizes replay, paid calls,
-migration, service changes or cutover.
+No storage migration, service restart, deployment or memory wipe is performed
+by this implementation or its tests.

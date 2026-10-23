@@ -1092,3 +1092,30 @@ fn owned_default_debug_is_shape_only_not_hidden_native_payload() {
         "actual RPC still carries its authorized source, diagnostics do not"
     );
 }
+
+#[test]
+fn owned_recall_cursor_preserves_utf16_through_native_and_subscription_writers() {
+    for vendor in ["openai","anthropic"] {
+        let mut history=Provider::start_turn(vendor,"<chat>\n</chat>\n","recall",None);
+        let call=super::ToolCall{id:"cursor".into(),name:"zoom".into(),arguments:json!({"id":0,"at":1}).into()};
+        let units="0+0|user: ".encode_utf16().chain([0xde42,90]).collect::<Vec<_>>();
+        Provider::append_result_units(vendor,&mut history,&call,units.clone());
+        let model=if vendor=="openai" {"openai/gpt-6-fixture"} else {"anthropic/fixture"};
+        let mut body=Provider::request_body(model,"medium","system",&history,&[]).unwrap();
+        super::compaction::ordinary_profile(model,&mut body).unwrap();
+        let native=super::native_value::prepare_request(model,&body,&history,false).unwrap();
+        assert!(native.canonical().contains(r"\ude42Z"));
+        let back=history.last().unwrap();
+        let text=if vendor=="openai" {back.field("output").unwrap().elements()[0].clone()} else {back.field("content").unwrap().elements()[0].field("content").unwrap().elements()[0].clone()};
+        assert_eq!(text.units("text"),units);
+        if vendor=="openai" {
+            let model="codex/gpt-6-fixture";
+            let body=Provider::request_body(model,"medium","system",&history,&[]).unwrap();
+            let native=super::native_value::prepare_request(model,&body,&history,false).unwrap();
+            for lite in [false,true] {
+                let wire=super::codex::Request::prepare_native(&native,super::codex::Capabilities{use_responses_lite:Some(lite),..Default::default()},uuid::Uuid::nil()).unwrap();
+                assert!(serde_json::to_string(&wire).unwrap().contains(r"\ude42Z"));
+            }
+        }
+    }
+}

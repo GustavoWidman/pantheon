@@ -150,7 +150,8 @@ async fn native_zoom_utf16_cursor_reaches_actual_root_tool_executor() {
         arguments: json!({"id":id,"n":1,"at":1}).into(),
         ..call
     };
-    assert!(h.execute_tool(&mut run, &invalid).await.is_err());
+    let (_,units)=h.execute_tool_output(&mut run,&invalid,None).await.unwrap();
+    assert_eq!(units.unwrap(),format!("{id}+0|user: ").encode_utf16().chain([0xde00,90]).collect::<Vec<_>>());
     server.abort();
 }
 

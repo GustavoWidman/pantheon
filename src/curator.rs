@@ -248,6 +248,28 @@ impl Session<'_> {
         self.budget.lock().unwrap().usage.push(raw.clone());
         Ok(())
     }
+    async fn read_owned(
+        &self,
+        call: &crate::provider::ToolCall,
+        skills: &crate::skills::Skills,
+        budget: crate::attachments::InputBudget,
+    ) -> Result<crate::provider::NativeValue> {
+        if call.name == "zoom" {
+            let a = &call.arguments;
+            let mut value = crate::provider::NativeValue::from(json!({}));
+            value.set(
+                "text",
+                crate::provider::NativeValue::text_units(self.memory.zoom_units_at(
+                    crate::tools::number(a, "id")?,
+                    a["n"].as_u64().unwrap_or(1),
+                    a["at"].as_u64().unwrap_or(0) as usize,
+                )?),
+            );
+            Ok(value)
+        } else {
+            self.read(call, skills, budget).await.map(Into::into)
+        }
+    }
     async fn read(
         &self,
         call: &crate::provider::ToolCall,
@@ -608,10 +630,10 @@ pub async fn run(
                     call.name.as_str(),
                     "create_skill" | "edit_skill" | "retire_skill"
                 ) {
-                    stage(env.library, &heads, &mut staged, call)
+                    stage(env.library, &heads, &mut staged, call).map(Into::into)
                 } else {
                     session
-                        .read(
+                        .read_owned(
                             call,
                             &snapshot,
                             crate::attachments::budget_with_native_media(
@@ -622,7 +644,7 @@ pub async fn run(
                 };
                 let (v, error) = match result {
                     Ok(v) => (v, false),
-                    Err(e) => (json!({"error":e.to_string()}), true),
+                    Err(e) => (json!({"error":e.to_string()}).into(), true),
                 };
                 media.extend(append_research_result(vendor, &mut history, call, v, error));
                 if !staged.is_empty() {
@@ -675,8 +697,8 @@ pub async fn run(
                     if response.calls.is_empty(){history.push(Provider::user(vendor,"Return your verdict using decide."));continue;}
                     let mut verdict=None;let mut media=vec![];
                     for call in &response.calls {
-                        let result=if call.name=="decide"{decision(&call.arguments).map(|approved|{verdict=Some((approved,(*call.arguments).clone()));json!({"recorded":true})})}else{session.read(call,&snapshot,crate::attachments::budget_with_native_media(env.model, &history,&media)).await};
-                        let(v,error)=match result{Ok(v)=>(v,false),Err(e)=>(json!({"error":e.to_string()}),true)};media.extend(append_research_result(vendor,&mut history,call,v,error));
+                        let result=if call.name=="decide"{decision(&call.arguments).map(|approved|{verdict=Some((approved,(*call.arguments).clone()));crate::provider::NativeValue::from(json!({"recorded":true}))})}else{session.read_owned(call,&snapshot,crate::attachments::budget_with_native_media(env.model, &history,&media)).await};
+                        let(v,error)=match result{Ok(v)=>(v,false),Err(e)=>(json!({"error":e.to_string()}).into(),true)};media.extend(append_research_result(vendor,&mut history,call,v,error));
                     }
                     append_research_media(vendor,&mut history,media)?;
                     if let Some(v)=verdict{return Ok::<_,anyhow::Error>(v);}
@@ -744,26 +766,21 @@ fn append_research_result(
     vendor: &str,
     history: &mut Vec<crate::provider::NativeValue>,
     call: &crate::provider::ToolCall,
-    mut value: Value,
+    value: impl Into<crate::provider::NativeValue>,
     error: bool,
 ) -> Vec<Value> {
+    let mut value = value.into();
     let parts = value
-        .as_object_mut()
-        .and_then(|v| v.remove("__attachment_parts"))
-        .and_then(|v| {
-            if let Value::Array(parts) = v {
-                Some(parts)
-            } else {
-                None
-            }
-        })
+        .field("__attachment_parts")
+        .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
+    value.remove("__attachment_parts");
     // Native zoom is already bounded/paged, including a usable UTF-16 cursor.
     // Do not replace its exact page with a lossy generic head/tail object.
     let value = if call.name == "zoom" && !error {
         value
     } else {
-        crate::skill_library::bounded_json(&value, 24_000)
+        crate::skill_library::bounded_json(&value, 24_000).into()
     };
     Provider::append_result(vendor, history, call, &value.to_string(), error);
     parts

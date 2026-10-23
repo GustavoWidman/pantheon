@@ -218,6 +218,7 @@ async fn native_production_spawn_worker_freezes_prompt_but_zooms_live_root_and_r
         // 30,000-unit boundary creates two durable Echo pages, not one Entry.
         assert!(expected_zoom.is_ascii() && expected_zoom.len() > 30000);
         let expected_trace = vec![
+            json!({"kind":"note","text":"subagent"}),
             json!({"kind":"user","text":"PRIVATE_ROUTE_TASK"}),
             json!({"kind":"tool","text":"zoom {\"id\":1,\"n\":1}"}),
             json!({"kind":"echo","text":&expected_zoom[..30000]}),
@@ -293,7 +294,7 @@ async fn native_production_root_actor_profiles_actual_wire_and_owned_stop() {
                 ],
             )
         };
-        let history = Provider::start(vendor, &view, &raw.join("\n\n"));
+        let history = Provider::start_turn(vendor, &view, &raw.join("\n\n"), None);
         let field = if vendor == "openai" {
             "input"
         } else {
@@ -486,8 +487,8 @@ async fn native_production_curator_and_reviewer_use_private_snapshot_read_routes
         for (index, label) in [(1, "draft"), (3, "reviewer")] {
             for (id, expected_value, error) in [
                 ("old", json!({"text":expected}), false),
-                ("new", json!({"error":"No line 2+1."}), true),
-                ("date-new", json!({"error":"No message 2."}), true),
+                ("new", json!({"text":"No line 2+1: n is a power of 2, id a multiple of n. The tree's roots: 0+2."}), false),
+                ("date-new", json!({"timestamp":"No message 2."}), false),
             ] {
                 let (text, is_error) = route_tool_output(vendor, &requests[index], id);
                 assert_eq!(
@@ -616,7 +617,7 @@ async fn native_production_worker_owned_cancel_delivers_once_without_root_write(
         let trace = Memory::open(h.config.state_dir.join("subagents").join(&id), 128000).unwrap();
         assert_eq!(
             native_trace_entries(&trace, 0),
-            vec![json!({"kind":"user","text":"CANCEL_PRIVATE_TASK"})]
+            vec![json!({"kind":"note","text":"subagent"}), json!({"kind":"user","text":"CANCEL_PRIVATE_TASK"})]
         );
         drop(trace);
         drop(run);
@@ -811,5 +812,62 @@ async fn native_production_curator_cancel_during_actual_reviewer_never_installs_
         eprintln!(
             "MEASURED reviewer-owned-cancel vendor={vendor} requests=3 root_writes=0 skill_installs=0"
         );
+    }
+}
+
+#[tokio::test]
+async fn native_worker_recall_tell_and_cold_resume_use_original_private_log() {
+    for vendor in ["openai","anthropic"] {
+        let (_dir,h,mut root,mock,server)=fixture(vendor,vec![final_response(vendor,"FIRST_PRIVATE_REPORT"),final_response(vendor,"SECOND_PRIVATE_REPORT"),final_response(vendor,"THIRD_PRIVATE_REPORT")]).await;
+        let result=h.execute_tool(&mut root,&ToolCall{id:"spawn-memory".into(),name:"spawn".into(),arguments:json!({"tasks":[{"name":"Memory Scout","task":"ORIGINAL_PRIVATE_TASK"}]}).into()}).await.unwrap();
+        let result:Value=serde_json::from_str(&result).unwrap();let id=result["ids"][0].as_str().unwrap();
+        async fn idle(h:&Harness,id:&str) {tokio::time::timeout(Duration::from_secs(10),async {while h.children.lock().await.contains_key(id) {tokio::task::yield_now().await;}}).await.unwrap();}
+        mock.started.notified().await;
+        assert_eq!(h.store.working_names(1,&[id.to_owned()]).unwrap(),vec!["Memory Scout"]);
+        assert!(h.store.working_names(99,&[id.to_owned()]).unwrap().is_empty());
+        mock.release.notify_one();
+        idle(&h,id).await;
+        let reports=h.store.queued(1).unwrap();let report=reports.iter().find(|r|r.text.contains("FIRST_PRIVATE_REPORT")).unwrap();
+        assert!(h.store.input_is_work(&report.id).unwrap());
+        h.append_admitted_input(&root.memory,report).await.unwrap();
+        let n=root.memory.memory.lock().await.lookup_source(&report.id).unwrap();
+        assert!(root.memory.memory.lock().await.zoom(n,1).unwrap().contains("|work: "));
+        let recall=|name:&str|ToolCall{id:"recall".into(),name:"zoom".into(),arguments:json!({"id":name}).into()};
+        let expected={let m=Memory::open(h.config.state_dir.join("subagents").join(id),128000).unwrap();m.original_log().unwrap()};
+        assert_eq!(h.execute_tool(&mut root,&recall("Memory Scout")).await.unwrap(),expected);
+        assert_eq!(h.execute_tool(&mut root,&recall(id)).await.unwrap(),expected);
+        assert_eq!(h.execute_tool(&mut root,&recall("Absent Worker")).await.unwrap(),"No agent Absent Worker.");
+        let mut foreign=h.channel(99).await.unwrap();
+        std::mem::swap(&mut root.memory,&mut foreign);let old_channel=root.channel;root.channel=99;
+        assert_eq!(h.execute_tool(&mut root,&recall(id)).await.unwrap(),format!("No agent {id}."));
+        root.channel=old_channel;std::mem::swap(&mut root.memory,&mut foreign);
+        root.memory.memory.lock().await.append(Kind::User,"FRESH_ROOT_FOR_TELL").unwrap();
+        h.execute_tool(&mut root,&ToolCall{id:"tell-memory".into(),name:"tell".into(),arguments:json!({"id":id,"message":"FOLLOWUP_PRIVATE_TASK"}).into()}).await.unwrap();
+        idle(&h,id).await;
+        {
+            let requests=mock.requests.lock().await;
+            assert_eq!(requests.len(),2);
+            assert!(route_contains(&requests[1],"FRESH_ROOT_FOR_TELL"));
+            let log=Memory::open(h.config.state_dir.join("subagents").join(id),128000).unwrap().original_log().unwrap();
+            let before_final=log.rsplit_once("\n\n").unwrap().0;
+            assert!(route_contains(&requests[1],before_final));
+            assert!(before_final.starts_with("0|note: subagent\n\n1|user: ORIGINAL_PRIVATE_TASK"));
+            assert!(before_final.contains("2|talk: FIRST_PRIVATE_REPORT"));
+            assert!(before_final.contains("FOLLOWUP_PRIVATE_TASK"));
+        }
+        // A process restart discards only its live set. Persisted launch views
+        // must not accidentally become a cold-restored worker's view.
+        h.known_workers.lock().await.clear();
+        h.store.send_agent_message(1,2,"channel:1",id,"COLD_RESUME_TASK").unwrap();
+        h.ensure_agent(id).await.unwrap();idle(&h,id).await;
+        let requests=mock.requests.lock().await;
+        assert_eq!(requests.len(),3);
+        let items=requests[2][if vendor=="openai" {"input"} else {"messages"}].as_array().unwrap();
+        let content=items.iter().find(|v|v["role"]=="user").unwrap()["content"].as_array().unwrap();
+        assert_eq!(content.len(),1,"cold Tools.agent has no captured root view");
+        let log=content[0]["text"].as_str().unwrap();
+        assert!(log.contains("SECOND_PRIVATE_REPORT")&&log.contains("COLD_RESUME_TASK"));
+        assert!(!log.contains("<chat>"));
+        drop(requests);h.shutdown.cancel();server.abort();
     }
 }

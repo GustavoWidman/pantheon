@@ -88,5 +88,30 @@ for(const matching of [false,true]) {
  restart.push({matching,events,text:Array.from({length:m.count},(_,i)=>Memory.message(m,i).text)});
 }
 records.push({name:'restart-open-group',inputs:restart});
+
+// Deterministic arbitrary appends/completions exercise fitting, free chains,
+// frozen compactor contexts and the 64-leaf frontier across mixed source sizes.
+const randomized:any[]=[];
+for(const [seed,high] of [[17,4096],[501,8192],[97001,128000]]) {
+ let value=seed;const rand=()=>{value^=value<<13;value^=value>>>17;value^=value<<5;return value>>>0};
+ m=init(high);const operations:any[]=[];const events:any[]=[];
+ const observe=()=>{if(operations.length%16===0)events.push(state(m,String(operations.length)))};
+ const complete=()=>{
+  const keys=[...m.busy.keys()];const key=keys[rand()%keys.length];let l=0,n=key+1;while(n%2===0){l++;n/=2}const i=(n-1)/2;
+  const text='S'+operations.length+':'+(rand()%2?'é':'s').repeat([1,80,250,512,540][rand()%5]);
+  finish(l,i,text);operations.push({kind:'finish',l,i,text});observe();
+ };
+ for(let step=0;step<192;step++) {
+  if(m.busy.size && rand()%3===0){complete();continue;}
+  const text='P'+step+':'+(rand()%3?'x':'😀').repeat([0,1,128,507,513,900,2000][rand()%7]);
+  const more=rand()%13===0;
+  push(text,more);operations.push({kind:'push',text,more});observe();
+ }
+ push('close',false);operations.push({kind:'push',text:'close',more:false});observe();
+ while(m.busy.size){complete();if(operations.length>2000)throw Error('oracle did not settle');}
+ events.push(state(m,'final'));
+ randomized.push({seed,high,operations,events});
+}
+records.push({name:'randomized-behavior',cases:randomized});
 console.log(JSON.stringify(records));
 process.exit(0);

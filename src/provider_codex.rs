@@ -29,7 +29,7 @@ pub(crate) struct Request {
     // Struct declaration order survives reqwest.json: incremental gateways see routing first.
     model: String,
     stream: bool,
-    input: Vec<Value>,
+    input: Vec<super::NativeValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<Value>>,
     tool_choice: Value,
@@ -79,7 +79,7 @@ impl Request {
         Ok(Self {
             model: model.into(),
             stream: true,
-            input,
+            input: input.into_iter().map(Into::into).collect(),
             tools: Some(tools),
             tool_choice: json!("auto"),
             parallel_tool_calls: true,
@@ -90,8 +90,20 @@ impl Request {
             lite: false,
         })
     }
+    #[cfg(test)]
     pub fn prepare(body: &Value, capabilities: Capabilities, affinity: Uuid) -> Result<Self> {
-        let mut request: Self = serde_json::from_value(body.clone())?;
+        Self::prepare_native(&body.clone().into(), capabilities, affinity)
+    }
+    pub fn prepare_native(
+        body: &super::NativeValue,
+        capabilities: Capabilities,
+        affinity: Uuid,
+    ) -> Result<Self> {
+        let mut request: Self = serde_json::from_value(body.projected())?;
+        request.input = body
+            .field("input")
+            .map(|v| v.elements())
+            .unwrap_or_default();
         // Hosted search is server-executed. Responses Lite supports only client
         // tools: moving web_search into additional_tools hides it from the
         // gateway, while leaving it top-level is explicitly rejected. Keep
@@ -114,7 +126,7 @@ impl Request {
             && let Some(text) = first["content"][0]["text"].as_str()
             && first["id"] == prefix_id(Uuid::nil(), "msg", text.as_bytes())
         {
-            first["id"] = json!(prefix_id(affinity, "msg", text.as_bytes()));
+            first.set("id", json!(prefix_id(affinity, "msg", text.as_bytes())));
         }
         if let Some(reasoning) = request.reasoning.as_mut().and_then(Value::as_object_mut) {
             reasoning.remove("context");
@@ -133,7 +145,8 @@ impl Request {
                 let id = prefix_id(affinity, "at", &serde_json::to_vec(&tools)?);
                 request.input.insert(
                     0,
-                    json!({"type":"additional_tools","id":id,"role":"developer","tools":tools}),
+                    json!({"type":"additional_tools","id":id,"role":"developer","tools":tools})
+                        .into(),
                 );
             }
         }
@@ -146,8 +159,11 @@ impl Request {
             request
         }
     }
+    pub fn native(&self) -> Result<super::NativeValue> {
+        super::NativeValue::parse(&serde_json::to_string(self)?)
+    }
     pub fn value(&self) -> Result<Value> {
-        Ok(serde_json::to_value(self)?)
+        Ok(self.native()?.projected())
     }
 }
 fn prefix_id(affinity: Uuid, prefix: &str, bytes: &[u8]) -> String {
