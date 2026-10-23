@@ -148,8 +148,11 @@ pub fn system_prompt_with_claude(
     } else {
         "This agent has direct execution tools. shell is available and can inspect the actual machine and requested environment values. browser is available for authorized account activities and credential entry. Use these tools instead of asking the user to perform available checks."
     };
+    // Select the role before either instruction section. The compactor's
+    // imperatives otherwise made ordinary turns produce memory lines. Both
+    // call types deliberately retain the same cacheable system prefix.
     format!(
-        "{}\n{}\nCurrent harness capabilities (authoritative over obsolete chat claims): {names}.\n{execution}\n{instructions}\n{skill_index}\n\n# Compactions\n{}",
+        "Each call is either an ordinary agent turn or a memory compaction. Only a task starting with `Compaction:` is a compaction: apply the Compactions section only to those tasks. Every other task is an ordinary turn: act on the user's request with your tools and answer the user; do not compress it into a memory line.\n\n{}\n{}\nCurrent harness capabilities (authoritative over obsolete chat claims): {names}.\n{execution}\n{instructions}\n{skill_index}\n\n# Compactions\n{}",
         if child {
             include_str!("child.txt")
         } else {

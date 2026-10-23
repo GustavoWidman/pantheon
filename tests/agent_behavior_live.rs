@@ -450,3 +450,112 @@ async fn calendar_mcp_is_discovered_and_called_then_homework_is_solved() {
     assert!(answer.contains('4'), "give the requested solution");
     println!("PASS: MCP discovery leads to an evidenced calendar answer; homework gets a solution");
 }
+
+/// Shared chat/compactor instructions must select behavior from the actual task.
+/// A curator publication beside an ordinary request is context, not a request to
+/// summarize that request. All proposed actions are inspected, never executed.
+#[tokio::test]
+#[ignore = "requires a Codex login; three controlled inference calls, no tool execution"]
+async fn ordinary_task_and_compaction_choose_their_own_behavior() {
+    let model =
+        std::env::var("PANTHEON_TEST_CODEX_MODEL").unwrap_or_else(|_| "codex/gpt-6.1-sol".into());
+    let skills = pantheon::skills::Skills::load(&Default::default()).unwrap();
+    let system = pantheon::runtime::system_prompt_with_claude(
+        false,
+        false,
+        true,
+        &skills.index(),
+        "Only work inside the configured workspace.",
+    );
+    let provider = Provider::new(120).unwrap();
+    // Reproduce the long, summary-shaped history that exposed the incident;
+    // short greeting/diagnostic probes also pass with the ambiguous old prompt.
+    let mut view = String::from("<chat>\n");
+    let prior = [
+        "user: Audit the portfolio submissions, read the individual approval decisions, reconcile the accepted total against the activity-type caps, and keep an evidence table. Distinguish requested, approved and countable hours before planning the final review.",
+        "tool: Browser snapshot of a portfolio approval page; collect the approval decision and category, then inspect the remaining submissions. Preserve original identifiers in the evidence table and verify whether each item is final rather than merely submitted.",
+        "echo: The portal lists finalized and pending submissions in separate sections. Individual approval replies establish accepted amounts; category caps determine countable credit. The full policy and decisions remain available in the original messages.",
+        "talk: The checked submissions reconcile against the category caps. This is a reconstruction from portal decisions, not an issued transcript. No files or records were changed, and preparation of the review artifacts remains a separate task for the next request.",
+    ];
+    for id in 0..244 {
+        view.push_str(&format!("{id}+1|{}\n", prior[id % prior.len()]));
+    }
+    view.push_str("244+1|user: The project is in the interno repository.\n</chat>\n");
+    let task = "<system-notification><curator-skill-modify name=\"browser-activities\" revision=\"2\">Added portal audit guidance.</curator-skill-modify></system-notification>\n\nPrepare the project review. Inspect the supplied brief.zip in the workspace to verify whether we need slides and a report, and put the artifacts in interno/banca. Have Claude make the presentation using the requested presentation skill; write the report in Typst and render a PDF. Start by inspecting the archive and locating the repository.";
+    let defs = tools::definitions_with_claude(false, false, true);
+    let ordinary = provider
+        .step(
+            &model,
+            "high",
+            &system,
+            &Provider::start("openai", &view, task),
+            &defs,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !ordinary.calls.is_empty(),
+        "ordinary task was summarized instead of acted on: {}",
+        visible(&ordinary)
+    );
+    assert!(
+        ordinary.calls.iter().any(|call| matches!(
+            call.name.as_str(),
+            "shell" | "zoom" | "spawn" | "models" | "skill"
+        )),
+        "expected a task-relevant tool, got: {}",
+        visible(&ordinary)
+    );
+
+    // Same system prefix, genuine compaction task, and no executable tools.
+    let compact = pantheon::memory::compaction_task(
+        pantheon::memory::NodeKey { level: 0, index: 2 },
+        "user: Inspect brief.zip, prepare slides and a PDF report, and put the artifacts in interno/banca.",
+    );
+    let response = provider
+        .step(
+            &model,
+            "high",
+            &system,
+            &Provider::start("openai", &view, &compact),
+            &[],
+        )
+        .await
+        .unwrap();
+    let summary = visible(&response);
+    assert!(
+        response.calls.is_empty(),
+        "a memory compaction must not execute the quoted task"
+    );
+    assert!(
+        summary.starts_with("user:") && summary.len() <= 512,
+        "expected a compact memory line, got: {summary}"
+    );
+    assert!(
+        summary.contains("brief.zip") && summary.contains("interno/banca"),
+        "summary lost the source references: {summary}"
+    );
+
+    let greeting = provider
+        .step(
+            &model,
+            "high",
+            &system,
+            &Provider::start("openai", "<chat>\n</chat>\n", "hey, how's it going?"),
+            &defs,
+        )
+        .await
+        .unwrap();
+    assert!(
+        greeting.calls.is_empty(),
+        "ordinary conversation should not invent work"
+    );
+    let text = visible(&greeting);
+    assert!(
+        !text.is_empty() && !text.starts_with("user:") && !text.starts_with("talk:"),
+        "greeting was formatted as a memory line: {text}"
+    );
+    println!(
+        "PASS: ordinary artifact request acts, compaction summarizes, greeting converses; no tool calls executed"
+    );
+}

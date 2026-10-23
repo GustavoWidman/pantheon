@@ -52,6 +52,13 @@ not provider busy retries. Provider diagnostics remain typed/bounded/redacted.
 
 ## Ordinary turns are not compactions
 
+The shared system prefix starts by distinguishing ordinary turns from tasks
+beginning `Compaction:`. Only the latter apply the Compactions instructions;
+ordinary turns act on the request and answer the user. This distinction must
+precede both instruction sections: without it, ordinary chat can follow the
+appended compactor instructions and return a memory line without taking action.
+The prefix remains shared; no output-text classifier or reply suppression is used.
+
 Ordinary tasks are marked; compactor tasks/corrections remain unmarked. OpenAI
 ordinary requests omit explicit-end cache options; Anthropic ordinary requests
 retain top-level ephemeral cache_control based on original task even after
