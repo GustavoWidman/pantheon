@@ -2,13 +2,6 @@
 
 # Pantheon
 
-> **0.21.0 is a fresh-state memory-format break, not an in-place upgrade.**
-> Use an empty native `state_dir`. Existing unmarked/incompatible state is refused
-> before Discord, operational databases or queued workers start. Do not add schema
-> markers by hand or point this release at an older instance's state. External
-> conversion, replay/recall validation and cutover are separate operator steps;
-> this PR/release does not authorize deployment. See [service.md](docs/service.md).
-
 An always-on Discord agent harness in Rust, packaged as a NixOS service. Native memory follows [UniiChat 0500bf6](https://github.com/VictorTaelin/uniichat/blob/0500bf6a8ea4bf0ce047488562022b1b6532cc30/Memory.ts): immutable paged originals, durable binary summaries, independent main/compactor views, staged coarsening and fresh provider conversations. See the [parity contract](docs/optmem-parity.md) for verified behavior and explicit implementation differences.
 
 Pantheon includes OpenAI Responses and Anthropic Messages adapters, background-only subagents, prompt steering, durable wakeups and change monitors, and bundled Camoufox windows with a shared profile and separate authenticated noVNC viewers. It runs its own agent loop; Prime Agent is not required.
