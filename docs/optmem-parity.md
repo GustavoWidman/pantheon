@@ -63,8 +63,10 @@ stochastic answers, recall quality, cache-hit rates or subscription quotas.
   context position and descending level at a tie (merge first). A failure keeps
   its reservation while the provider owner retries. Completion order need not
   match dispatch order. Settle requires leaves, not all parent jobs.
-- Compaction shares the root system/catalogue with ordinary channel turns, but
-  no tools. A neutral 512-dash ruler replaces contentful examples. Up to five
+- Compaction preserves the memory conventions but restores the pre-parity
+  `compact.txt`-only system prompt and no tools or skills catalogue. Ordinary
+  turns omit compaction-only instructions (a named prompt-safety difference).
+  A neutral 512-dash ruler replaces contentful examples. Up to five
   answered attempts see the original context/task plus at most the latest size
   correction: never previous answers, reasoning or accumulated corrections.
   Persist the shortest answer, even if still >512 bytes (upstream behavior).

@@ -54,10 +54,25 @@ not provider busy retries. Provider diagnostics remain typed/bounded/redacted.
 
 ## Ordinary turns are not compactions
 
-Root turns and compactions use the complete pinned `MASTER` memory prompt,
-with Unii/Pantheon and unii/talk naming adaptations. Harness rules follow it;
-operator instructions remain last, as in `Tools.system`. The earlier custom
-"Each call is either..." paragraph has been removed.
+Prompt mode is selected by the host, not by user text. Ordinary root turns and
+workers never receive `compact.txt` (including its "Call no tools" instruction).
+The compactor uses `compact.txt` alone, exactly the pre-#49 prompt-selection
+boundary: no chat prefix, harness instructions, skills catalogue or operator task
+rules. Its requests still have no executable tools. Harness rules follow the memory prompt and operator instructions
+remain last. `Turn:` / `Compaction:` task labels and native memory behavior remain.
+
+This is an intentional prompt-safety difference from the pinned UniiChat source.
+Upstream `Tools.MASTER` contains both Turns and Compactions; `Chat.share` supplies
+it to ordinary turns and `Memory.ask`, relying on task prefixes to select behavior.
+Pantheon #49 adopted that shared construction; #53 aligned its complete prompt and
+removed the earlier compaction-only scope sentence. Sharing a prefix is no longer
+preferred over separating contradictory task instructions. The upstream fixtures
+remain unchanged as provenance, not as a requirement to leak compaction rules into
+ordinary requests. This reverts prompt selection only, not the OptMem algorithm,
+worker recall, retry/outcome policy, provider wire profiles or cache identities.
+No cache-hit or model-alignment improvement is promised. Deterministic tests
+inspect actual outgoing system/message
+roles and tool lists; they do not prove a particular model's response or speed.
 
 `Chat.call` puts `Turn: the user's new message:\n\n` before the selected raw
 suffix. The production channel actor now does the same. Agent status and product
@@ -116,7 +131,8 @@ Pantheon's object-only guard (an intentional stronger-safety restriction).
 - Z.ai has no pinned upstream adapter. Do not infer equivalent cache semantics.
 - Unknown/legacy Anthropic capability fallback and real model limits remain
   provider constraints. Encrypted-reasoning include control is retained.
-- Shared root and worker memory instructions follow the pinned source. Harness
+- Root memory instructions intentionally separate compaction from ordinary turns;
+  worker memory instructions follow the pinned source. Harness
   tools, execution device descriptions, Discord provenance and hosted-search
   delegation remain Pantheon integrations. Background delegation remains the
   user-requested Pantheon policy.
@@ -188,3 +204,22 @@ non-scalar identity in a separately framed domain; existing scalar delivery
 keys remain unchanged. New opaque JSON/ID/raw-RPC Debug implementations expose
 shape/length only, not hidden source representations. Explicit authorized
 provider/RPC encoders still emit the original source data.
+
+## Prompt-selection fix and existing memory banks
+
+Restoring the pre-parity turn/compactor prompt boundary requires **no memory-bank
+migration** from the currently installed native global state. The prompt is not a
+storage version. `memory.rs`, `store.rs`, `state_namespace.rs`, original/tree
+journal formats, saved views/snapshots, page/span IDs, worker banks and format
+markers are unchanged. Existing originals and summaries are reused, not replayed,
+rewritten, renumbered or re-compacted as part of this fix. The current summary
+instructions in `compact.txt` are retained; only their selection changes.
+
+This is not a rollback of #49/#53 or of the earlier global-state transition.
+Historical channel-scoped/non-native banks remain subject to the existing
+fail-closed admission rules. Do not remove or spoof a format marker, create a
+fresh state directory, import/export history, or run a migration for this patch.
+Normal operation will append future messages/summaries as before. Changing a
+prompt cannot repair any previously lossy summary, but immutable originals and
+numeric zoom remain available. Live deployment/restart is separate from local
+validation and is not performed by the regression tests.
