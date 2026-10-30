@@ -402,12 +402,18 @@ async fn compactor_committed_publication_before_shutdown_survives_native_reopen(
 }
 
 #[test]
-fn actual_upstream_shared_memory_prompt_and_worker_boundary() {
+fn actual_upstream_memory_prompt_has_explicit_turn_compaction_boundary() {
     let contract: Value = serde_json::from_str(include_str!("../tests/fixtures/memory-contract-0500bf6.json")).unwrap();
     let upstream = contract["master"].as_str().unwrap().replace("Unii", "Pantheon").replace("- unii:", "- talk:");
     let root = system_prompt(false, false, "catalogue", "operator rules");
-    assert!(root.starts_with(&upstream));
+    // Preserve the unmodified oracle, but name the intentional mode split.
+    let ordinary_prefix = upstream.split("\n\n# Compactions").next().unwrap();
+    assert!(root.starts_with(ordinary_prefix));
+    assert!(!root.contains("# Compactions"));
+    assert!(!root.contains("Call no tools"));
     assert!(root.ends_with("operator rules"));
+    assert!(COMPACT.contains("Call no tools"));
+    assert!(!COMPACT.contains("# Harness rules"));
     let child = system_prompt(true, false, "catalogue", "operator rules");
     assert!(!child.contains("# Compactions"));
     assert!(!child.contains("You write Pantheon's memory"));

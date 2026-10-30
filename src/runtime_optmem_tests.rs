@@ -74,10 +74,7 @@ async fn native_compactor_retries_are_bounded_original_input_only_for_each_trans
                     .unwrap_or("")
                     .to_owned()
             };
-            if vendor != "zai" {
-                assert!(sys.contains("# Compactions"));
-                assert!(sys.contains("Current harness capabilities"));
-            }
+            assert_eq!(sys, COMPACT, "{vendor} compaction-only system prompt");
         }
         server.abort();
     }

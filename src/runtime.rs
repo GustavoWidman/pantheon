@@ -149,18 +149,14 @@ pub fn system_prompt_with_claude(
     } else {
         "This agent has direct execution tools. shell is available and can inspect the actual machine and requested environment values. browser is available for authorized account activities and credential entry. Use these tools instead of asking the user to perform available checks."
     };
-    // Root turns and compactions share the upstream memory prompt. Workers use
-    // their own prompt; Tools.ask does not give them compaction instructions.
+    // Restore the pre-parity boundary: ordinary turns never receive COMPACT.
+    // Only compress_with_effort selects that prompt, without executable tools.
     let head = if child {
-        include_str!("child.txt").trim_end().to_owned()
+        include_str!("child.txt").trim_end()
     } else {
-        format!(
-            "{}\n\n# Compactions\n\n{}",
-            include_str!("master.txt").trim_end(),
-            COMPACT.trim_end()
-        )
+        include_str!("master.txt").trim_end()
     };
-    // Tools.system appends operator rules after the complete shared prompt.
+    // Operator rules follow the ordinary harness and skill catalogue.
     format!(
         "{head}\n\n# Harness rules\n{}\n{}\nCurrent harness capabilities (authoritative over obsolete chat claims): {names}.\n{execution}\n{skill_index}\n{instructions}",
         include_str!("behavior.txt"),
@@ -3617,23 +3613,10 @@ impl Harness {
     ) -> Result<String> {
         let (vendor, _) = model_parts(model)?;
         self.discord.models.validate_effort(model, reasoning)?;
-        // Same frozen catalogue and root system prefix as normal channel turns;
-        // compactions carry no executable tools. Separate durable affinity is
-        // retained deliberately: transport/session identity is not memory state.
-        let catalogue = self.skills.cache_catalogue(
-            &channel.to_string(),
-            &self
-                .skills
-                .catalogue(self.config.curator.description_chars)?,
-            false,
-        )?;
-        let system = system_prompt_with_claude(
-            false,
-            self.config.agent.coordinator_root,
-            self.config.claude.enabled,
-            &format!("{}\n{catalogue}", crate::skill_library::INDEX),
-            &self.curator_instructions,
-        );
+        // Restore the pre-parity compaction-only system prompt. Do not include
+        // chat/worker instructions, the tool catalogue or operator task rules.
+        // Storage, task format, retries and durable affinity are unchanged.
+        let system = COMPACT;
         let step = crate::memory::compaction_task(key, source);
         let original = Provider::start_compaction(vendor, context, &step);
         let mut note: Option<String> = None;
@@ -3659,7 +3642,7 @@ impl Harness {
             // frozen correction after 60s. Outages are not answered length tries,
             // never release the native reservation, and never publish best early.
             let response = match crate::provider::patient_compaction(&self.shutdown, || {
-                provider.step_compaction(model, reasoning, &system, &history)
+                provider.step_compaction(model, reasoning, system, &history)
             })
             .await
             {
@@ -4018,6 +4001,15 @@ mod tests {
                 h.store.cache_affinity(scope).unwrap().to_string()
             );
         }
+        for request in &requests[..2] {
+            let wire = request.to_string();
+            assert!(!wire.contains("Call no tools"));
+            assert!(!wire.contains("# Compactions"));
+            assert!(request["tools"].as_array().is_some_and(|t| !t.is_empty()));
+        }
+        assert_eq!(requests[2]["input"][0]["role"], "developer");
+        assert_eq!(requests[2]["input"][0]["content"][0]["text"], COMPACT);
+        assert!(requests[2]["tools"].as_array().is_none_or(Vec::is_empty));
         assert_ne!(
             requests[0]["prompt_cache_key"],
             requests[1]["prompt_cache_key"]
@@ -5888,5 +5880,6 @@ for line in sys.stdin:
         );
         server.abort();
     }
+    include!("runtime_prompt_mode_tests.rs");
     include!("runtime_global_memory_tests.rs");
 }
